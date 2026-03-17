@@ -1,0 +1,13 @@
+[package]
+name = "sumi-vm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sumi-abi = { path = "../sumi-abi" }
+thiserror = "2.0.18"
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-bindings = "0.14"
+kvm-ioctls = "0.24"
