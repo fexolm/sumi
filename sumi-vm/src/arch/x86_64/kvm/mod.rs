@@ -44,6 +44,14 @@ const SS_SELECTOR: u16 = 0x10;
 const CS_TYPE: u8 = 0xB;
 const SS_TYPE: u8 = 0x3;
 
+// Port used by the guest test payload to output debug messages.
+const DEBUG_PORT: u16 = 0xE9;
+const GUEST_TEST_PAYLOAD: [u8; 5] = [
+    0xB0, 0x41, // mov al, 'A'
+    0xE6, 0xE9, // out 0xE9, al
+    0xF4,       // hlt
+];
+
 pub const GUEST_BASE: GuestAddress = GuestAddress(0);
 
 pub struct KvmVm {
@@ -126,6 +134,9 @@ impl VirtBackend for KvmVm {
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 
+        // Write the guest test payload (a simple program that outputs 'A' to the debug port and halts) into guest memory at the physical address where the kernel code is mapped.
+        mem.write_slice(&GUEST_TEST_PAYLOAD, GuestAddress(KERNEL_CODE_PHYS.as_u64()))?;
+
         // Register the guest memory region with KVM.
         unsafe {
             self.vm_fd
@@ -172,6 +183,8 @@ impl VCpu for KvmVCpu {
         // - RSP: stack pointer inside guest memory
         // - RFLAGS: set the reserved bit required by x86
         let mut regs = self.fd.get_regs()?;
+        // Start executing at the virtual address where we loaded the guest test payload.
+        regs.rip = KERNEL_CODE_VIRT.as_u64();
         // _start is entered without a CALL frame; keep SysV ABI expectation
         // (RSP % 16 == 8 on function entry) so local variables that require
         // 16-byte alignment remain aligned after prologue.
@@ -222,6 +235,9 @@ impl VCpu for KvmVCpu {
     fn run(&mut self) -> Result<()> {
         loop {
             match self.fd.run()? {
+                VcpuExit::IoOut(port, data) if port == DEBUG_PORT => {
+                    println!("IoOut: {}", String::from_utf8_lossy(data));
+                }
                 VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),
                 other => panic!("unexpected vcpu exit: {other:?}"),
             }
