@@ -36,6 +36,7 @@ pub trait VirtBackend: Sized {
 }
 
 pub struct SumiVm<Backend: VirtBackend + 'static> {
+    _mem: GuestMemoryMmap<()>,
     _backend: Backend,
     vcpus: Vec<Backend::VCpuType>,
 }
@@ -56,6 +57,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         backend.initialize_memory(&mem)?;
 
         Ok(Self {
+            _mem: mem,
             vcpus,
             _backend: backend,
         })

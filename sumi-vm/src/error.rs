@@ -1,6 +1,6 @@
 use crate::vm::Hypervisor;
 use thiserror::Error;
-use vm_memory::mmap::FromRangesError;
+use vm_memory::{GuestMemoryError, mmap::FromRangesError};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -13,6 +13,15 @@ pub enum Error {
 
     #[error("Failed to map guest memory: {0}")]
     GuestMemoryMmap(#[from] FromRangesError),
+
+    #[error("guest memory error: {0}")]
+    GuestMemory(#[from] GuestMemoryError),
+
+    #[error("Invalid VM config: {0}")]
+    InvalidVmConfig(String),
+
+    #[error("unexpected vCPU exit: {0}")]
+    UnexpectedExit(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
