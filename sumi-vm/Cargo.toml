@@ -8,6 +8,7 @@ clap = { version = "4.5", features = ["derive"] }
 sumi-abi = { path = "../sumi-abi" }
 thiserror = "2.0.18"
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
+goblin = { version = "0.10.5" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = "0.14"

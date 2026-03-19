@@ -5,10 +5,10 @@ use sumi_abi::arch::address::DirectMap;
 use sumi_abi::arch::address::{get_pdpt_index, get_pml4_index};
 use sumi_abi::arch::layout::{
     DIRECT_MAP_PD, DIRECT_MAP_PD_COUNT, DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
-    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, KERNEL_CODE_PD, KERNEL_CODE_PDPD,
-    KERNEL_CODE_PHYS, KERNEL_CODE_VIRT, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES,
+    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, KERNEL_CODE_PD, KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES,
     PAGE_TABLE_SIZE,
 };
+use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::{
@@ -43,21 +43,10 @@ const SS_SELECTOR: u16 = 0x10;
 const CS_TYPE: u8 = 0xB;
 const SS_TYPE: u8 = 0x3;
 
-// Port used by the guest test payload to output debug messages.
-const DEBUG_PORT: u16 = 0xE9;
-const GUEST_TEST_PAYLOAD: [u8; 11] = [
-    0xB8, 0x41, 0x00, 0x00, 0x00, // mov eax, 0x41
-    0x66, 0xBA, 0xE9, 0x00,       // mov dx, 0xE9
-    0xEE,                         // out dx, al
-    0xF4,                         // hlt
-];
-
 pub const GUEST_BASE: GuestAddress = GuestAddress(0);
 
 pub struct KvmVm {
     vm_fd: kvm_ioctls::VmFd,
-    max_vcpus: usize,
-    mem_size: usize,
     next_vcpu_id: AtomicUsize,
 }
 
@@ -66,13 +55,11 @@ impl KvmVm {}
 impl VirtBackend for KvmVm {
     type VCpuType = KvmVCpu;
 
-    fn new(info: &VmCreateInfo) -> Result<Self> {
+    fn new(_info: &VmCreateInfo) -> Result<Self> {
         let kvm = kvm_ioctls::Kvm::new()?;
         let vm_fd = kvm.create_vm()?;
         Ok(Self {
             vm_fd: vm_fd,
-            max_vcpus: kvm.get_nr_vcpus() as usize,
-            mem_size: info.mem_size,
             next_vcpu_id: AtomicUsize::new(0),
         })
     }
@@ -123,16 +110,15 @@ impl VirtBackend for KvmVm {
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 
-        // Write the guest test payload (a simple program that outputs 'A' to the debug port and halts) into guest memory at the physical address where the kernel code is mapped.
-        mem.write_slice(&GUEST_TEST_PAYLOAD, GuestAddress(KERNEL_CODE_PHYS.as_u64()))?;
-
         // Register the guest memory region with KVM.
+        let guest_memory_size = mem.last_addr().0 + 1;
+
         unsafe {
             self.vm_fd
                 .set_user_memory_region(kvm_userspace_memory_region {
                     slot: 0,
                     guest_phys_addr: GUEST_BASE.0,
-                    memory_size: self.mem_size as u64,
+                    memory_size: guest_memory_size,
                     userspace_addr: mem.get_host_address(GUEST_BASE).unwrap() as u64,
                     flags: 0,
                 })?;
@@ -143,12 +129,6 @@ impl VirtBackend for KvmVm {
 
     fn create_vcpu(&self) -> Result<Self::VCpuType> {
         let id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
-        if id >= self.max_vcpus {
-            return Err(Error::InvalidVmConfig(format!(
-                "vcpu_count exceeds KVM's max of {}",
-                self.max_vcpus
-            )));
-        }
         let fd = self.vm_fd.create_vcpu(id as u64)?;
 
         Ok(KvmVCpu::new(fd))
@@ -166,14 +146,14 @@ impl KvmVCpu {
 }
 
 impl VCpu for KvmVCpu {
-    fn init(&mut self) -> Result<()> {
+    fn init(&mut self, entry_point: u64) -> Result<()> {
         // General purpose registers:
         // - RIP: instruction pointer where the guest will start executing
         // - RSP: stack pointer inside guest memory
         // - RFLAGS: set the reserved bit required by x86
         let mut regs = self.fd.get_regs()?;
-        // Start executing at the virtual address where we loaded the guest test payload.
-        regs.rip = KERNEL_CODE_VIRT.as_u64();
+        // Start executing at the ELF entry point supplied by the kernel image.
+        regs.rip = entry_point;
         // _start is entered without a CALL frame; keep SysV ABI expectation
         // (RSP % 16 == 8 on function entry) so local variables that require
         // 16-byte alignment remain aligned after prologue.
@@ -224,7 +204,7 @@ impl VCpu for KvmVCpu {
     fn run(&mut self) -> Result<()> {
         loop {
             match self.fd.run()? {
-                VcpuExit::IoOut(port, data) if port == DEBUG_PORT => {
+                VcpuExit::IoOut(port, data) if port == 0xE9 => {
                     println!("IoOut: {}", String::from_utf8_lossy(data));
                 }
                 VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),

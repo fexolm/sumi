@@ -16,6 +16,7 @@ impl RunCommand {
             vcpu_count: 1,
             hypervisor: Hypervisor::Kvm,
             mem_size: 2 << 30,
+            kernel_path: self.program,
         };
 
         run_sumi_vm(&info)
