@@ -19,6 +19,9 @@ pub enum Error {
 
     #[error("Invalid VM config: {0}")]
     InvalidVmConfig(String),
+
+    #[error("unexpected vCPU exit: {0}")]
+    UnexpectedExit(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

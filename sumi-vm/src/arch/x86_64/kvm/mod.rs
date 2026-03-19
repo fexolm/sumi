@@ -12,7 +12,6 @@ use sumi_abi::arch::layout::{
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::{
-    Hypervisor,
     error::Result,
     vm::{VCpu, VirtBackend, VmCreateInfo},
 };
@@ -46,10 +45,11 @@ const SS_TYPE: u8 = 0x3;
 
 // Port used by the guest test payload to output debug messages.
 const DEBUG_PORT: u16 = 0xE9;
-const GUEST_TEST_PAYLOAD: [u8; 5] = [
-    0xB0, 0x41, // mov al, 'A'
-    0xE6, 0xE9, // out 0xE9, al
-    0xF4,       // hlt
+const GUEST_TEST_PAYLOAD: [u8; 11] = [
+    0xB8, 0x41, 0x00, 0x00, 0x00, // mov eax, 0x41
+    0x66, 0xBA, 0xE9, 0x00,       // mov dx, 0xE9
+    0xEE,                         // out dx, al
+    0xF4,                         // hlt
 ];
 
 pub const GUEST_BASE: GuestAddress = GuestAddress(0);
@@ -67,17 +67,6 @@ impl VirtBackend for KvmVm {
     type VCpuType = KvmVCpu;
 
     fn new(info: &VmCreateInfo) -> Result<Self> {
-        if !matches!(info.hypervisor, Hypervisor::Kvm) {
-            return Err(Error::MissingHypervisor(info.hypervisor));
-        }
-        if info.vcpu_count == 0 {
-            return Err(Error::InvalidVmConfig("vcpu_count must be > 0".into()));
-        }
-        if info.mem_size == 0 || info.mem_size % PAGE_SIZE != 0 {
-            return Err(Error::InvalidVmConfig(
-                "mem_size must be non-zero and page-aligned".into(),
-            ));
-        }
         let kvm = kvm_ioctls::Kvm::new()?;
         let vm_fd = kvm.create_vm()?;
         Ok(Self {
@@ -239,7 +228,7 @@ impl VCpu for KvmVCpu {
                     println!("IoOut: {}", String::from_utf8_lossy(data));
                 }
                 VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),
-                other => panic!("unexpected vcpu exit: {other:?}"),
+                other => return Err(Error::UnexpectedExit(format!("{:?}", other))),
             }
         }
     }
