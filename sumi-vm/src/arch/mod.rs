@@ -9,15 +9,7 @@ use crate::{
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
-// #[allow(unreachable_patterns)]
-// pub fn create_vm(info: &VmCreateInfo) -> Result<Box<dyn VirtBackend>> {
-//     match info.hypervisor {
-//         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-//         Hypervisor::Kvm => Ok(Box::new(x86_64::kvm::KvmVm::new(info))),
-//         _ => Err(Error::MissingHypervisor(info.hypervisor)),
-//     }
-// }
-
+#[allow(unreachable_patterns)]
 pub fn run_sumi_vm(info: &VmCreateInfo) -> Result<()> {
     match info.hypervisor {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
