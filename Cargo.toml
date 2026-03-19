@@ -1,14 +1,8 @@
 [workspace]
+default-members = ["sumi-vm"]
 members = ["sumi-vm", "sumi-abi"]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[package]
-name = "sumi"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
