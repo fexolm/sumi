@@ -1,6 +1,7 @@
 use crate::{
     address::{PhysicalAddr, VirtualAddr},
-    arch::x86_64::layout::{DIRECT_MAP_OFFSET, MAX_PHYSICAL_ADDR},
+    arch::x86_64::layout::DIRECT_MAP_OFFSET,
+    layout::MAX_PHYSICAL_ADDR,
 };
 
 pub struct DirectMap;

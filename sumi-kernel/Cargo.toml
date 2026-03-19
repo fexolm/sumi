@@ -1,0 +1,10 @@
+[package]
+name = "sumi-kernel"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+sumi-abi = { path = "../sumi-abi" }
+
+[dependencies]
