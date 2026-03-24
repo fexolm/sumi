@@ -2,9 +2,10 @@
 name = "sumi-kernel"
 version.workspace = true
 edition.workspace = true
-build = "build.rs"
 
-[build-dependencies]
-sumi-abi = { path = "../sumi-abi" }
+[features]
+bench-memory-limit = []
 
 [dependencies]
+sumi-abi = { path = "../sumi-abi" }
+spin = "0.10.0"

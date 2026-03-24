@@ -1,0 +1,9 @@
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C",
+  "panic=abort",
+  "-C",
+  "code-model=kernel",
+  "-C",
+  "link-arg=-Tsumi-kernel/linker/x86_64.ld",
+]

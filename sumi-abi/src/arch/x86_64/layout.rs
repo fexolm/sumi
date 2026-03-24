@@ -1,6 +1,7 @@
 use crate::{
     address::{PhysicalAddr, VirtualAddr},
-    arch::x86_64::address::get_pml4_index, layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, MAX_PHYSICAL_ADDR},
+    arch::x86_64::address::get_pml4_index,
+    layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, MAX_PHYSICAL_ADDR},
 };
 
 pub const PAGE_SIZE: usize = 2 << 20;
