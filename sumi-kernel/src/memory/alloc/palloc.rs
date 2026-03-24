@@ -144,13 +144,6 @@ impl PageAllocator {
         Self(spin::Mutex::new(PageAllocatorImpl::new()))
     }
 
-    #[cfg(feature = "bench-memory-limit")]
-    pub fn with_memory_limit(memory_limit: usize) -> Self {
-        Self(spin::Mutex::new(PageAllocatorImpl::with_memory_limit(
-            memory_limit,
-        )))
-    }
-
     pub fn alloc(&self, pages: usize) -> Result<PhysicalAddr> {
         self.0.lock().alloc(pages)
     }
