@@ -158,15 +158,12 @@ impl PageTable {
             for i in 0..end {
                 let entry = self.entries[i];
                 if entry.is_present() {
-                    kalloc.free(entry.addr(), PAGE_TABLE_SIZE)?;
+                    kalloc.free(entry.addr())?;
                 }
             }
         }
 
-        kalloc.free(
-            to_physical_checked(self.self_vaddr(), kalloc.direct_map())?,
-            PAGE_TABLE_SIZE,
-        )?;
+        kalloc.free(to_physical_checked(self.self_vaddr(), kalloc.direct_map())?)?;
         Ok(())
     }
 
