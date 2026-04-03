@@ -54,7 +54,7 @@ impl PageAllocatorImpl {
             return Err(MemoryError::InvalidPageCount { pages });
         }
 
-        let search_limit = self.page_search_limit();
+        let search_limit = PAGE_COUNT;
         if pages > search_limit {
             return Err(MemoryError::OutOfMemory);
         }
@@ -83,10 +83,6 @@ impl PageAllocatorImpl {
         }
 
         Err(MemoryError::OutOfMemory)
-    }
-
-    fn page_search_limit(&self) -> usize {
-        PAGE_COUNT
     }
 
     fn free(&mut self, addr: PhysicalAddr) -> Result<()> {
@@ -124,9 +120,7 @@ impl PageAllocatorImpl {
 
     fn stats(&self) -> Stats {
         let used_pages = self.used_pages();
-        let alloc_limit_pages = self
-            .page_search_limit()
-            .saturating_sub(Self::reserved_pages());
+        let alloc_limit_pages = PAGE_COUNT.saturating_sub(Self::reserved_pages());
         Stats {
             used_pages,
             used_bytes: used_pages * PAGE_SIZE,

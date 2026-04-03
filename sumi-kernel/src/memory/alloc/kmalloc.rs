@@ -1,4 +1,7 @@
-use core::ptr::write_bytes;
+use core::{
+    mem::{align_of, size_of},
+    ptr::write_bytes,
+};
 
 use crate::memory::{
     alloc::palloc::PageAllocator,
@@ -6,253 +9,74 @@ use crate::memory::{
 };
 use sumi_abi::{
     address::{DirectMap, PhysicalAddr},
-    arch::layout::PAGE_SIZE,
+    arch::layout::{PAGE_SIZE, PAGE_TABLE_SIZE},
 };
 
-const MIN_SHIFT: u32 = 10;
-const MAX_SHIFT: u32 = 24;
-const MIN_ALLOC_SIZE: usize = 1 << MIN_SHIFT;
-const MAX_ALLOC_SIZE: usize = 1 << MAX_SHIFT;
-const SMALL_CLASS_COUNT: usize = 12;
-const MAX_SLABS_PER_CLASS: usize = 512;
-const MAX_LARGE_ALLOCS: usize = 256;
-const FREE_LIST_END: u16 = u16::MAX;
-const PAGE_MASK: usize = !(PAGE_SIZE - 1);
-const SMALL_SLAB_MAP_SIZE: usize = 4096;
+const MAX_ALLOC: usize = 1 << 24;
+const FREE_LIST_END: usize = 0;
+const MAX_ACTIVE_ALLOCS: usize = 4096;
 
-const SMALL_CLASS_SIZES: [u32; SMALL_CLASS_COUNT] = [
-    1 << 10,
-    1 << 11,
-    1 << 12,
-    1 << 13,
-    1 << 14,
-    1 << 15,
-    1 << 16,
-    1 << 17,
-    1 << 18,
-    1 << 19,
-    1 << 20,
-    1 << 21,
-];
-
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct Slab {
-    in_use: bool,
-    base: PhysicalAddr,
-    capacity: u16,
-    free_count: u16,
-    free_head: u16,
+struct FreeBlock {
+    size: usize,
+    next: usize,
 }
 
-impl Slab {
+#[derive(Clone, Copy)]
+struct ActiveAllocation {
+    in_use: bool,
+    addr: PhysicalAddr,
+    size: usize,
+}
+
+impl ActiveAllocation {
     const fn empty() -> Self {
         Self {
             in_use: false,
-            base: PhysicalAddr::new(0),
-            capacity: 0,
-            free_count: 0,
-            free_head: FREE_LIST_END,
+            addr: PhysicalAddr::new(0),
+            size: 0,
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct SizeClass {
-    block_size: u32,
-    slabs: [Slab; MAX_SLABS_PER_CLASS],
-    last_alloc_slab: usize,
+const MIN_FREE_BLOCK_SIZE: usize = size_of::<FreeBlock>();
+const MIN_ALIGNMENT: usize = align_of::<FreeBlock>();
+
+struct AllocatorInner {
+    free_list_head: usize,
+    active: [ActiveAllocation; MAX_ACTIVE_ALLOCS],
 }
 
-impl SizeClass {
-    const fn new(block_size: u32) -> Self {
+impl AllocatorInner {
+    const fn new() -> Self {
         Self {
-            block_size,
-            slabs: [Slab::empty(); MAX_SLABS_PER_CLASS],
-            last_alloc_slab: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LargeAlloc {
-    in_use: bool,
-    base: PhysicalAddr,
-    pages: usize,
-}
-
-impl LargeAlloc {
-    const fn empty() -> Self {
-        Self {
-            in_use: false,
-            base: PhysicalAddr::new(0),
-            pages: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SmallSlabMapEntry {
-    key_page_plus_one: u32,
-    value: u16,
-    _reserved: u16,
-}
-
-impl SmallSlabMapEntry {
-    const fn empty() -> Self {
-        Self {
-            key_page_plus_one: 0,
-            value: 0,
-            _reserved: 0,
-        }
-    }
-}
-
-struct KernelAllocatorImpl<'i, DM: DirectMap> {
-    small: [SizeClass; SMALL_CLASS_COUNT],
-    small_slab_map: [SmallSlabMapEntry; SMALL_SLAB_MAP_SIZE],
-    large: [LargeAlloc; MAX_LARGE_ALLOCS],
-    palloc: &'i PageAllocator,
-    dm: &'i DM,
-}
-
-impl<'i, DM: DirectMap> KernelAllocatorImpl<'i, DM> {
-    const fn new(dm: &'i DM, page_alloc: &'i PageAllocator) -> Self {
-        Self {
-            small: build_small_classes(),
-            small_slab_map: [SmallSlabMapEntry::empty(); SMALL_SLAB_MAP_SIZE],
-            large: [LargeAlloc::empty(); MAX_LARGE_ALLOCS],
-            palloc: page_alloc,
-            dm,
+            free_list_head: FREE_LIST_END,
+            active: [const { ActiveAllocation::empty() }; MAX_ACTIVE_ALLOCS],
         }
     }
 
-    fn alloc(&mut self, size: usize) -> Result<PhysicalAddr> {
-        let class_size = size_to_class(size)?;
-
-        if class_size <= PAGE_SIZE {
-            self.alloc_small(class_size as u32)
-        } else {
-            self.alloc_large(class_size)
-        }
+    fn reserve_slot(&self) -> Result<usize> {
+        self.active
+            .iter()
+            .position(|slot| !slot.in_use)
+            .ok_or(MemoryError::OutOfMemory)
     }
 
-    fn calloc(&mut self, size: usize) -> Result<PhysicalAddr> {
-        let addr = self.alloc(size)?;
-
-        unsafe {
-            write_bytes(addr.to_virtual(self.dm).as_ptr::<u8>(), 0, size);
-        }
-
-        Ok(addr)
-    }
-
-    fn free(&mut self, ptr: PhysicalAddr) -> Result<()> {
-        if self.free_small(ptr)? {
-            return Ok(());
-        }
-
-        self.free_large(ptr)
-    }
-
-    fn alloc_small(&mut self, block_size: u32) -> Result<PhysicalAddr> {
-        let class_idx = (block_size.trailing_zeros() - MIN_SHIFT) as usize;
-        let start_idx = self.small[class_idx].last_alloc_slab;
-
-        for offset in 0..MAX_SLABS_PER_CLASS {
-            let slab_idx = (start_idx + offset) % MAX_SLABS_PER_CLASS;
-            let slab = &mut self.small[class_idx].slabs[slab_idx];
-            if slab.in_use && slab.free_count > 0 {
-                self.small[class_idx].last_alloc_slab = slab_idx;
-                let block = self.small[class_idx].block_size as usize;
-                return alloc_from_small_slab(slab, block, self.dm);
-            }
-        }
-
-        for slab_idx in 0..MAX_SLABS_PER_CLASS {
-            if !self.small[class_idx].slabs[slab_idx].in_use {
-                let base = {
-                    let slab = &mut self.small[class_idx].slabs[slab_idx];
-                    let block = self.small[class_idx].block_size;
-                    init_small_slab(self.palloc, slab, block, self.dm)?;
-                    slab.base.as_usize()
-                };
-                self.small_slab_map_insert(base, class_idx, slab_idx)?;
-                self.small[class_idx].last_alloc_slab = slab_idx;
-                let slab = &mut self.small[class_idx].slabs[slab_idx];
-                let block = self.small[class_idx].block_size as usize;
-                return alloc_from_small_slab(slab, block, self.dm);
-            }
-        }
-
-        Err(MemoryError::TooManySlabs {
-            class_size: self.small[class_idx].block_size,
-        })
-    }
-
-    fn free_small(&mut self, addr: PhysicalAddr) -> Result<bool> {
-        let p = addr.as_usize();
-        let page_base = p & PAGE_MASK;
-        let Some((class_idx, slab_idx)) = self.small_slab_map_get(page_base) else {
-            return Ok(false);
+    fn remember(&mut self, slot: usize, addr: PhysicalAddr, size: usize) {
+        self.active[slot] = ActiveAllocation {
+            in_use: true,
+            addr,
+            size,
         };
-
-        let slab = &mut self.small[class_idx].slabs[slab_idx];
-        let offset = p - slab.base.as_usize();
-        let block_size = self.small[class_idx].block_size as usize;
-
-        if offset % block_size != 0 {
-            return Err(MemoryError::SlabAlignmentMismatch {
-                addr: p,
-                block_size,
-            });
-        }
-
-        let idx = (offset / block_size) as u16;
-        unsafe {
-            *small_slab_link_ptr(slab, idx, self.dm) = slab.free_head;
-        }
-        slab.free_head = idx;
-        slab.free_count += 1;
-
-        if slab.free_count == slab.capacity {
-            let base = slab.base;
-            *slab = Slab::empty();
-            self.small_slab_map_remove(page_base);
-            self.palloc.free(base)?;
-        }
-
-        Ok(true)
     }
 
-    fn alloc_large(&mut self, class_size: usize) -> Result<PhysicalAddr> {
-        let pages = class_size.div_ceil(PAGE_SIZE);
-        let base = self.palloc.alloc(pages)?;
-
-        for slot in &mut self.large {
-            if !slot.in_use {
-                *slot = LargeAlloc {
-                    in_use: true,
-                    base,
-                    pages,
-                };
-                return Ok(base);
-            }
-        }
-
-        for page in 0..pages {
-            self.palloc.free(base.add(page * PAGE_SIZE))?;
-        }
-        Err(MemoryError::TooManyLargeAllocations)
-    }
-
-    fn free_large(&mut self, addr: PhysicalAddr) -> Result<()> {
-        for slot in &mut self.large {
-            if slot.in_use && slot.base == addr {
-                for page in 0..slot.pages {
-                    self.palloc.free(slot.base.add(page * PAGE_SIZE))?;
-                }
-                *slot = LargeAlloc::empty();
-                return Ok(());
+    fn forget(&mut self, addr: PhysicalAddr) -> Result<usize> {
+        for slot in &mut self.active {
+            if slot.in_use && slot.addr == addr {
+                let size = slot.size;
+                *slot = ActiveAllocation::empty();
+                return Ok(size);
             }
         }
 
@@ -260,296 +84,515 @@ impl<'i, DM: DirectMap> KernelAllocatorImpl<'i, DM> {
             addr: addr.as_usize(),
         })
     }
+}
 
-    fn small_slab_map_insert(
-        &mut self,
-        page_base: usize,
-        class_idx: usize,
-        slab_idx: usize,
-    ) -> Result<()> {
-        let value = (class_idx * MAX_SLABS_PER_CLASS + slab_idx + 1) as u16;
-        for probe in 0..SMALL_SLAB_MAP_SIZE {
-            let idx = (hash_page_base(page_base) + probe) & (SMALL_SLAB_MAP_SIZE - 1);
-            let entry = self.small_slab_map[idx];
-            if entry.value == 0 || entry.key_page_plus_one == to_page_plus_one(page_base) {
-                self.small_slab_map[idx] = SmallSlabMapEntry {
-                    key_page_plus_one: to_page_plus_one(page_base),
-                    value,
-                    _reserved: 0,
-                };
-                return Ok(());
-            }
-        }
+#[derive(Clone, Copy)]
+struct Placement {
+    alloc_start: usize,
+    alloc_size: usize,
+    prefix_size: usize,
+    suffix_start: usize,
+    suffix_size: usize,
+}
 
-        Err(MemoryError::TooManySlabs {
-            class_size: self.small[class_idx].block_size,
-        })
-    }
+// Kept for API compatibility. The simple freelist allocator has no per-thread state.
+pub struct LocalHeap;
 
-    fn small_slab_map_get(&self, page_base: usize) -> Option<(usize, usize)> {
-        for probe in 0..SMALL_SLAB_MAP_SIZE {
-            let idx = (hash_page_base(page_base) + probe) & (SMALL_SLAB_MAP_SIZE - 1);
-            let entry = self.small_slab_map[idx];
-            if entry.value == 0 {
-                return None;
-            }
-            if entry.key_page_plus_one == to_page_plus_one(page_base) {
-                let unpacked = entry.value as usize - 1;
-                return Some((
-                    unpacked / MAX_SLABS_PER_CLASS,
-                    unpacked % MAX_SLABS_PER_CLASS,
-                ));
-            }
-        }
-
-        None
-    }
-
-    fn small_slab_map_remove(&mut self, page_base: usize) {
-        let mut removed_idx = None;
-        for probe in 0..SMALL_SLAB_MAP_SIZE {
-            let idx = (hash_page_base(page_base) + probe) & (SMALL_SLAB_MAP_SIZE - 1);
-            let entry = self.small_slab_map[idx];
-            if entry.value == 0 {
-                return;
-            }
-            if entry.key_page_plus_one == to_page_plus_one(page_base) {
-                removed_idx = Some(idx);
-                break;
-            }
-        }
-
-        let Some(remove_idx) = removed_idx else {
-            return;
-        };
-
-        self.small_slab_map[remove_idx] = SmallSlabMapEntry::empty();
-        let mut scan = (remove_idx + 1) & (SMALL_SLAB_MAP_SIZE - 1);
-        for _ in 0..SMALL_SLAB_MAP_SIZE {
-            let entry = self.small_slab_map[scan];
-            if entry.value == 0 {
-                return;
-            }
-            self.small_slab_map[scan] = SmallSlabMapEntry::empty();
-
-            for probe in 0..SMALL_SLAB_MAP_SIZE {
-                let idx = (hash_page_base(from_page_plus_one(entry.key_page_plus_one)) + probe)
-                    & (SMALL_SLAB_MAP_SIZE - 1);
-                if self.small_slab_map[idx].value == 0 {
-                    self.small_slab_map[idx] = entry;
-                    break;
-                }
-            }
-
-            scan = (scan + 1) & (SMALL_SLAB_MAP_SIZE - 1);
-        }
+impl LocalHeap {
+    pub const fn new() -> Self {
+        Self
     }
 }
 
-fn init_small_slab(
-    palloc: &PageAllocator,
-    slab: &mut Slab,
-    block_size: u32,
-    dm: &impl DirectMap,
-) -> Result<()> {
-    let base = palloc.alloc(1)?;
-    let capacity = (PAGE_SIZE / block_size as usize) as u16;
-    if capacity == 0 {
-        return Err(MemoryError::InvalidSlabCapacity);
-    }
-
-    *slab = Slab {
-        in_use: true,
-        base,
-        capacity,
-        free_count: capacity,
-        free_head: 0,
-    };
-
-    for i in 0..capacity {
-        let next = if i + 1 < capacity {
-            i + 1
-        } else {
-            FREE_LIST_END
-        };
-        unsafe {
-            *small_slab_link_ptr(slab, i, dm) = next;
-        }
-    }
-
-    Ok(())
+pub struct KernelAllocator<'i, DM: DirectMap> {
+    inner: spin::Mutex<AllocatorInner>,
+    palloc: &'i PageAllocator,
+    dm: &'i DM,
 }
 
-const fn build_small_classes() -> [SizeClass; SMALL_CLASS_COUNT] {
-    [
-        SizeClass::new(SMALL_CLASS_SIZES[0]),
-        SizeClass::new(SMALL_CLASS_SIZES[1]),
-        SizeClass::new(SMALL_CLASS_SIZES[2]),
-        SizeClass::new(SMALL_CLASS_SIZES[3]),
-        SizeClass::new(SMALL_CLASS_SIZES[4]),
-        SizeClass::new(SMALL_CLASS_SIZES[5]),
-        SizeClass::new(SMALL_CLASS_SIZES[6]),
-        SizeClass::new(SMALL_CLASS_SIZES[7]),
-        SizeClass::new(SMALL_CLASS_SIZES[8]),
-        SizeClass::new(SMALL_CLASS_SIZES[9]),
-        SizeClass::new(SMALL_CLASS_SIZES[10]),
-        SizeClass::new(SMALL_CLASS_SIZES[11]),
-    ]
-}
-
-fn size_to_class(size: usize) -> Result<usize> {
-    let requested = if size == 0 { MIN_ALLOC_SIZE } else { size };
-    if requested > MAX_ALLOC_SIZE {
-        return Err(MemoryError::AllocationTooLarge {
-            requested,
-            max: MAX_ALLOC_SIZE,
-        });
-    }
-
-    Ok(requested.next_power_of_two().max(MIN_ALLOC_SIZE))
-}
-
-fn alloc_from_small_slab(
-    slab: &mut Slab,
-    block_size: usize,
-    dm: &impl DirectMap,
-) -> Result<PhysicalAddr> {
-    let idx = slab.free_head;
-    if idx == FREE_LIST_END {
-        return Err(MemoryError::SlabEmpty);
-    }
-
-    let next = unsafe { *small_slab_link_ptr(slab, idx, dm) };
-    slab.free_head = next;
-    slab.free_count -= 1;
-
-    let offset = idx as usize * block_size;
-    Ok(slab.base.add(offset))
-}
-
-unsafe fn small_slab_link_ptr(slab: &Slab, idx: u16, map: &impl DirectMap) -> *mut u16 {
-    let addr = slab.base.as_usize() + idx as usize * (PAGE_SIZE / slab.capacity as usize);
-    PhysicalAddr::new(addr).to_virtual(map).as_ptr::<u16>()
-}
-
-#[inline(always)]
-const fn hash_page_base(page_base: usize) -> usize {
-    ((page_base >> 21).wrapping_mul(0x9E37_79B9_7F4A_7C15usize)) >> 2
-}
-
-#[inline(always)]
-const fn to_page_plus_one(page_base: usize) -> u32 {
-    (page_base / PAGE_SIZE + 1) as u32
-}
-
-#[inline(always)]
-const fn from_page_plus_one(page_plus_one: u32) -> usize {
-    (page_plus_one as usize - 1) * PAGE_SIZE
-}
-
-pub struct KernelAllocator<'i, DM: DirectMap>(spin::Mutex<KernelAllocatorImpl<'i, DM>>);
+unsafe impl<'i, DM: DirectMap + Sync> Sync for KernelAllocator<'i, DM> {}
 
 impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
     pub const fn new(dm: &'i DM, palloc: &'i PageAllocator) -> Self {
-        Self(spin::Mutex::new(KernelAllocatorImpl::new(dm, palloc)))
+        Self {
+            inner: spin::Mutex::new(AllocatorInner::new()),
+            palloc,
+            dm,
+        }
+    }
+
+    pub fn alloc_with_local(&self, _local: &mut LocalHeap, size: usize) -> Result<PhysicalAddr> {
+        self.alloc_internal(size)
+    }
+
+    pub fn free_with_local(&self, _local: &mut LocalHeap, ptr: PhysicalAddr) -> Result<()> {
+        self.free_internal(ptr)
+    }
+
+    pub fn calloc_with_local(&self, local: &mut LocalHeap, size: usize) -> Result<PhysicalAddr> {
+        let addr = self.alloc_with_local(local, size)?;
+        unsafe {
+            write_bytes(addr.to_virtual(self.dm).as_ptr::<u8>(), 0, size);
+        }
+        Ok(addr)
     }
 
     pub fn alloc(&self, size: usize) -> Result<PhysicalAddr> {
-        self.0.lock().alloc(size)
+        self.alloc_internal(size)
     }
 
-    pub fn free(&self, ptr: PhysicalAddr, _size: usize) -> Result<()> {
-        self.0.lock().free(ptr)
+    pub fn free(&self, ptr: PhysicalAddr) -> Result<()> {
+        self.free_internal(ptr)
     }
 
     pub fn calloc(&self, size: usize) -> Result<PhysicalAddr> {
-        self.0.lock().calloc(size)
+        let addr = self.alloc(size)?;
+        unsafe {
+            write_bytes(addr.to_virtual(self.dm).as_ptr::<u8>(), 0, size);
+        }
+        Ok(addr)
     }
 
     pub fn direct_map(&self) -> &'i DM {
-        self.0.lock().dm
+        self.dm
     }
+
+    fn alloc_internal(&self, requested_size: usize) -> Result<PhysicalAddr> {
+        let requested_size = requested_size.max(1);
+        if requested_size > MAX_ALLOC {
+            return Err(MemoryError::AllocationTooLarge {
+                requested: requested_size,
+                max: MAX_ALLOC,
+            });
+        }
+
+        let alloc_size = requested_size.max(MIN_FREE_BLOCK_SIZE);
+        let align = allocation_alignment(alloc_size);
+        let mut inner = self.inner.lock();
+
+        loop {
+            if let Some(addr) = self.try_alloc_from_free_list(&mut inner, alloc_size, align)? {
+                return Ok(addr);
+            }
+
+            self.grow_free_list(&mut inner, alloc_size)?;
+        }
+    }
+
+    fn free_internal(&self, ptr: PhysicalAddr) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let size = inner.forget(ptr)?;
+        self.insert_free_block(&mut inner, ptr.as_usize(), size);
+        Ok(())
+    }
+
+    fn try_alloc_from_free_list(
+        &self,
+        inner: &mut AllocatorInner,
+        alloc_size: usize,
+        align: usize,
+    ) -> Result<Option<PhysicalAddr>> {
+        let mut prev = FREE_LIST_END;
+        let mut current = inner.free_list_head;
+
+        while current != FREE_LIST_END {
+            let block = self.read_free_block(current);
+            if let Some(placement) = place_allocation(current, block.size, alloc_size, align) {
+                let slot = inner.reserve_slot()?;
+                self.consume_free_block(inner, prev, current, block.next, placement);
+                let addr = PhysicalAddr::new(placement.alloc_start);
+                inner.remember(slot, addr, placement.alloc_size);
+                return Ok(Some(addr));
+            }
+
+            prev = current;
+            current = block.next;
+        }
+
+        Ok(None)
+    }
+
+    fn consume_free_block(
+        &self,
+        inner: &mut AllocatorInner,
+        prev: usize,
+        current: usize,
+        next: usize,
+        placement: Placement,
+    ) {
+        match (placement.prefix_size > 0, placement.suffix_size > 0) {
+            (true, true) => {
+                self.write_free_block(current, placement.prefix_size, placement.suffix_start);
+                self.write_free_block(placement.suffix_start, placement.suffix_size, next);
+                if prev == FREE_LIST_END {
+                    inner.free_list_head = current;
+                } else {
+                    self.free_block_mut(prev).next = current;
+                }
+            }
+            (true, false) => {
+                self.write_free_block(current, placement.prefix_size, next);
+                if prev == FREE_LIST_END {
+                    inner.free_list_head = current;
+                } else {
+                    self.free_block_mut(prev).next = current;
+                }
+            }
+            (false, true) => {
+                self.write_free_block(placement.suffix_start, placement.suffix_size, next);
+                if prev == FREE_LIST_END {
+                    inner.free_list_head = placement.suffix_start;
+                } else {
+                    self.free_block_mut(prev).next = placement.suffix_start;
+                }
+            }
+            (false, false) => {
+                if prev == FREE_LIST_END {
+                    inner.free_list_head = next;
+                } else {
+                    self.free_block_mut(prev).next = next;
+                }
+            }
+        }
+    }
+
+    fn grow_free_list(&self, inner: &mut AllocatorInner, alloc_size: usize) -> Result<()> {
+        let pages = alloc_size.div_ceil(PAGE_SIZE).max(1);
+        let base = self.palloc.alloc(pages)?;
+        self.insert_free_block(inner, base.as_usize(), pages * PAGE_SIZE);
+        Ok(())
+    }
+
+    fn insert_free_block(&self, inner: &mut AllocatorInner, start: usize, size: usize) {
+        debug_assert!(size >= MIN_FREE_BLOCK_SIZE);
+
+        let mut prev = FREE_LIST_END;
+        let mut current = inner.free_list_head;
+
+        while current != FREE_LIST_END && current < start {
+            prev = current;
+            current = self.read_free_block(current).next;
+        }
+
+        let merged_start = if prev != FREE_LIST_END {
+            let prev_block = self.read_free_block(prev);
+            if prev + prev_block.size == start {
+                let prev_block = self.free_block_mut(prev);
+                prev_block.size += size;
+                prev
+            } else {
+                self.write_free_block(start, size, current);
+                self.free_block_mut(prev).next = start;
+                start
+            }
+        } else {
+            self.write_free_block(start, size, current);
+            inner.free_list_head = start;
+            start
+        };
+
+        if current != FREE_LIST_END {
+            let merged_block = self.read_free_block(merged_start);
+            if merged_start + merged_block.size == current {
+                let next_block = self.read_free_block(current);
+                let merged_block = self.free_block_mut(merged_start);
+                merged_block.size += next_block.size;
+                merged_block.next = next_block.next;
+            }
+        }
+    }
+
+    fn read_free_block(&self, addr: usize) -> FreeBlock {
+        *self.free_block(addr)
+    }
+
+    fn write_free_block(&self, addr: usize, size: usize, next: usize) {
+        unsafe {
+            *PhysicalAddr::new(addr).to_virtual(self.dm).as_ptr::<FreeBlock>() = FreeBlock {
+                size,
+                next,
+            };
+        }
+    }
+
+    fn free_block(&self, addr: usize) -> &FreeBlock {
+        unsafe { PhysicalAddr::new(addr).to_virtual(self.dm).as_ref_mut::<FreeBlock>() }
+    }
+
+    fn free_block_mut(&self, addr: usize) -> &mut FreeBlock {
+        unsafe { PhysicalAddr::new(addr).to_virtual(self.dm).as_ref_mut::<FreeBlock>() }
+    }
+}
+
+fn allocation_alignment(size: usize) -> usize {
+    size.next_power_of_two().min(PAGE_TABLE_SIZE).max(MIN_ALIGNMENT)
+}
+
+fn align_up(addr: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
+}
+
+fn place_allocation(
+    block_start: usize,
+    block_size: usize,
+    alloc_size: usize,
+    align: usize,
+) -> Option<Placement> {
+    let block_end = block_start.checked_add(block_size)?;
+    let mut alloc_start = align_up(block_start, align);
+    let mut prefix_size = alloc_start.checked_sub(block_start)?;
+
+    if prefix_size != 0 && prefix_size < MIN_FREE_BLOCK_SIZE {
+        alloc_start = alloc_start.checked_add(align)?;
+        prefix_size = alloc_start.checked_sub(block_start)?;
+    }
+
+    let alloc_end = alloc_start.checked_add(alloc_size)?;
+    if alloc_end > block_end {
+        return None;
+    }
+
+    let mut final_alloc_size = alloc_size;
+    let mut suffix_start = alloc_end;
+    let mut suffix_size = block_end.checked_sub(alloc_end)?;
+
+    if suffix_size != 0 && suffix_size < MIN_FREE_BLOCK_SIZE {
+        final_alloc_size = final_alloc_size.checked_add(suffix_size)?;
+        suffix_start = block_end;
+        suffix_size = 0;
+    }
+
+    Some(Placement {
+        alloc_start,
+        alloc_size: final_alloc_size,
+        prefix_size,
+        suffix_start,
+        suffix_size,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::KernelDirectMap;
+    use std::{collections::HashSet, sync::Arc};
+    use sumi_abi::{address::VirtualAddr, arch::layout::KERNEL_STACK};
 
-    #[test]
-    fn class_rounding_works() {
-        assert_eq!(size_to_class(0).unwrap(), 1024);
-        assert_eq!(size_to_class(1024).unwrap(), 1024);
-        assert_eq!(size_to_class(1025).unwrap(), 2048);
-        assert_eq!(size_to_class((1 << 22) + 1).unwrap(), 1 << 23);
+    struct TestDirectMap {
+        phys_base: usize,
+        buf: Vec<u8>,
     }
 
-    #[test]
-    fn class_boundaries_are_powers_of_two() {
-        for shift in MIN_SHIFT..=MAX_SHIFT {
-            let class = 1 << shift;
-            assert_eq!(size_to_class(class - 1).unwrap(), class);
-            assert_eq!(size_to_class(class).unwrap(), class);
-            if shift < MAX_SHIFT {
-                assert_eq!(size_to_class(class + 1).unwrap(), class << 1);
+    impl TestDirectMap {
+        fn new(pages: usize) -> Self {
+            Self {
+                phys_base: KERNEL_STACK.as_usize(),
+                buf: vec![0u8; pages * PAGE_SIZE],
             }
         }
     }
 
+    impl sumi_abi::address::DirectMap for TestDirectMap {
+        fn p2v(&self, paddr: PhysicalAddr) -> VirtualAddr {
+            VirtualAddr::new(self.buf.as_ptr() as usize + (paddr.as_usize() - self.phys_base))
+        }
+
+        fn v2p(&self, vaddr: VirtualAddr) -> Option<PhysicalAddr> {
+            let base = self.buf.as_ptr() as usize;
+            let len = self.buf.len();
+            if vaddr.as_usize() < base || vaddr.as_usize() >= base + len {
+                return None;
+            }
+
+            Some(PhysicalAddr::new(vaddr.as_usize() - base + self.phys_base))
+        }
+    }
+
+    fn make_alloc(
+        pages: usize,
+    ) -> (
+        Box<TestDirectMap>,
+        Box<PageAllocator>,
+        Box<KernelAllocator<'static, TestDirectMap>>,
+    ) {
+        let dm = Box::new(TestDirectMap::new(pages));
+        let pa = Box::new(PageAllocator::new());
+        let dm_ref: &'static TestDirectMap = unsafe { &*(dm.as_ref() as *const _) };
+        let pa_ref: &'static PageAllocator = unsafe { &*(pa.as_ref() as *const _) };
+        (dm, pa, Box::new(KernelAllocator::new(dm_ref, pa_ref)))
+    }
+
     #[test]
-    fn class_rounding_errors_above_limit() {
+    fn small_alloc_and_free_reuses_address() {
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let mut local = LocalHeap::new();
+        let a = alloc.alloc_with_local(&mut local, 64).unwrap();
+        let b = alloc.alloc_with_local(&mut local, 64).unwrap();
+        assert_ne!(a, b);
+
+        alloc.free_with_local(&mut local, a).unwrap();
+        let c = alloc.alloc_with_local(&mut local, 64).unwrap();
+        assert_eq!(c, a);
+    }
+
+    #[test]
+    fn small_allocs_do_not_overlap() {
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let mut local = LocalHeap::new();
+        let a = alloc.alloc_with_local(&mut local, 4096).unwrap();
+        let b = alloc.alloc_with_local(&mut local, 4096).unwrap();
+        assert!(a.as_usize().abs_diff(b.as_usize()) >= 4096);
+    }
+
+    #[test]
+    fn calloc_zeroes_memory() {
+        let (dm, _pa, alloc) = make_alloc(4);
+        let mut local = LocalHeap::new();
+
+        let ptr = alloc.alloc_with_local(&mut local, 128).unwrap();
+        unsafe {
+            *ptr.to_virtual(&*dm).as_ptr::<u64>() = 0xDEAD_BEEF_CAFE_BABE;
+        }
+        alloc.free_with_local(&mut local, ptr).unwrap();
+
+        let zeroed = alloc.calloc_with_local(&mut local, 128).unwrap();
+        let slice =
+            unsafe { core::slice::from_raw_parts(zeroed.to_virtual(&*dm).as_ptr::<u8>(), 128) };
+        assert!(slice.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn page_table_alloc_is_aligned() {
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let mut local = LocalHeap::new();
+        let ptr = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
+        assert_eq!(ptr.as_usize() % PAGE_TABLE_SIZE, 0);
+    }
+
+    #[test]
+    fn adjacent_frees_are_coalesced() {
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let mut local = LocalHeap::new();
+        let a = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
+        let b = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
+        assert_eq!(b.as_usize(), a.as_usize() + PAGE_TABLE_SIZE);
+
+        alloc.free_with_local(&mut local, b).unwrap();
+        alloc.free_with_local(&mut local, a).unwrap();
+
+        let big = alloc
+            .alloc_with_local(&mut local, PAGE_TABLE_SIZE * 2)
+            .unwrap();
+        assert_eq!(big, a);
+    }
+
+    #[test]
+    fn large_allocs_dont_overlap() {
+        let (_dm, _pa, alloc) = make_alloc(8);
+        let mut local = LocalHeap::new();
+        let a = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        let b = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        assert!(a.as_usize().abs_diff(b.as_usize()) >= (1 << 22));
+    }
+
+    #[test]
+    fn large_free_and_realloc_reuses_address() {
+        let (_dm, _pa, alloc) = make_alloc(8);
+        let mut local = LocalHeap::new();
+        let a = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        let b = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        assert_ne!(a, b);
+
+        alloc.free_with_local(&mut local, b).unwrap();
+        let c = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        assert_eq!(c, b);
+    }
+
+    #[test]
+    fn zero_size_alloc_succeeds() {
+        let (_dm, _pa, alloc) = make_alloc(2);
+        let mut local = LocalHeap::new();
+        let ptr = alloc.alloc_with_local(&mut local, 0).unwrap();
+        alloc.free_with_local(&mut local, ptr).unwrap();
+    }
+
+    #[test]
+    fn alloc_too_large_fails() {
+        let (_dm, _pa, alloc) = make_alloc(8);
+        let mut local = LocalHeap::new();
         assert!(matches!(
-            size_to_class(MAX_ALLOC_SIZE + 1),
+            alloc.alloc_with_local(&mut local, MAX_ALLOC + 1),
             Err(MemoryError::AllocationTooLarge { .. })
         ));
     }
 
     #[test]
-    fn kmalloc_large_is_contiguous_and_reused() {
-        let dm = KernelDirectMap;
-        let page_alloc = Box::new(PageAllocator::new());
-        let alloc = Box::new(KernelAllocator::new(&dm, &page_alloc));
+    fn double_free_is_detected() {
+        let (_dm, _pa, alloc) = make_alloc(2);
+        let mut local = LocalHeap::new();
+        let ptr = alloc.alloc_with_local(&mut local, 64).unwrap();
+        alloc.free_with_local(&mut local, ptr).unwrap();
 
-        let a = alloc.alloc((1 << 22) + 1).unwrap();
-        let b = alloc.alloc(1 << 22).unwrap();
-
-        assert_eq!(a.as_usize() % PAGE_SIZE, 0);
-        assert_eq!(b.as_usize() % PAGE_SIZE, 0);
-
-        alloc.free(a, (1 << 22) + 1).unwrap();
-        let c = alloc.alloc(1 << 23).unwrap();
-        assert_eq!(c.as_u64(), a.as_u64());
+        let result = alloc.free_with_local(&mut local, ptr);
+        assert!(matches!(result, Err(MemoryError::UnknownAllocation { .. })));
     }
 
     #[test]
-    fn kmalloc_large_allocations_do_not_overlap() {
-        let dm = KernelDirectMap;
-        let page_alloc = Box::new(PageAllocator::new());
-        let alloc = Box::new(KernelAllocator::new(&dm, &page_alloc));
+    fn cross_thread_free_is_reused() {
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let alloc: Arc<KernelAllocator<'static, TestDirectMap>> = Arc::from(alloc);
 
-        let a = alloc.alloc(1 << 22).unwrap();
-        let b = alloc.alloc(1 << 22).unwrap();
+        let mut owner = LocalHeap::new();
+        let ptr = alloc.alloc_with_local(&mut owner, 64).unwrap();
 
-        let a_phys = a.as_u64();
-        let b_phys = b.as_u64();
+        let worker_alloc = Arc::clone(&alloc);
+        let worker = std::thread::spawn(move || {
+            let mut local = LocalHeap::new();
+            worker_alloc.free_with_local(&mut local, ptr).unwrap();
+        });
+        worker.join().unwrap();
 
-        assert_ne!(a_phys, b_phys);
-        let diff = a_phys.abs_diff(b_phys);
-        assert!(diff >= (1 << 22));
+        let mut local = LocalHeap::new();
+        let next = alloc.alloc_with_local(&mut local, 64).unwrap();
+        assert_eq!(next, ptr);
     }
 
     #[test]
-    fn kmalloc_large_free_and_realloc_same_class_reuses_address() {
-        let dm = KernelDirectMap;
-        let page_alloc = Box::new(PageAllocator::new());
-        let alloc = Box::new(KernelAllocator::new(&dm, &page_alloc));
+    fn concurrent_live_allocations_are_unique() {
+        const THREADS: usize = 32;
+        const OPS: usize = 16;
+        const SIZE: usize = 64;
 
-        let a = alloc.alloc(1 << 24).unwrap();
-        let b = alloc.alloc(1 << 24).unwrap();
-        assert_ne!(a.as_u64(), b.as_u64());
+        let (_dm, _pa, alloc) = make_alloc(4);
+        let alloc: Arc<KernelAllocator<'static, TestDirectMap>> = Arc::from(alloc);
 
-        alloc.free(b, 1 << 24).unwrap();
-        let c = alloc.alloc(1 << 24).unwrap();
-        assert_eq!(c.as_u64(), b.as_u64());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let alloc = Arc::clone(&alloc);
+                std::thread::spawn(move || {
+                    let mut local = LocalHeap::new();
+                    (0..OPS)
+                        .map(|_| alloc.alloc_with_local(&mut local, SIZE).unwrap().as_usize())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let allocations: Vec<Vec<usize>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let mut seen = HashSet::new();
+        for ptrs in &allocations {
+            for &addr in ptrs {
+                assert!(seen.insert(addr), "duplicate live allocation at {addr:#x}");
+            }
+        }
+
+        let mut local = LocalHeap::new();
+        for ptrs in allocations {
+            for addr in ptrs {
+                alloc.free_with_local(&mut local, PhysicalAddr::new(addr))
+                    .unwrap();
+            }
+        }
     }
 }

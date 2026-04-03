@@ -3,9 +3,6 @@ name = "sumi-kernel"
 version.workspace = true
 edition.workspace = true
 
-[features]
-bench-memory-limit = []
-
 [dependencies]
 sumi-abi = { path = "../sumi-abi" }
 spin = "0.10.0"

@@ -1,2 +1,23 @@
 /target
 .vscode
+
+# Codex local configuration
+.codex/
+
+# Claude Flow runtime data
+.claude*
+.hive-mind
+.swarm
+.agents
+.mcp.json
+
+AGENTS.md
+CLAUDE.md
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Claude Code local config
+CLAUDE.local.md
