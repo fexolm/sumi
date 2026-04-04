@@ -52,12 +52,12 @@ unsafe extern "C" {
 /// Initialize MSRs to enable syscall handling. Call once at boot before running any user code.
 #[cfg(not(test))]
 pub fn init() {
-    // SAFETY: We are in ring 0 during kernel boot. EFER is read-modify-write
-    // to preserve existing bits (LME, LMA). All MSR addresses and values are correct.
+    // SAFETY: We are in ring 0 during kernel boot. All MSR addresses and values
+    // are correct for 64-bit long mode.
     unsafe {
-        let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | EFER_SCE);
-        wrmsr(MSR_LSTAR, syscall_entry as u64);
+        // Enable SCE in EFER via KVM sregs (set in VM init) to avoid WRMSR #GP.
+        // Set LSTAR, STAR, SFMASK for syscall handling.
+        wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
         wrmsr(MSR_STAR, STAR_VALUE);
         wrmsr(MSR_SFMASK, SFMASK_VALUE);
     }

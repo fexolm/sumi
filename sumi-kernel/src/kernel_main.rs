@@ -3,7 +3,7 @@ use core::panic::PanicInfo;
 use sumi_abi::arch::layout::DIRECT_MAP_PML4;
 use sumi_kernel::{
     KernelState,
-    arch::{KernelDirectMap, RootPageTable, debugcon_write_byte, halt_forever},
+    arch::{KernelDirectMap, RootPageTable, debugcon_write_byte, halt_forever, syscall},
     fs::virtio_fs::VirtioFsClient,
     memory::alloc::{kmalloc::KernelAllocator, palloc::PageAllocator},
 };
@@ -19,15 +19,14 @@ static KERNEL_PAGE_TABLE: RootPageTable<KernelDirectMap> =
 pub extern "C" fn _start() -> ! {
     let _kernel = KernelState::new(&PAGE_ALLOCATOR, &KERNEL_ALLOCATOR, &KERNEL_PAGE_TABLE);
 
+    syscall::init();
+
     // Initialize virtio-fs if the device is present
     if let Some(fs) = VirtioFsClient::init(&KERNEL_ALLOCATOR) {
         sumi_kernel::VIRTIO_FS.call_once(|| fs);
     }
 
-    // Run kernel selftests if virtio-fs is available
-    if sumi_kernel::VIRTIO_FS.get().is_some() {
-        sumi_kernel::selftest::run_all();
-    }
+    sumi_kernel::selftest::run_all();
 
     debugcon_write_byte(0x41);
     halt_forever()

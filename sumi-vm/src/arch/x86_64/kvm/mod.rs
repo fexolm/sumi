@@ -29,6 +29,7 @@ const PTE_PS: u64 = 0x80;
 const CR4_PAE: u64 = 1 << 5;
 const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const EFER_SCE: u64 = 1 << 0;
 const EFER_LME: u64 = 1 << 8;
 const EFER_LMA: u64 = 1 << 10;
 const CR0_PE: u64 = 1 << 0;
@@ -176,7 +177,8 @@ impl VCpu for KvmVCpu {
         sregs.cr4 |= CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
 
         // EFER.LME enables Long Mode; EFER.LMA indicates Long Mode Active.
-        sregs.efer = EFER_LME | EFER_LMA;
+        // EFER.SCE enables the SYSCALL/SYSRET instructions.
+        sregs.efer = EFER_LME | EFER_LMA | EFER_SCE;
 
         // Code segment descriptor: set as a 64-bit code segment.
         sregs.cs.l = 1; // L bit = 1 => 64-bit code segment

@@ -228,14 +228,20 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
 
     match whence {
         SEEK_SET => {
+            if offset < 0 {
+                return EINVAL;
+            }
             // SAFETY: cur_offset points into the FD table entry we hold via table lock.
             unsafe { *cur_offset = offset as u64 };
             offset as SyscallResult
         }
         SEEK_CUR => {
             let cur = unsafe { *cur_offset };
-            let new = (cur as i64 + offset) as u64;
-            unsafe { *cur_offset = new };
+            let new = cur as i64 + offset;
+            if new < 0 {
+                return EINVAL;
+            }
+            unsafe { *cur_offset = new as u64 };
             new as SyscallResult
         }
         SEEK_END => {
@@ -248,14 +254,17 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
                 Ok(a) => a,
                 Err(e) => return e as SyscallResult,
             };
-            let new = (attr.attr.size as i64 + offset) as u64;
+            let new = attr.attr.size as i64 + offset;
+            if new < 0 {
+                return EINVAL;
+            }
             let mut table = crate::FD_TABLE.lock();
             if let Some(desc) = table.get_mut(fd_num) {
                 if let FdKind::File {
                     offset: cur, ..
                 } = &mut desc.kind
                 {
-                    *cur = new;
+                    *cur = new as u64;
                     return new as SyscallResult;
                 }
             }

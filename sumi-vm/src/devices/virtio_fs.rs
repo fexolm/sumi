@@ -321,6 +321,10 @@ impl VirtioFs {
             Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
         };
 
+        if name == ".." || name == "." || name.contains('/') || name.contains('\0') {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
         let parent_path = match self.nodes.get(header.nodeid as usize) {
             Some(Some(node)) => node.host_path.clone(),
             _ => return self.write_error(header.unique, -2, writable_bufs, mem),
@@ -415,6 +419,10 @@ impl VirtioFs {
             Ok(s) => s,
             Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
         };
+
+        if name == ".." || name == "." || name.contains('/') || name.contains('\0') {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
 
         let parent_path = match self.nodes.get(header.nodeid as usize) {
             Some(Some(node)) => node.host_path.clone(),
