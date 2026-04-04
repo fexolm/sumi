@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 pub mod pagetable;
+pub mod syscall;
 
 pub use self::pagetable::RootPageTable;
 pub use sumi_abi::arch::address::DirectMap as KernelDirectMap;

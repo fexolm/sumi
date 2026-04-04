@@ -3,7 +3,7 @@ use core::panic::PanicInfo;
 use sumi_abi::arch::layout::DIRECT_MAP_PML4;
 use sumi_kernel::{
     KernelState,
-    arch::{KernelDirectMap, RootPageTable, debugcon_write_byte, halt_forever},
+    arch::{KernelDirectMap, RootPageTable, debugcon_write_byte, halt_forever, syscall},
     memory::alloc::{kmalloc::KernelAllocator, palloc::PageAllocator},
 };
 
@@ -17,6 +17,8 @@ static KERNEL_PAGE_TABLE: RootPageTable<KernelDirectMap> =
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _kernel = KernelState::new(&PAGE_ALLOCATOR, &KERNEL_ALLOCATOR, &KERNEL_PAGE_TABLE);
+
+    syscall::init();
 
     debugcon_write_byte(0x41);
     halt_forever()
