@@ -13,15 +13,14 @@ impl crate::address::DirectMap for DirectMap {
     }
 
     fn v2p(&self, vaddr: VirtualAddr) -> Option<PhysicalAddr> {
-        if vaddr.as_usize() < DIRECT_MAP_OFFSET.as_usize()
-            || vaddr.as_usize() > DIRECT_MAP_OFFSET.as_usize() + MAX_PHYSICAL_ADDR
-        {
-            None
-        } else {
-            Some(PhysicalAddr::new(
-                vaddr.as_usize() - DIRECT_MAP_OFFSET.as_usize(),
-            ))
+        if vaddr.as_usize() < DIRECT_MAP_OFFSET.as_usize() {
+            return None;
         }
+        let phys = vaddr.as_usize() - DIRECT_MAP_OFFSET.as_usize();
+        if phys >= MAX_PHYSICAL_ADDR {
+            return None;
+        }
+        Some(PhysicalAddr::new(phys))
     }
 }
 

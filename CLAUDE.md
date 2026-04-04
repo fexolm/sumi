@@ -25,6 +25,9 @@ cargo test
 # Run tests for a specific crate
 cargo test -p sumi-kernel
 cargo test -p sumi-vm
+
+# Run kernel selftests under KVM (requires /dev/kvm)
+make self-test
 ```
 
 ## Coding Standards
@@ -61,6 +64,15 @@ This is a bare-metal systems project. Every decision matters.
 - Every allocator/memory subsystem change must have unit tests.
 - Tests must verify edge cases: zero-size, max-size, alignment, double-free, concurrent access.
 - Use `TestDirectMap` pattern from `kmalloc.rs` for memory subsystem tests.
+
+### Delivery Checklist
+Every implementation MUST pass before being presented as complete:
+1. `cargo test` — all unit tests pass.
+2. `cargo build -p sumi-kernel --target x86_64-unknown-none` — bare-metal kernel links.
+3. `cargo build -p sumi-vm` — VM host binary builds.
+4. KVM smoke test: `sumi-vm run <kernel>` — kernel boots and exits cleanly.
+5. KVM integration test: if a new device/subsystem was added, run `sumi-vm run --share <dir> <kernel>` (or equivalent) and verify the init path succeeds.
+If any step fails, fix it before reporting done. Never present a broken build.
 
 ## Multi-Agent Development Workflow
 
