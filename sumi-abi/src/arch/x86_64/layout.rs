@@ -33,3 +33,15 @@ const KERNEL_STACK_SIZE: usize = 0x1000 * 8; // 32KB stack
 pub const KERNEL_STACK: PhysicalAddr = KERNEL_CODE_PD
     .add(PAGE_TABLE_SIZE + KERNEL_STACK_SIZE)
     .align_up(PAGE_SIZE);
+
+/// Base physical address for virtio MMIO devices.
+/// Placed at 64 GB — above any reasonable guest RAM (2 TB max),
+/// within the direct-map range so the kernel can access it, and
+/// outside the KVM memslot so accesses trigger MMIO exits.
+pub const VIRTIO_MMIO_BASE: PhysicalAddr = PhysicalAddr::new(0x10_0000_0000);
+
+/// Each virtio device occupies 4KB (one MMIO page).
+pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+
+/// Device 0 = virtio-fs.
+pub const VIRTIO_FS_MMIO: PhysicalAddr = VIRTIO_MMIO_BASE;

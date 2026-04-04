@@ -1,16 +1,18 @@
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VcpuExit;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use sumi_abi::arch::address::DirectMap;
 use sumi_abi::arch::address::{get_pdpt_index, get_pml4_index};
 use sumi_abi::arch::layout::{
-    DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
-    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD,
-    KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
+    DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4, DIRECT_MAP_PML4_ENTRIES_COUNT,
+    DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD, KERNEL_CODE_PDPD, KERNEL_STACK,
+    PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
 };
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use crate::devices::DeviceRegistry;
 use crate::{
     error::Result,
     vm::{VCpu, VirtBackend, VmCreateInfo},
@@ -59,7 +61,7 @@ impl VirtBackend for KvmVm {
         let kvm = kvm_ioctls::Kvm::new()?;
         let vm_fd = kvm.create_vm()?;
         Ok(Self {
-            vm_fd: vm_fd,
+            vm_fd,
             next_vcpu_id: AtomicUsize::new(0),
         })
     }
@@ -122,21 +124,31 @@ impl VirtBackend for KvmVm {
         Ok(())
     }
 
-    fn create_vcpu(&self) -> Result<Self::VCpuType> {
+    fn create_vcpu(
+        &self,
+        devices: Arc<Mutex<DeviceRegistry>>,
+        mem: Arc<GuestMemoryMmap<()>>,
+    ) -> Result<Self::VCpuType> {
         let id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
         let fd = self.vm_fd.create_vcpu(id as u64)?;
 
-        Ok(KvmVCpu::new(fd))
+        Ok(KvmVCpu::new(fd, devices, mem))
     }
 }
 
 pub struct KvmVCpu {
     fd: kvm_ioctls::VcpuFd,
+    devices: Arc<Mutex<DeviceRegistry>>,
+    mem: Arc<GuestMemoryMmap<()>>,
 }
 
 impl KvmVCpu {
-    pub fn new(fd: kvm_ioctls::VcpuFd) -> Self {
-        Self { fd }
+    pub fn new(
+        fd: kvm_ioctls::VcpuFd,
+        devices: Arc<Mutex<DeviceRegistry>>,
+        mem: Arc<GuestMemoryMmap<()>>,
+    ) -> Self {
+        Self { fd, devices, mem }
     }
 }
 
@@ -200,7 +212,19 @@ impl VCpu for KvmVCpu {
         loop {
             match self.fd.run()? {
                 VcpuExit::IoOut(port, data) if port == 0xE9 => {
-                    println!("IoOut: {}", String::from_utf8_lossy(data));
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    let _ = lock.write_all(data);
+                    let _ = lock.flush();
+                }
+                VcpuExit::MmioRead(addr, data) => {
+                    let devs = self.devices.lock().unwrap();
+                    devs.handle_mmio_read(addr, data);
+                }
+                VcpuExit::MmioWrite(addr, data) => {
+                    let mut devs = self.devices.lock().unwrap();
+                    devs.handle_mmio_write(addr, data, &self.mem);
                 }
                 VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),
                 other => return Err(Error::UnexpectedExit(format!("{:?}", other))),

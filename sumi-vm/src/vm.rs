@@ -3,9 +3,13 @@ use goblin::elf::program_header::PT_LOAD;
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use crate::devices::DeviceRegistry;
 use crate::error::{Error, Result};
 use std::{
-    fmt::{self, Display}, path::PathBuf, thread
+    fmt::{self, Display},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    thread,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +30,7 @@ pub struct VmCreateInfo {
     pub hypervisor: Hypervisor,
     pub mem_size: usize,
     pub kernel_path: PathBuf,
+    pub share_dir: Option<PathBuf>,
 }
 
 pub trait VirtBackend: Sized {
@@ -35,11 +40,15 @@ pub trait VirtBackend: Sized {
 
     fn initialize_memory(&self, mem: &GuestMemoryMmap<()>) -> Result<()>;
 
-    fn create_vcpu(&self) -> Result<Self::VCpuType>;
+    fn create_vcpu(
+        &self,
+        devices: Arc<Mutex<DeviceRegistry>>,
+        mem: Arc<GuestMemoryMmap<()>>,
+    ) -> Result<Self::VCpuType>;
 }
 
 pub struct SumiVm<Backend: VirtBackend + 'static> {
-    _mem: GuestMemoryMmap<()>,
+    mem: Arc<GuestMemoryMmap<()>>,
     _backend: Backend,
     kernel_entry: u64,
     vcpus: Vec<Backend::VCpuType>,
@@ -49,21 +58,25 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
     pub fn new(info: &VmCreateInfo) -> Result<Self> {
         let backend = Backend::new(info)?;
 
-        let mut vcpus = Vec::new();
-
-        for _ in 0..info.vcpu_count {
-            vcpus.push(backend.create_vcpu()?);
-        }
-
-        let mem: GuestMemoryMmap<()> =
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), info.mem_size + KERNEL_CODE_SIZE)])?;
+        let mem = Arc::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), info.mem_size + KERNEL_CODE_SIZE)])?,
+        );
 
         backend.initialize_memory(&mem)?;
+
+        let devices = Arc::new(Mutex::new(DeviceRegistry::new(
+            info.share_dir.as_deref(),
+        )));
+
+        let mut vcpus = Vec::new();
+        for _ in 0..info.vcpu_count {
+            vcpus.push(backend.create_vcpu(Arc::clone(&devices), Arc::clone(&mem))?);
+        }
 
         let kernel_entry = Self::load_elf(&mem, &info.kernel_path)?;
 
         Ok(Self {
-            _mem: mem,
+            mem,
             vcpus,
             _backend: backend,
             kernel_entry,
@@ -151,7 +164,10 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                     ph.p_paddr, memsz
                 )))
             })?;
-            if phys_end == 0 || phys_end - 1 > guest_memory_end || phys_end > KERNEL_CODE_SIZE as u64 {
+            if phys_end == 0
+                || phys_end - 1 > guest_memory_end
+                || phys_end > KERNEL_CODE_SIZE as u64
+            {
                 return Err(Error::Parsing(goblin::error::Error::Malformed(format!(
                     "Program header with p_paddr {:#x} and memsz {:#x} is out of guest memory bounds",
                     ph.p_paddr, memsz

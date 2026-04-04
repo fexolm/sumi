@@ -8,6 +8,10 @@ pub struct RunCommand {
     /// Path to the program binary that will be loaded into the VM.
     #[arg(value_name = "PROGRAM")]
     program: PathBuf,
+
+    /// Host directory to share with the guest as its root filesystem.
+    #[arg(long = "share", value_name = "DIR")]
+    share_dir: Option<PathBuf>,
 }
 
 impl RunCommand {
@@ -17,6 +21,7 @@ impl RunCommand {
             hypervisor: Hypervisor::Kvm,
             mem_size: 2 << 30,
             kernel_path: self.program,
+            share_dir: self.share_dir,
         };
 
         run_sumi_vm(&info)
