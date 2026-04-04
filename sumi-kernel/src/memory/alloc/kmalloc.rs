@@ -308,24 +308,33 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
 
     fn write_free_block(&self, addr: usize, size: usize, next: usize) {
         unsafe {
-            *PhysicalAddr::new(addr).to_virtual(self.dm).as_ptr::<FreeBlock>() = FreeBlock {
-                size,
-                next,
-            };
+            *PhysicalAddr::new(addr)
+                .to_virtual(self.dm)
+                .as_ptr::<FreeBlock>() = FreeBlock { size, next };
         }
     }
 
     fn free_block(&self, addr: usize) -> &FreeBlock {
-        unsafe { PhysicalAddr::new(addr).to_virtual(self.dm).as_ref_mut::<FreeBlock>() }
+        unsafe {
+            PhysicalAddr::new(addr)
+                .to_virtual(self.dm)
+                .as_ref_mut::<FreeBlock>()
+        }
     }
 
     fn free_block_mut(&self, addr: usize) -> &mut FreeBlock {
-        unsafe { PhysicalAddr::new(addr).to_virtual(self.dm).as_ref_mut::<FreeBlock>() }
+        unsafe {
+            PhysicalAddr::new(addr)
+                .to_virtual(self.dm)
+                .as_ref_mut::<FreeBlock>()
+        }
     }
 }
 
 fn allocation_alignment(size: usize) -> usize {
-    size.next_power_of_two().min(PAGE_TABLE_SIZE).max(MIN_ALIGNMENT)
+    size.next_power_of_two()
+        .min(PAGE_TABLE_SIZE)
+        .max(MIN_ALIGNMENT)
 }
 
 fn align_up(addr: usize, align: usize) -> usize {
@@ -590,7 +599,8 @@ mod tests {
         let mut local = LocalHeap::new();
         for ptrs in allocations {
             for addr in ptrs {
-                alloc.free_with_local(&mut local, PhysicalAddr::new(addr))
+                alloc
+                    .free_with_local(&mut local, PhysicalAddr::new(addr))
                     .unwrap();
             }
         }

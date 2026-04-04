@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use sumi_abi::arch::address::DirectMap;
 use sumi_abi::arch::address::{get_pdpt_index, get_pml4_index};
 use sumi_abi::arch::layout::{
-    DIRECT_MAP_PD, DIRECT_MAP_PD_COUNT, DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
-    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, KERNEL_CODE_PD, KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES,
-    PAGE_TABLE_SIZE,
+    DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
+    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD,
+    KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
 };
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -65,6 +65,7 @@ impl VirtBackend for KvmVm {
     }
 
     fn initialize_memory(&self, mem: &GuestMemoryMmap<()>) -> Result<()> {
+        // PML4 entries — each points to a PDPT table
         for i in 0..DIRECT_MAP_PML4_ENTRIES_COUNT {
             let entry_val = (DIRECT_MAP_PDPT.as_u64() + i as u64 * PAGE_TABLE_SIZE as u64)
                 | PTE_PRESENT
@@ -74,17 +75,11 @@ impl VirtBackend for KvmVm {
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 
+        // PDPT entries — 1GB huge pages (PTE_PS at PDPT level), no PD tables needed
         for i in 0..DIRECT_MAP_PDPT_COUNT * PAGE_TABLE_ENTRIES {
-            let pd_phys = DIRECT_MAP_PD.as_u64() + i as u64 * PAGE_TABLE_SIZE as u64;
-            let entry_val = pd_phys | PTE_PRESENT | PTE_RW;
-            let entry_addr = GuestAddress(DIRECT_MAP_PDPT.as_u64() + (i * 8) as u64);
-            mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
-        }
-
-        for i in 0..DIRECT_MAP_PD_COUNT * PAGE_TABLE_ENTRIES {
-            let phys = i as u64 * PAGE_SIZE as u64;
+            let phys = i as u64 * HUGE_PAGE_SIZE_1G as u64;
             let entry_val = phys | PTE_PRESENT | PTE_RW | PTE_PS;
-            let entry_addr = GuestAddress(DIRECT_MAP_PD.as_u64() + (i * 8) as u64);
+            let entry_addr = GuestAddress(DIRECT_MAP_PDPT.as_u64() + (i * 8) as u64);
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 

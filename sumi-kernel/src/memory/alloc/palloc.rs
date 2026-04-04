@@ -2,12 +2,12 @@ use crate::memory::errors::{MemoryError, Result};
 use sumi_abi::{
     address::PhysicalAddr,
     arch::layout::{KERNEL_STACK, PAGE_SIZE},
-    layout::MAX_PHYSICAL_ADDR,
+    layout::MAX_GUEST_MEMORY,
 };
 
 const PALLOC_FIRST_PAGE: PhysicalAddr = KERNEL_STACK;
 
-const PAGE_COUNT: usize = (MAX_PHYSICAL_ADDR + 1).div_ceil(PAGE_SIZE);
+const PAGE_COUNT: usize = MAX_GUEST_MEMORY.div_ceil(PAGE_SIZE);
 const BITMAP_SIZE: usize = PAGE_COUNT.div_ceil(64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

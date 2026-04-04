@@ -2,8 +2,8 @@ ENTRY(_start)
 
 MEMORY
 {
-    phys (rx) : ORIGIN = 0x0, LENGTH = 1M
-    virt (rw) : ORIGIN = 0xffffffff80000000, LENGTH = 1M
+    phys (rx) : ORIGIN = 0x0, LENGTH = 4M
+    virt (rw) : ORIGIN = 0xffffffff80000000, LENGTH = 16M
 }
 
 PHDRS

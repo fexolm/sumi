@@ -97,7 +97,7 @@ This project uses a 4-agent workflow to ensure quality. Use `/develop` to run th
                         ... page tables, stack ...
 KERNEL_STACK            First allocatable page (palloc starts here)
                         ... physical memory ...
-0x0000_00FF_FFFF_FFFF  MAX_PHYSICAL_ADDR
+0x0000_7FFF_FFFF_FFFF  MAX_PHYSICAL_ADDR (128 TB)
 
 0xFFFF_8880_0000_0000  DIRECT_MAP_OFFSET (virtual, identity map of all physical memory)
 0xFFFF_FFFF_8000_0000  KERNEL_CODE_VIRT (virtual, 2GB kernel code region)
