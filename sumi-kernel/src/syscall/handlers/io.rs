@@ -30,7 +30,7 @@ fn release_fuse_resources(desc: &FileDescriptor) {
 
 /// Translate a virtual address to physical. Works for both kernel (direct-map)
 /// and user (lower-half, page-table walk) addresses.
-fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
+pub(crate) fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
     use sumi_abi::arch::layout::{DIRECT_MAP_OFFSET, PAGE_SIZE};
 
     let va = VirtualAddr::new(vaddr as usize);
@@ -46,7 +46,7 @@ fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
 }
 
 /// How many bytes from `vaddr` until the next 2 MB page boundary.
-fn bytes_to_page_end(vaddr: u64) -> u32 {
+pub(crate) fn bytes_to_page_end(vaddr: u64) -> u32 {
     use sumi_abi::arch::layout::PAGE_SIZE;
     let offset = vaddr as usize & (PAGE_SIZE - 1);
     (PAGE_SIZE - offset) as u32
@@ -55,7 +55,7 @@ fn bytes_to_page_end(vaddr: u64) -> u32 {
 /// Transfer data between a FUSE file handle and a user buffer, splitting at
 /// 2 MB page boundaries so each DMA uses the correct physical address.
 /// `op` is called with (file_offset, physical_addr, chunk_size) for each chunk.
-fn fs_transfer_chunked(
+pub(crate) fn fs_transfer_chunked(
     op: impl Fn(u64, sumi_abi::address::PhysicalAddr, u32) -> core::result::Result<u32, i32>,
     mut file_offset: u64,
     mut buf_vaddr: u64,

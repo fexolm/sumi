@@ -2,8 +2,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
+use libc;
+
+use sumi_abi::arch::layout::DAX_WINDOW_SIZE;
 use sumi_abi::fuse::*;
 use sumi_abi::virtio::*;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -20,10 +24,15 @@ pub struct VirtioFs {
     nodes: Vec<Option<FuseNode>>,
     file_handles: Vec<Option<File>>,
     last_avail_idx: u16,
+    /// Host pointer to the 128 GB DAX window. Null if DAX is not available.
+    dax_host_ptr: Option<*mut u8>,
 }
 
+// SAFETY: VirtioFs is only accessed from a single thread (inside Mutex<DeviceRegistry>).
+unsafe impl Send for VirtioFs {}
+
 impl VirtioFs {
-    pub fn new(share_dir: &std::path::Path) -> Self {
+    pub fn new(share_dir: &std::path::Path, dax_host_ptr: *mut u8) -> Self {
         let mut nodes = Vec::new();
         // nodeid 0 is unused (FUSE convention)
         nodes.push(None);
@@ -33,11 +42,18 @@ impl VirtioFs {
             _lookup_count: 1,
         }));
 
+        let dax_host_ptr = if dax_host_ptr.is_null() {
+            None
+        } else {
+            Some(dax_host_ptr)
+        };
+
         Self {
             _share_root: share_dir.to_path_buf(),
             nodes,
             file_handles: Vec::new(),
             last_avail_idx: 0,
+            dax_host_ptr,
         }
     }
 
@@ -191,6 +207,8 @@ impl VirtioFs {
                 self.handle_forget(header, req_data);
                 0
             }
+            FUSE_SETUPMAPPING => self.handle_setupmapping(header, req_data, writable_bufs, mem),
+            FUSE_REMOVEMAPPING => self.handle_removemapping(header, req_data, writable_bufs, mem),
             _ => self.write_error(header.unique, -38, writable_bufs, mem),
         }
     }
@@ -295,7 +313,8 @@ impl VirtioFs {
             max_write: 1_048_576, // 1 MB
             time_gran: 1,
             max_pages: 0,
-            map_alignment: 0,
+            // 21 = log2(2MB): tells the kernel that DAX mappings must be 2MB-aligned.
+            map_alignment: 21,
             flags2: 0,
             unused: [0; 7],
         };
@@ -779,6 +798,136 @@ impl VirtioFs {
         if nodeid < self.nodes.len() && nodeid > 1 {
             self.nodes[nodeid] = None;
         }
+    }
+
+    fn handle_setupmapping(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let in_size = core::mem::size_of::<FuseSetupMappingIn>();
+
+        if req_data.len() < hdr_size + in_size {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        // SAFETY: req_data is large enough and aligned for FuseSetupMappingIn (repr(C)).
+        let setup_in =
+            unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseSetupMappingIn) };
+
+        let dax_base = match self.dax_host_ptr {
+            Some(ptr) => ptr,
+            None => return self.write_error(header.unique, -12, writable_bufs, mem),
+        };
+
+        let moffset = setup_in.moffset as usize;
+        let len = setup_in.len as usize;
+        if moffset.checked_add(len).map_or(true, |end| end > DAX_WINDOW_SIZE) {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let fh = setup_in.fh as usize;
+        let file = match self.file_handles.get(fh) {
+            Some(Some(f)) => f,
+            _ => return self.write_error(header.unique, -9, writable_bufs, mem),
+        };
+
+        let fd = file.as_raw_fd();
+        let mmap_flags = libc::MAP_FIXED | libc::MAP_SHARED;
+        let prot = if setup_in.flags & FUSE_SETUPMAPPING_FLAG_WRITE != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+
+        // SAFETY: dax_base + moffset is within the 128 GB DAX window (bounds verified above)
+        // that was registered as a KVM memslot. MAP_FIXED replaces the anonymous mapping
+        // with a shared file mapping, which is what DAX requires.
+        let target = unsafe { dax_base.add(moffset) };
+        let result = unsafe {
+            libc::mmap(
+                target as *mut libc::c_void,
+                len as libc::size_t,
+                prot,
+                mmap_flags,
+                fd,
+                setup_in.foffset as libc::off_t,
+            )
+        };
+
+        if result == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        self.write_response(header.unique, &[], writable_bufs, mem)
+    }
+
+    fn handle_removemapping(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let in_size = core::mem::size_of::<FuseRemoveMappingIn>();
+        let one_size = core::mem::size_of::<FuseRemoveMappingOne>();
+
+        if req_data.len() < hdr_size + in_size + one_size {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let dax_base = match self.dax_host_ptr {
+            Some(ptr) => ptr,
+            None => return self.write_error(header.unique, -12, writable_bufs, mem),
+        };
+
+        // SAFETY: We verified req_data has enough bytes. Using read_unaligned because
+        // FuseRemoveMappingOne starts at byte offset 44 (hdr=40 + in=4), which is not
+        // 8-byte aligned.
+        let remove_one = unsafe {
+            core::ptr::read_unaligned(
+                req_data[hdr_size + in_size..].as_ptr() as *const FuseRemoveMappingOne,
+            )
+        };
+
+        let moffset = remove_one.moffset as usize;
+        let len = remove_one.len as usize;
+        if moffset.checked_add(len).map_or(true, |end| end > DAX_WINDOW_SIZE) {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        // Replace the shared file mapping with an anonymous private mapping,
+        // which disconnects that DAX slot from the file without unmapping the
+        // guest physical address (KVM still needs the host VA range present).
+        // SAFETY: target is within the DAX window (bounds verified above);
+        // MAP_FIXED replaces the previous mapping.
+        let target = unsafe { dax_base.add(moffset) };
+        let result = unsafe {
+            libc::mmap(
+                target as *mut libc::c_void,
+                len as libc::size_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+
+        if result == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        self.write_response(header.unique, &[], writable_bufs, mem)
     }
 }
 

@@ -34,7 +34,7 @@ pub struct VirtioMmioDevice {
 }
 
 impl VirtioMmioDevice {
-    pub fn new_fs(share_dir: &std::path::Path) -> Self {
+    pub fn new_fs(share_dir: &std::path::Path, dax_host_ptr: *mut u8) -> Self {
         Self {
             status: 0,
             device_features_sel: 0,
@@ -42,7 +42,7 @@ impl VirtioMmioDevice {
             driver_features_sel: 0,
             queue_sel: 0,
             queues: [VirtqueueState::new(), VirtqueueState::new()],
-            backend: VirtioFs::new(share_dir),
+            backend: VirtioFs::new(share_dir, dax_host_ptr),
         }
     }
 

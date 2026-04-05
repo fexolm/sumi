@@ -41,6 +41,9 @@ pub trait VirtBackend: Sized {
 
     fn initialize_memory(&self, mem: &GuestMemoryMmap<()>) -> Result<()>;
 
+    /// Return the host pointer for the DAX window, if one was set up.
+    fn dax_host_ptr(&self) -> *mut u8;
+
     fn create_vcpu(
         &self,
         devices: Arc<Mutex<DeviceRegistry>>,
@@ -65,8 +68,10 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 
         backend.initialize_memory(&mem)?;
 
+        let dax_host_ptr = backend.dax_host_ptr();
         let devices = Arc::new(Mutex::new(DeviceRegistry::new(
             info.share_dir.as_deref(),
+            dax_host_ptr,
         )));
 
         let mut vcpus = Vec::new();

@@ -57,3 +57,12 @@ pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 
 /// Device 0 = virtio-fs.
 pub const VIRTIO_FS_MMIO: PhysicalAddr = VIRTIO_MMIO_BASE;
+
+/// Base physical address of the DAX shared memory window.
+pub const DAX_WINDOW_BASE: PhysicalAddr = PhysicalAddr::new(0x20_0000_0000);
+
+/// Total DAX window size (128 GB = 65536 x 2MB slots).
+pub const DAX_WINDOW_SIZE: usize = 128 * 1024 * 1024 * 1024;
+
+/// Number of 2MB slots in the DAX window.
+pub const DAX_SLOT_COUNT: usize = DAX_WINDOW_SIZE / PAGE_SIZE;

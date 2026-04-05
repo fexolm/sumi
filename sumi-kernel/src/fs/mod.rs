@@ -1,3 +1,4 @@
+pub mod dax;
 pub mod virtio_fs;
 
 pub const MAX_FDS: usize = 256;

@@ -271,6 +271,7 @@ dependencies = [
  "goblin",
  "kvm-bindings",
  "kvm-ioctls",
+ "libc",
  "sumi-abi",
  "thiserror",
  "vm-memory",

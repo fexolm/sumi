@@ -10,12 +10,17 @@ pub struct DeviceRegistry {
     devices: Vec<(u64, VirtioMmioDevice)>,
 }
 
+// SAFETY: DeviceRegistry is only accessed through a Mutex; the raw pointer inside
+// VirtioMmioDevice/VirtioFs points to the DAX window which lives for the VM lifetime.
+unsafe impl Send for DeviceRegistry {}
+unsafe impl Sync for DeviceRegistry {}
+
 impl DeviceRegistry {
-    pub fn new(share_dir: Option<&std::path::Path>) -> Self {
+    pub fn new(share_dir: Option<&std::path::Path>, dax_host_ptr: *mut u8) -> Self {
         let mut devices = Vec::new();
 
         if let Some(dir) = share_dir {
-            let fs_device = VirtioMmioDevice::new_fs(dir);
+            let fs_device = VirtioMmioDevice::new_fs(dir, dax_host_ptr);
             devices.push((VIRTIO_MMIO_BASE.as_u64(), fs_device));
         }
 

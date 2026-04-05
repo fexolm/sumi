@@ -32,3 +32,8 @@ pub static VIRTIO_FS: spin::Once<fs::virtio_fs::VirtioFsClient> = spin::Once::ne
 pub static BRK_BASE: spin::Mutex<VirtualAddr> = spin::Mutex::new(VirtualAddr::new(0));
 pub static BRK_CURRENT: spin::Mutex<VirtualAddr> = spin::Mutex::new(VirtualAddr::new(0));
 pub static MMAP_NEXT: spin::Mutex<VirtualAddr> = spin::Mutex::new(USER_MMAP_BASE);
+
+pub static DAX_ALLOCATOR: spin::Mutex<fs::dax::DaxAllocator> =
+    spin::Mutex::new(fs::dax::DaxAllocator::new());
+pub static VMA_TABLE: spin::Mutex<memory::vma::VmaTable> =
+    spin::Mutex::new(memory::vma::VmaTable::new());

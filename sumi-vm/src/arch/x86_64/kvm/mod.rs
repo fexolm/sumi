@@ -1,13 +1,13 @@
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VcpuExit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use sumi_abi::arch::address::DirectMap;
 use sumi_abi::arch::address::{get_pdpt_index, get_pml4_index};
 use sumi_abi::arch::layout::{
-    DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4, DIRECT_MAP_PML4_ENTRIES_COUNT,
-    DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD, KERNEL_CODE_PDPD, KERNEL_STACK,
-    PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
+    DAX_WINDOW_BASE, DAX_WINDOW_SIZE, DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
+    DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD,
+    KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
 };
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -51,6 +51,9 @@ pub const GUEST_BASE: GuestAddress = GuestAddress(0);
 pub struct KvmVm {
     vm_fd: kvm_ioctls::VmFd,
     next_vcpu_id: AtomicUsize,
+    /// Host pointer to the 128 GB DAX window (anonymous mmap, MAP_NORESERVE).
+    /// Written once in initialize_memory, read thereafter.
+    dax_host_ptr: AtomicPtr<u8>,
 }
 
 impl KvmVm {}
@@ -64,7 +67,12 @@ impl VirtBackend for KvmVm {
         Ok(Self {
             vm_fd,
             next_vcpu_id: AtomicUsize::new(0),
+            dax_host_ptr: AtomicPtr::new(core::ptr::null_mut()),
         })
+    }
+
+    fn dax_host_ptr(&self) -> *mut u8 {
+        self.dax_host_ptr.load(Ordering::Acquire)
     }
 
     fn initialize_memory(&self, mem: &GuestMemoryMmap<()>) -> Result<()> {
@@ -108,7 +116,7 @@ impl VirtBackend for KvmVm {
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 
-        // Register the guest memory region with KVM.
+        // Register the guest memory region with KVM (slot 0).
         let guest_memory_size = mem.last_addr().0 + 1;
 
         unsafe {
@@ -121,6 +129,39 @@ impl VirtBackend for KvmVm {
                     flags: 0,
                 })?;
         }
+
+        // Allocate the 128 GB DAX window on the host and register as KVM memslot 1.
+        // MAP_NORESERVE so we don't commit swap for the full 128 GB upfront.
+        // SAFETY: mmap with MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE and prot RW
+        // returns a valid pointer or MAP_FAILED (-1).
+        let dax_ptr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                DAX_WINDOW_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if dax_ptr == libc::MAP_FAILED {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        let dax_ptr = dax_ptr as *mut u8;
+
+        // SAFETY: dax_ptr is a valid host mapping of DAX_WINDOW_SIZE bytes.
+        unsafe {
+            self.vm_fd
+                .set_user_memory_region(kvm_userspace_memory_region {
+                    slot: 1,
+                    guest_phys_addr: DAX_WINDOW_BASE.as_u64(),
+                    memory_size: DAX_WINDOW_SIZE as u64,
+                    userspace_addr: dax_ptr as u64,
+                    flags: 0,
+                })?;
+        }
+
+        self.dax_host_ptr.store(dax_ptr, Ordering::Release);
 
         Ok(())
     }

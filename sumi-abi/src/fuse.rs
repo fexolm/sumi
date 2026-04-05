@@ -16,6 +16,12 @@ pub const FUSE_OPENDIR: u32 = 28;
 pub const FUSE_READDIR: u32 = 29;
 pub const FUSE_RELEASEDIR: u32 = 30;
 
+pub const FUSE_SETUPMAPPING: u32 = 48;
+pub const FUSE_REMOVEMAPPING: u32 = 49;
+
+pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1;
+pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 2;
+
 pub const FUSE_ROOT_ID: u64 = 1;
 
 #[repr(C)]
@@ -205,4 +211,27 @@ pub const fn fuse_dirent_align(x: usize) -> usize {
 /// Total size of a FUSE dirent including the name and padding.
 pub const fn fuse_dirent_size(namelen: usize) -> usize {
     fuse_dirent_align(core::mem::size_of::<FuseDirent>() + namelen)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseSetupMappingIn {
+    pub fh: u64,
+    pub foffset: u64,
+    pub len: u64,
+    pub flags: u64,
+    pub moffset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseRemoveMappingIn {
+    pub count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseRemoveMappingOne {
+    pub moffset: u64,
+    pub len: u64,
 }

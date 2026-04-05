@@ -59,7 +59,7 @@ The current `sys_mmap` returns `ENOSYS` for any non-`MAP_ANONYMOUS` call.
  +-----v-------------------------+
  | Map DAX phys pages into       |           +-------------------------------+
  | user virtual address space    |           | DAX Window (KVM memslot 1)    |
- | via KERNEL_PAGE_TABLE         |           |  host mmap'd region, 512 MB   |
+ | via KERNEL_PAGE_TABLE         |           |  host mmap'd region, 128 GB   |
  +-------------------------------+           |  guest sees as physical memory |
                                              +-------------------------------+
  +-------------------------------+

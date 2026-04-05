@@ -921,6 +921,135 @@ impl VirtioFsClient {
         }
     }
 
+    /// FUSE_SETUPMAPPING: map a file region into the DAX window.
+    pub fn setup_mapping(
+        &self,
+        fh: u64,
+        file_offset: u64,
+        len: u64,
+        dax_offset: usize,
+        flags: u64,
+    ) -> Result<(), i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseSetupMappingIn>()];
+
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr() as *mut FuseInHeader,
+                FuseInHeader {
+                    len: req.len() as u32,
+                    opcode: FUSE_SETUPMAPPING,
+                    unique: self.next_unique(),
+                    nodeid: 0,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                    padding: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseSetupMappingIn,
+                FuseSetupMappingIn {
+                    fh,
+                    foffset: file_offset,
+                    len,
+                    flags,
+                    moffset: dax_offset as u64,
+                },
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+
+        let specs = [
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
+        ];
+
+        self.submit_chain(&specs)?;
+
+        // SAFETY: VM wrote FuseOutHeader into resp buffer.
+        unsafe {
+            let out_header = core::ptr::read_volatile(resp.as_ptr() as *const FuseOutHeader);
+            if out_header.error != 0 {
+                return Err(out_header.error);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// FUSE_REMOVEMAPPING: unmap a region from the DAX window.
+    pub fn remove_mapping(&self, dax_offset: usize, len: u64) -> Result<(), i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>()
+            + size_of::<FuseRemoveMappingIn>()
+            + size_of::<FuseRemoveMappingOne>()];
+
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr() as *mut FuseInHeader,
+                FuseInHeader {
+                    len: req.len() as u32,
+                    opcode: FUSE_REMOVEMAPPING,
+                    unique: self.next_unique(),
+                    nodeid: 0,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                    padding: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseRemoveMappingIn,
+                FuseRemoveMappingIn { count: 1 },
+            );
+            // SAFETY: offset 44 is not 8-byte aligned, so we must use write_unaligned.
+            core::ptr::write_unaligned(
+                req.as_mut_ptr()
+                    .add(size_of::<FuseInHeader>() + size_of::<FuseRemoveMappingIn>())
+                    as *mut FuseRemoveMappingOne,
+                FuseRemoveMappingOne {
+                    moffset: dax_offset as u64,
+                    len,
+                },
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+
+        let specs = [
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
+        ];
+
+        self.submit_chain(&specs)?;
+
+        // SAFETY: VM wrote FuseOutHeader into resp buffer.
+        unsafe {
+            let out_header = core::ptr::read_volatile(resp.as_ptr() as *const FuseOutHeader);
+            if out_header.error != 0 {
+                return Err(out_header.error);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Resolve a path to a FUSE nodeid by walking each component via FUSE_LOOKUP.
     /// Intermediate nodeids are forgotten so only the final nodeid is retained.
     pub fn resolve_path(&self, path: &[u8]) -> Result<u64, i32> {
