@@ -11,8 +11,8 @@ use sumi_abi::{
     boot_info::{BOOT_INFO_FLAG_HAS_RUN_PATH, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo},
 };
 
+use crate::kprintln;
 use crate::memory::errors::MemoryError;
-use crate::selftest::debugcon_puts;
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -62,9 +62,7 @@ pub fn read_boot_info() -> Option<&'static str> {
 
 /// Load and execute a user program from the given path. Never returns.
 pub fn exec_user_program(path: &str) -> ! {
-    debugcon_puts("[exec] loading ");
-    debugcon_puts(path);
-    debugcon_puts("\n");
+    kprintln!("[exec] loading {}", path);
 
     match exec_user_program_inner(path) {
         Ok(()) => {
@@ -73,21 +71,11 @@ pub fn exec_user_program(path: &str) -> ! {
             crate::arch::halt_forever()
         }
         Err(e) => {
-            debugcon_puts("[exec] error: ");
             match e {
-                ExecError::Fs(code) => {
-                    debugcon_puts("fs error ");
-                    print_i64(code as i64);
-                }
-                ExecError::InvalidElf(msg) => {
-                    debugcon_puts("invalid elf: ");
-                    debugcon_puts(msg);
-                }
-                ExecError::Memory(_) => {
-                    debugcon_puts("memory error");
-                }
+                ExecError::Fs(code) => kprintln!("[exec] error: fs error {}", code),
+                ExecError::InvalidElf(msg) => kprintln!("[exec] error: invalid elf: {}", msg),
+                ExecError::Memory(_) => kprintln!("[exec] error: memory error"),
             }
-            debugcon_puts("\n");
             crate::arch::halt_forever()
         }
     }
@@ -97,9 +85,7 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     // 1. Read file from virtio-fs
     let file_data = read_file(path)?;
 
-    debugcon_puts("[exec] read ");
-    print_usize(file_data.len());
-    debugcon_puts(" bytes\n");
+    kprintln!("[exec] read {} bytes", file_data.len());
 
     // 2. Parse ELF
     let elf = Elf::parse(&file_data).map_err(|_| ExecError::InvalidElf("parse failed"))?;
@@ -146,9 +132,7 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     *crate::BRK_BASE.lock() = brk_base;
     *crate::BRK_CURRENT.lock() = brk_base;
 
-    debugcon_puts("[exec] jumping to entry ");
-    print_hex(elf_info.entry);
-    debugcon_puts("\n");
+    kprintln!("[exec] jumping to entry {:#x}", elf_info.entry);
 
     // 7. Intentionally leak elf and file_data — we're about to jump to user code
     // and never return. This avoids deallocation overhead.
@@ -349,50 +333,6 @@ pub fn align_down_2mb(addr: u64) -> u64 {
 
 pub fn align_up_2mb(addr: u64) -> u64 {
     (addr + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
-}
-
-fn print_usize(n: usize) {
-    if n == 0 {
-        debugcon_puts("0");
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut n = n;
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    for &b in &buf[i..] {
-        crate::arch::debugcon_write_byte(b);
-    }
-}
-
-fn print_i64(n: i64) {
-    if n < 0 {
-        crate::arch::debugcon_write_byte(b'-');
-        print_usize((n as i128).unsigned_abs() as usize);
-    } else {
-        print_usize(n as usize);
-    }
-}
-
-fn print_hex(n: u64) {
-    debugcon_puts("0x");
-    let mut started = false;
-    for shift in (0..16).rev() {
-        let digit = ((n >> (shift * 4)) & 0xF) as u8;
-        if digit != 0 || started || shift == 0 {
-            started = true;
-            let c = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + digit - 10
-            };
-            crate::arch::debugcon_write_byte(c);
-        }
-    }
 }
 
 // Assembly trampoline — only for bare-metal target

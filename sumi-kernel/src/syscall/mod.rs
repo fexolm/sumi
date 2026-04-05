@@ -1,3 +1,4 @@
+pub mod errno;
 pub mod handlers;
 
 #[repr(C)]
@@ -12,7 +13,6 @@ pub struct SyscallArgs {
 }
 
 pub type SyscallResult = i64;
-pub const ENOSYS: SyscallResult = -38;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
@@ -99,6 +99,6 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         52 => handlers::net::sys_getpeername(args),
         54 => handlers::net::sys_setsockopt(args),
         55 => handlers::net::sys_getsockopt(args),
-        _  => ENOSYS,
+        _  => errno::ENOSYS,
     }
 }

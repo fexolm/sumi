@@ -2,10 +2,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
 use sumi_kernel::{
-    KernelState,
-    arch::{debugcon_write_byte, halt_forever, syscall},
+    arch::{halt_forever, syscall},
     exec,
     fs::virtio_fs::VirtioFsClient,
+    kprintln,
 };
 
 struct GlobalKernelAlloc;
@@ -34,12 +34,6 @@ static GLOBAL_ALLOC: GlobalKernelAlloc = GlobalKernelAlloc;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    let _kernel = KernelState::new(
-        &sumi_kernel::PAGE_ALLOCATOR,
-        &sumi_kernel::KERNEL_ALLOCATOR,
-        &sumi_kernel::KERNEL_PAGE_TABLE,
-    );
-
     syscall::init();
 
     // Initialize virtio-fs if the device is present
@@ -55,15 +49,16 @@ pub extern "C" fn _start() -> ! {
     // No program specified — run selftests
     sumi_kernel::selftest::run_all();
 
-    debugcon_write_byte(0x41);
+    kprintln!("A");
     halt_forever()
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    // Write "PANIC\n" to debugcon so we can see panics in VM output
+    // Write "PANIC\n" to debugcon so we can see panics in VM output.
+    // Use raw byte writes — fmt machinery may not be safe in a panic handler.
     for &b in b"PANIC\n" {
-        debugcon_write_byte(b);
+        sumi_kernel::arch::debugcon_write_byte(b);
     }
     halt_forever()
 }

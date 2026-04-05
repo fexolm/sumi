@@ -154,9 +154,10 @@ impl PageAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::errors::MemoryError;
 
     #[test]
-    fn test_page_allocator() {
+    fn basic_alloc_and_free() {
         let allocator = Box::new(PageAllocator::new());
         let first_page = PALLOC_FIRST_PAGE.as_usize();
         let addr1 = allocator.alloc(1).unwrap();
@@ -166,5 +167,53 @@ mod tests {
         allocator.free(addr1).unwrap();
         let addr3 = allocator.alloc(1).unwrap();
         assert_eq!(addr3, PhysicalAddr::new(first_page));
+    }
+
+    #[test]
+    fn multi_page_contiguous_alloc() {
+        let allocator = Box::new(PageAllocator::new());
+        let first_page = PALLOC_FIRST_PAGE.as_usize();
+        let addr = allocator.alloc(4).unwrap();
+        assert_eq!(addr, PhysicalAddr::new(first_page));
+        // Next single alloc should start after the 4-page block
+        let addr2 = allocator.alloc(1).unwrap();
+        assert_eq!(addr2, PhysicalAddr::new(first_page + 4 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn alloc_zero_pages_returns_error() {
+        let allocator = Box::new(PageAllocator::new());
+        let result = allocator.alloc(0);
+        assert!(matches!(result, Err(MemoryError::InvalidPageCount { pages: 0 })));
+    }
+
+    #[test]
+    fn stats_track_usage() {
+        let allocator = Box::new(PageAllocator::new());
+        let before = allocator.get_stats();
+        assert_eq!(before.used_pages, 0);
+
+        let addr = allocator.alloc(2).unwrap();
+        let after_alloc = allocator.get_stats();
+        assert_eq!(after_alloc.used_pages, 2);
+        assert_eq!(after_alloc.used_bytes, 2 * PAGE_SIZE);
+
+        allocator.free(addr).unwrap();
+        // free() only frees 1 page at a time
+        let after_free = allocator.get_stats();
+        assert_eq!(after_free.used_pages, 1);
+    }
+
+    #[test]
+    fn free_and_reuse() {
+        let allocator = Box::new(PageAllocator::new());
+        let first_page = PALLOC_FIRST_PAGE.as_usize();
+        let a = allocator.alloc(1).unwrap();
+        let b = allocator.alloc(1).unwrap();
+        allocator.free(a).unwrap();
+        allocator.free(b).unwrap();
+        // After freeing both, re-alloc should reuse the first page
+        let c = allocator.alloc(1).unwrap();
+        assert_eq!(c, PhysicalAddr::new(first_page));
     }
 }

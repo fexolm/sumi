@@ -2,10 +2,8 @@ use sumi_abi::address::VirtualAddr;
 use sumi_abi::arch::layout::PAGE_SIZE;
 
 use crate::exec::{align_up_2mb, zero_page};
-use crate::syscall::{ENOSYS, SyscallArgs, SyscallResult};
-
-const EINVAL: SyscallResult = -22;
-const ENOMEM: SyscallResult = -12;
+use crate::syscall::errno::*;
+use crate::syscall::{SyscallArgs, SyscallResult};
 
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10;

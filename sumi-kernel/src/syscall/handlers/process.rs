@@ -1,6 +1,6 @@
+use crate::kprintln;
+use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
-
-const EINVAL: SyscallResult = -22;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -108,38 +108,6 @@ pub fn sys_set_tid_address(_args: &SyscallArgs) -> SyscallResult {
 }
 
 fn exit_with_code(code: i32) -> SyscallResult {
-    use crate::selftest::debugcon_puts;
-
-    if code == 0 {
-        debugcon_puts("[exit] code=0\n");
-    } else {
-        debugcon_puts("[exit] code=");
-        // Simple decimal output for the exit code
-        if code < 0 {
-            crate::arch::debugcon_write_byte(b'-');
-            print_decimal((-code) as u32);
-        } else {
-            print_decimal(code as u32);
-        }
-        debugcon_puts("\n");
-    }
+    kprintln!("[exit] code={}", code);
     crate::arch::halt_forever()
-}
-
-fn print_decimal(n: u32) {
-    if n == 0 {
-        crate::arch::debugcon_write_byte(b'0');
-        return;
-    }
-    let mut buf = [0u8; 10];
-    let mut i = buf.len();
-    let mut n = n;
-    while n > 0 {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    for &b in &buf[i..] {
-        crate::arch::debugcon_write_byte(b);
-    }
 }

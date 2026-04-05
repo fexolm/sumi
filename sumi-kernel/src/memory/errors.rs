@@ -6,12 +6,7 @@ pub enum MemoryError {
     InvalidPageCount { pages: usize },
     OutOfMemory,
     AllocationTooLarge { requested: usize, max: usize },
-    TooManySlabs { class_size: u32 },
-    TooManyLargeAllocations,
     UnknownAllocation { addr: usize },
-    SlabAlignmentMismatch { addr: usize, block_size: usize },
-    InvalidSlabCapacity,
-    SlabEmpty,
     AlreadyMapped { addr: usize },
     NotMapped { addr: usize },
 }
@@ -30,19 +25,9 @@ impl fmt::Display for MemoryError {
                 f,
                 "allocation too large: requested {requested} bytes, max {max} bytes"
             ),
-            Self::TooManySlabs { class_size } => {
-                write!(f, "too many slabs for class {class_size}")
-            }
-            Self::TooManyLargeAllocations => write!(f, "too many active large allocations"),
             Self::UnknownAllocation { addr } => {
                 write!(f, "unknown allocation at physical address {addr:#x}")
             }
-            Self::SlabAlignmentMismatch { addr, block_size } => write!(
-                f,
-                "pointer {addr:#x} does not match slab alignment {block_size}"
-            ),
-            Self::InvalidSlabCapacity => write!(f, "invalid slab capacity"),
-            Self::SlabEmpty => write!(f, "slab is empty"),
             Self::AlreadyMapped { addr } => {
                 write!(f, "virtual address {addr:#x} is already mapped")
             }

@@ -81,3 +81,94 @@ impl FdTable {
         self.fds[fd].take()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fds_are_console() {
+        let table = FdTable::new();
+        for fd in 0..3 {
+            let desc = table.get(fd).expect("fd 0-2 should exist");
+            assert!(matches!(desc.kind, FdKind::Console));
+        }
+    }
+
+    #[test]
+    fn alloc_returns_lowest_free() {
+        let mut table = FdTable::new();
+        let desc = FileDescriptor {
+            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            flags: 0,
+        };
+        // First alloc should return fd 3 (0-2 are console)
+        assert_eq!(table.alloc(desc), Some(3));
+        assert_eq!(table.alloc(desc), Some(4));
+    }
+
+    #[test]
+    fn free_and_realloc_reuses_slot() {
+        let mut table = FdTable::new();
+        let desc = FileDescriptor {
+            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            flags: 0,
+        };
+        let fd = table.alloc(desc).unwrap();
+        assert_eq!(fd, 3);
+        table.free(fd);
+        // Re-alloc should reuse fd 3
+        assert_eq!(table.alloc(desc), Some(3));
+    }
+
+    #[test]
+    fn get_invalid_fd_returns_none() {
+        let table = FdTable::new();
+        assert!(table.get(MAX_FDS).is_none());
+        assert!(table.get(MAX_FDS + 1).is_none());
+        assert!(table.get(3).is_none()); // unallocated
+    }
+
+    #[test]
+    fn free_unallocated_returns_none() {
+        let mut table = FdTable::new();
+        assert!(table.free(3).is_none());
+        assert!(table.free(MAX_FDS).is_none());
+    }
+
+    #[test]
+    fn alloc_full_returns_none() {
+        let mut table = FdTable::new();
+        let desc = FileDescriptor {
+            kind: FdKind::Console,
+            flags: 0,
+        };
+        // Fill all remaining slots (3..MAX_FDS)
+        for _ in 3..MAX_FDS {
+            assert!(table.alloc(desc).is_some());
+        }
+        // Table is full
+        assert!(table.alloc(desc).is_none());
+    }
+
+    #[test]
+    fn get_mut_updates_offset() {
+        let mut table = FdTable::new();
+        let desc = FileDescriptor {
+            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            flags: 0,
+        };
+        let fd = table.alloc(desc).unwrap();
+        if let Some(d) = table.get_mut(fd) {
+            if let FdKind::File { ref mut offset, .. } = d.kind {
+                *offset = 42;
+            }
+        }
+        let d = table.get(fd).unwrap();
+        if let FdKind::File { offset, .. } = d.kind {
+            assert_eq!(offset, 42);
+        } else {
+            panic!("expected File");
+        }
+    }
+}

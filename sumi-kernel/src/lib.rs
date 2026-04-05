@@ -6,12 +6,9 @@ pub mod arch;
 pub mod drivers;
 pub mod exec;
 pub mod fs;
-pub mod kernel;
 pub mod memory;
 pub mod selftest;
 pub mod syscall;
-
-pub use crate::kernel::{Kernel, KernelState};
 
 use arch::{KernelDirectMap, RootPageTable};
 use memory::alloc::{kmalloc::KernelAllocator, palloc::PageAllocator};
