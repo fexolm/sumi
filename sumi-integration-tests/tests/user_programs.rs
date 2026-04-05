@@ -32,6 +32,24 @@ fn ensure_built() {
     assert!(status.success(), "VM build failed");
 }
 
+/// Build a Rust no_std fixture crate into a static ELF.
+fn build_rust_fixture(crate_name: &str, out_dir: &Path) -> PathBuf {
+    let crate_dir = project_root().join("tests/fixtures").join(crate_name);
+    let status = Command::new("cargo")
+        .args(["build", "--target", "x86_64-unknown-linux-gnu"])
+        .current_dir(&crate_dir)
+        .status()
+        .expect("failed to build rust fixture");
+    assert!(status.success(), "building {crate_name} failed");
+
+    let bin = crate_dir
+        .join("target/x86_64-unknown-linux-gnu/debug")
+        .join(crate_name);
+    let dest = out_dir.join(crate_name);
+    std::fs::copy(&bin, &dest).expect("failed to copy rust fixture binary");
+    dest
+}
+
 /// Assemble a static ELF from an assembly source file.
 fn assemble_fixture(src: &str, out_dir: &Path) -> PathBuf {
     let stem = Path::new(src).file_stem().unwrap().to_str().unwrap();
@@ -153,6 +171,28 @@ fn mmap_anonymous() {
     assert!(
         output.contains("mmap ok"),
         "expected 'mmap ok' in output, got:\n{output}"
+    );
+}
+
+#[test]
+fn rust_hello() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not available");
+        return;
+    }
+
+    ensure_built();
+    let tmp = TempDir::new();
+    build_rust_fixture("rust-hello", tmp.path());
+    let output = run_program("rust-hello", tmp.path());
+
+    assert!(
+        output.contains("Hello from Rust!"),
+        "expected 'Hello from Rust!' in output, got:\n{output}"
+    );
+    assert!(
+        output.contains("[exit] code=0"),
+        "expected clean exit in output, got:\n{output}"
     );
 }
 
