@@ -58,6 +58,10 @@ pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 /// Device 0 = virtio-fs.
 pub const VIRTIO_FS_MMIO: PhysicalAddr = VIRTIO_MMIO_BASE;
 
+/// Device 1 = virtio-console.
+pub const VIRTIO_CONSOLE_MMIO: PhysicalAddr =
+    PhysicalAddr::new(VIRTIO_MMIO_BASE.as_u64() as usize + VIRTIO_MMIO_STRIDE);
+
 /// Base physical address of the DAX shared memory window.
 pub const DAX_WINDOW_BASE: PhysicalAddr = PhysicalAddr::new(0x20_0000_0000);
 

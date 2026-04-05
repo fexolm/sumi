@@ -12,7 +12,7 @@ use sumi_abi::fuse::*;
 use sumi_abi::virtio::*;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::virtio_mmio::VirtqueueState;
+use super::virtio_mmio::{VirtioBackend, VirtqueueState};
 
 struct FuseNode {
     host_path: PathBuf,
@@ -77,7 +77,7 @@ impl VirtioFs {
         (self.file_handles.len() - 1) as u64
     }
 
-    pub fn process_queue(&mut self, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
+    fn process_queue_inner(&mut self, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
         // Read available ring idx
         let mut buf = [0u8; 4];
         mem.read_slice(&mut buf, GuestAddress(queue.avail_addr))
@@ -928,6 +928,20 @@ impl VirtioFs {
         }
 
         self.write_response(header.unique, &[], writable_bufs, mem)
+    }
+}
+
+impl VirtioBackend for VirtioFs {
+    fn device_id(&self) -> u32 {
+        sumi_abi::virtio::VIRTIO_DEVICE_FS
+    }
+
+    fn num_queues(&self) -> usize {
+        2
+    }
+
+    fn process_queue(&mut self, _queue_idx: usize, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
+        self.process_queue_inner(queue, mem);
     }
 }
 

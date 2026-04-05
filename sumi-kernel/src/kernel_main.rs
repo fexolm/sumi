@@ -41,6 +41,13 @@ pub extern "C" fn _start() -> ! {
         sumi_kernel::VIRTIO_FS.call_once(|| fs);
     }
 
+    if let Some(console) = sumi_kernel::drivers::virtio::console::VirtioConsole::init(
+        &sumi_kernel::KERNEL_ALLOCATOR,
+        &sumi_kernel::PAGE_ALLOCATOR,
+    ) {
+        sumi_kernel::VIRTIO_CONSOLE.call_once(|| console);
+    }
+
     // Check for user program to execute
     if let Some(path) = exec::read_boot_info() {
         exec::exec_user_program(path);

@@ -4,6 +4,25 @@ use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
 use sumi_abi::address::VirtualAddr;
 
+fn console_write(data: &[u8]) -> usize {
+    match crate::VIRTIO_CONSOLE.get() {
+        Some(console) => console.write(data),
+        None => {
+            for &byte in data {
+                crate::arch::debugcon_write_byte(byte);
+            }
+            data.len()
+        }
+    }
+}
+
+fn console_read(buf: &mut [u8]) -> usize {
+    match crate::VIRTIO_CONSOLE.get() {
+        Some(console) => console.read(buf),
+        None => 0,
+    }
+}
+
 const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
@@ -99,7 +118,12 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
-        FdKind::Console => 0,
+        FdKind::Console => {
+            // SAFETY: In sumi unikernel, all user virtual addresses are valid
+            // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, count as usize) };
+            console_read(buf) as SyscallResult
+        }
         FdKind::File {
             fuse_fh, offset, ..
         } => {
@@ -142,12 +166,10 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::Console => {
-            for i in 0..count {
-                let byte =
-                    unsafe { core::ptr::read_volatile((buf_vaddr as usize + i) as *const u8) };
-                crate::arch::debugcon_write_byte(byte);
-            }
-            count as SyscallResult
+            // SAFETY: In sumi unikernel, all user virtual addresses are valid
+            // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
+            let data = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, count) };
+            console_write(data) as SyscallResult
         }
         FdKind::File {
             fuse_fh, offset, ..
@@ -400,7 +422,24 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
-        FdKind::Console => 0, // No stdin
+        FdKind::Console => {
+            let mut total = 0usize;
+            for i in 0..iovcnt {
+                // SAFETY: Reading iovec entries from user-provided pointer; valid in
+                // sumi's single-address-space model where user and kernel share the
+                // same virtual address space.
+                let iov_base = unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) } as usize;
+                let iov_len = unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) } as usize;
+                if iov_len == 0 { continue; }
+                // SAFETY: In sumi unikernel, all user virtual addresses are valid
+                // kernel-mapped memory. The caller guarantees iov_base points to iov_len bytes.
+                let buf = unsafe { core::slice::from_raw_parts_mut(iov_base as *mut u8, iov_len) };
+                let n = console_read(buf);
+                total += n;
+                if n < iov_len { break; }
+            }
+            total as SyscallResult
+        }
         FdKind::File {
             fuse_fh, offset, ..
         } => {
@@ -473,16 +512,16 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
         FdKind::Console => {
             let mut total = 0usize;
             for i in 0..iovcnt {
-                let iov_base =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) } as usize;
-                let iov_len =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) }
-                        as usize;
-                for j in 0..iov_len {
-                    let byte = unsafe { core::ptr::read_volatile((iov_base + j) as *const u8) };
-                    crate::arch::debugcon_write_byte(byte);
-                }
-                total += iov_len;
+                // SAFETY: Reading iovec entries from user-provided pointer; valid in
+                // sumi's single-address-space model where user and kernel share the
+                // same virtual address space.
+                let iov_base = unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) } as usize;
+                let iov_len = unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) } as usize;
+                if iov_len == 0 { continue; }
+                // SAFETY: In sumi unikernel, all user virtual addresses are valid
+                // kernel-mapped memory. The caller guarantees iov_base points to iov_len bytes.
+                let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+                total += console_write(data);
             }
             total as SyscallResult
         }

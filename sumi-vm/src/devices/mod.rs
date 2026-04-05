@@ -1,9 +1,12 @@
+pub mod virtio_console;
 pub mod virtio_fs;
 pub mod virtio_mmio;
 
-use sumi_abi::arch::layout::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE};
+use sumi_abi::arch::layout::{VIRTIO_CONSOLE_MMIO, VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE};
 use vm_memory::GuestMemoryMmap;
 
+use self::virtio_console::VirtioConsoleBackend;
+use self::virtio_fs::VirtioFs;
 use self::virtio_mmio::VirtioMmioDevice;
 
 pub struct DeviceRegistry {
@@ -20,9 +23,13 @@ impl DeviceRegistry {
         let mut devices = Vec::new();
 
         if let Some(dir) = share_dir {
-            let fs_device = VirtioMmioDevice::new_fs(dir, dax_host_ptr);
+            let fs_device = VirtioMmioDevice::new(Box::new(VirtioFs::new(dir, dax_host_ptr)));
             devices.push((VIRTIO_MMIO_BASE.as_u64(), fs_device));
         }
+
+        // Console is always present
+        let console_device = VirtioMmioDevice::new(Box::new(VirtioConsoleBackend::new()));
+        devices.push((VIRTIO_CONSOLE_MMIO.as_u64(), console_device));
 
         Self { devices }
     }

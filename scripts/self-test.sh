@@ -8,5 +8,5 @@ cargo build -p sumi-kernel --target x86_64-unknown-none
 cargo build -p sumi-vm
 
 echo "--- kernel selftests ---"
-target/debug/sumi-vm run --share "$SHARE_DIR" target/x86_64-unknown-none/debug/sumi-kernel
+target/debug/sumi-vm run --share "$SHARE_DIR" target/x86_64-unknown-none/debug/sumi-kernel < /dev/null
 echo ""

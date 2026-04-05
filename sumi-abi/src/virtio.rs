@@ -47,6 +47,9 @@ pub const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x74726976;
 /// VirtIO device ID for filesystem.
 pub const VIRTIO_DEVICE_FS: u32 = 26;
 
+/// VirtIO device ID for console.
+pub const VIRTIO_DEVICE_CONSOLE: u32 = 3;
+
 /// Vendor ID for sumi.
 pub const SUMI_VENDOR_ID: u32 = 0x554D4953;
 
