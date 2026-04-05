@@ -35,6 +35,7 @@ pub struct VmaTable {
     vmas: [Option<Vma>; MAX_VMAS],
 }
 
+#[allow(clippy::new_without_default)] // const fn for static init
 impl VmaTable {
     pub const fn new() -> Self {
         // Option<Vma> is not Copy, but None is valid for const init via this pattern.
@@ -57,10 +58,10 @@ impl VmaTable {
     /// Remove the VMA whose start equals `start`. Returns the removed VMA.
     pub fn remove(&mut self, start: VirtualAddr) -> Option<Vma> {
         for slot in &mut self.vmas {
-            if let Some(vma) = slot {
-                if vma.start == start {
-                    return slot.take();
-                }
+            if let Some(vma) = slot
+                && vma.start == start
+            {
+                return slot.take();
             }
         }
         None
@@ -68,16 +69,9 @@ impl VmaTable {
 
     /// Find the first VMA that contains `addr` (start <= addr < end).
     pub fn find(&self, addr: VirtualAddr) -> Option<&Vma> {
-        for slot in &self.vmas {
-            if let Some(vma) = slot {
-                if vma.start.as_usize() <= addr.as_usize()
-                    && addr.as_usize() < vma.end.as_usize()
-                {
-                    return Some(vma);
-                }
-            }
-        }
-        None
+        self.vmas.iter().flatten().find(|vma| {
+            vma.start.as_usize() <= addr.as_usize() && addr.as_usize() < vma.end.as_usize()
+        })
     }
 
     /// Remove all VMAs that overlap with [start, end). Returns up to 4 removed VMAs.

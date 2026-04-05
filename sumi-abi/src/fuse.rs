@@ -1,4 +1,4 @@
-/// FUSE protocol types (FUSE 7.31).
+//! FUSE protocol types (FUSE 7.31).
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;

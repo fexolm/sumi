@@ -74,6 +74,6 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             Ok(())
         }
     }
-    let _ = write!(DebugconWriter, "PANIC: {}\n", info);
+    let _ = writeln!(DebugconWriter, "PANIC: {}", info);
     halt_forever()
 }

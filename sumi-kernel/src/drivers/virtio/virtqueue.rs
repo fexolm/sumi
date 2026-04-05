@@ -84,6 +84,7 @@ impl Virtqueue {
     }
 
     /// Get a mutable pointer to a descriptor by index.
+    #[allow(clippy::mut_from_ref)] // Mutation goes through MMIO raw pointers, not &self
     pub fn desc_mut(&self, idx: u16) -> &mut VirtqDesc {
         // SAFETY: idx < QUEUE_SIZE is enforced by alloc_desc returning valid indices.
         unsafe {

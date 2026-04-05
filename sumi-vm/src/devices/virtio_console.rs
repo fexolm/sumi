@@ -5,6 +5,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::virtio_mmio::{VirtioBackend, VirtqueueState};
 
+#[derive(Default)]
 pub struct VirtioConsoleBackend {
     last_avail_idx: [u16; 2],
 }

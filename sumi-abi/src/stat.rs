@@ -1,7 +1,7 @@
-/// Linux x86_64 stat and directory entry structures.
-///
-/// These are kernel ABI types returned by stat/fstat/getdents64 syscalls.
-/// Layout must match the Linux kernel's x86_64 definitions exactly.
+//! Linux x86_64 stat and directory entry structures.
+//!
+//! These are kernel ABI types returned by stat/fstat/getdents64 syscalls.
+//! Layout must match the Linux kernel's x86_64 definitions exactly.
 
 /// `struct stat` for x86_64 Linux (144 bytes).
 #[repr(C)]

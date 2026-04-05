@@ -52,7 +52,7 @@ pub trait VirtBackend: Sized {
 }
 
 pub struct SumiVm<Backend: VirtBackend + 'static> {
-    mem: Arc<GuestMemoryMmap<()>>,
+    _mem: Arc<GuestMemoryMmap<()>>,
     _backend: Backend,
     kernel_entry: u64,
     vcpus: Vec<Backend::VCpuType>,
@@ -83,7 +83,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         Self::write_boot_info(&mem, info)?;
 
         Ok(Self {
-            mem,
+            _mem: mem,
             vcpus,
             _backend: backend,
             kernel_entry,

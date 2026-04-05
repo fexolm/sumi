@@ -4,6 +4,7 @@ use crate::syscall::{SyscallArgs, SyscallResult};
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
+#[cfg(not(test))]
 const IA32_FS_BASE: u32 = 0xC000_0100;
 
 pub fn sys_getpid(_args: &SyscallArgs) -> SyscallResult {
@@ -36,7 +37,7 @@ pub fn sys_getppid(_args: &SyscallArgs) -> SyscallResult {
 
 pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
     let code = args.arg0;
-    let addr = args.arg1;
+    let _addr = args.arg1;
 
     match code {
         ARCH_SET_FS => {
@@ -44,7 +45,7 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
             {
                 // SAFETY: We are in ring 0 and IA32_FS_BASE is a valid MSR.
                 unsafe {
-                    crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, addr);
+                    crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, _addr);
                 }
             }
             0
@@ -55,7 +56,7 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
                 let val = unsafe { crate::arch::x86_64::syscall::rdmsr(IA32_FS_BASE) };
                 // SAFETY: User passed a valid pointer for the result.
                 unsafe {
-                    *(addr as *mut u64) = val;
+                    *(_addr as *mut u64) = val;
                 }
             }
             0

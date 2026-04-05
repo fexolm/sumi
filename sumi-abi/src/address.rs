@@ -64,8 +64,10 @@ impl VirtualAddr {
         self.0 as *mut T
     }
 
+    /// # Safety
+    /// The caller must ensure `self` points to a valid, initialized `T` with correct alignment.
     pub unsafe fn as_ref_mut<'i, T>(self) -> &'i mut T {
-        debug_assert!(self.0 % core::mem::align_of::<T>() == 0);
+        debug_assert!(self.0.is_multiple_of(core::mem::align_of::<T>()));
         unsafe { &mut *self.as_ptr() }
     }
 }

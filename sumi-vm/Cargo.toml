@@ -3,6 +3,9 @@ name = "sumi-vm"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 sumi-abi = { path = "../sumi-abi" }

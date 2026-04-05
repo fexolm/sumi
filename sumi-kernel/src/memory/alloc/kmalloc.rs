@@ -302,6 +302,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         }
     }
 
+    #[allow(clippy::mut_from_ref)] // Mutation goes through direct-map raw pointers, not &self
     fn free_block_mut(&self, addr: usize) -> &mut FreeBlock {
         unsafe {
             PhysicalAddr::new(addr)
@@ -313,8 +314,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
 
 fn allocation_alignment(size: usize) -> usize {
     size.next_power_of_two()
-        .min(PAGE_TABLE_SIZE)
-        .max(MIN_ALIGNMENT)
+        .clamp(MIN_ALIGNMENT, PAGE_TABLE_SIZE)
 }
 
 fn align_up(addr: usize, align: usize) -> usize {

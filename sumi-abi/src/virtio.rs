@@ -1,4 +1,4 @@
-/// VirtIO split virtqueue types (virtio spec v1.2, section 2.7).
+//! VirtIO split virtqueue types (virtio spec v1.2, section 2.7).
 
 /// Number of descriptors per queue.
 pub const QUEUE_SIZE: u16 = 256;

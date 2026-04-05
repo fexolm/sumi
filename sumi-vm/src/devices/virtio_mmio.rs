@@ -7,6 +7,7 @@ pub trait VirtioBackend {
     fn process_queue(&mut self, queue_idx: usize, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>);
 }
 
+#[derive(Default)]
 pub struct VirtqueueState {
     pub num: u32,
     pub ready: bool,

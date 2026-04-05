@@ -1,6 +1,6 @@
 use sumi_abi::arch::layout::{DAX_SLOT_COUNT, PAGE_SIZE};
 
-const BITMAP_U64S: usize = (DAX_SLOT_COUNT + 63) / 64;
+const BITMAP_U64S: usize = DAX_SLOT_COUNT.div_ceil(64);
 
 #[derive(Debug)]
 pub enum DaxError {
@@ -15,6 +15,7 @@ pub struct DaxAllocator {
     bitmap: [u64; BITMAP_U64S],
 }
 
+#[allow(clippy::new_without_default)] // const fn new() for static init
 impl DaxAllocator {
     pub const fn new() -> Self {
         Self {
@@ -53,7 +54,7 @@ impl DaxAllocator {
     /// Out-of-bounds offsets are silently ignored.
     pub fn free(&mut self, offset: usize, count: usize) {
         let start_slot = offset / PAGE_SIZE;
-        if start_slot.checked_add(count).map_or(true, |sum| sum > DAX_SLOT_COUNT) {
+        if start_slot.checked_add(count).is_none_or(|sum| sum > DAX_SLOT_COUNT) {
             return;
         }
         self.mark(start_slot, count, false);

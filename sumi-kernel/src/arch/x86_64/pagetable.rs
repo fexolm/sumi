@@ -243,6 +243,8 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
         unsafe { Ok(Self::from_paddr(addr, kalloc)) }
     }
 
+    /// # Safety
+    /// `addr` must point to a valid, initialized PML4 page table.
     pub const unsafe fn from_paddr(
         addr: PhysicalAddr,
         kalloc: &'i KernelAllocator<'i, DM>,
@@ -295,6 +297,7 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
         Ok(paddr)
     }
 
+    #[allow(clippy::mut_from_ref)] // Mutation goes through direct-map raw pointers, not &self
     fn get_pml4(&self) -> &mut PageTable {
         // SAFETY: The PML4 page table at self.addr is mapped via the direct map.
         // Mutation goes through direct-map raw pointers, not through &self.

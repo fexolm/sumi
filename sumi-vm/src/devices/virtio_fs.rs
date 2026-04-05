@@ -33,14 +33,15 @@ unsafe impl Send for VirtioFs {}
 
 impl VirtioFs {
     pub fn new(share_dir: &std::path::Path, dax_host_ptr: *mut u8) -> Self {
-        let mut nodes = Vec::new();
-        // nodeid 0 is unused (FUSE convention)
-        nodes.push(None);
-        // nodeid 1 = root
-        nodes.push(Some(FuseNode {
-            host_path: share_dir.to_path_buf(),
-            _lookup_count: 1,
-        }));
+        let nodes = vec![
+            // nodeid 0 is unused (FUSE convention)
+            None,
+            // nodeid 1 = root
+            Some(FuseNode {
+                host_path: share_dir.to_path_buf(),
+                _lookup_count: 1,
+            }),
+        ];
 
         let dax_host_ptr = if dax_host_ptr.is_null() {
             None
@@ -825,7 +826,7 @@ impl VirtioFs {
 
         let moffset = setup_in.moffset as usize;
         let len = setup_in.len as usize;
-        if moffset.checked_add(len).map_or(true, |end| end > DAX_WINDOW_SIZE) {
+        if moffset.checked_add(len).is_none_or(|end| end > DAX_WINDOW_SIZE) {
             return self.write_error(header.unique, -22, writable_bufs, mem);
         }
 
@@ -899,7 +900,7 @@ impl VirtioFs {
 
         let moffset = remove_one.moffset as usize;
         let len = remove_one.len as usize;
-        if moffset.checked_add(len).map_or(true, |end| end > DAX_WINDOW_SIZE) {
+        if moffset.checked_add(len).is_none_or(|end| end > DAX_WINDOW_SIZE) {
             return self.write_error(header.unique, -22, writable_bufs, mem);
         }
 

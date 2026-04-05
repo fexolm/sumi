@@ -133,6 +133,7 @@ impl PageAllocatorImpl {
 
 pub struct PageAllocator(spin::Mutex<PageAllocatorImpl>);
 
+#[allow(clippy::new_without_default)] // const fn for static init
 impl PageAllocator {
     pub const fn new() -> Self {
         Self(spin::Mutex::new(PageAllocatorImpl::new()))

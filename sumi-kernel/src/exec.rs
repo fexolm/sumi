@@ -205,7 +205,7 @@ fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> 
         let file_size = ph.p_filesz as usize;
         if file_offset
             .checked_add(file_size)
-            .map_or(true, |end| end > file_data.len())
+            .is_none_or(|end| end > file_data.len())
         {
             return Err(ExecError::InvalidElf("segment data out of file bounds"));
         }

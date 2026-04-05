@@ -305,13 +305,12 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
         }
 
         let mut table = crate::FD_TABLE.lock();
-        if let Some(desc) = table.get_mut(fd_num) {
-            if let FdKind::Directory {
+        if let Some(desc) = table.get_mut(fd_num)
+            && let FdKind::Directory {
                 ref mut offset, ..
             } = desc.kind
-            {
-                *offset = last_off;
-            }
+        {
+            *offset = last_off;
         }
     }
 
@@ -458,7 +457,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
 
     // If path is absolute or dirfd is AT_FDCWD, use normal open logic.
     // We don't support relative-to-fd paths yet.
-    if dirfd != AT_FDCWD && !(path.first() == Some(&b'/')) {
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
         return ENOSYS;
     }
 
@@ -592,7 +591,7 @@ pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
         return sys_fstat(&fstat_args);
     }
 
-    if dirfd != AT_FDCWD && !(path.first() == Some(&b'/')) {
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
         return ENOSYS;
     }
 

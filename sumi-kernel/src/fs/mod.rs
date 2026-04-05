@@ -31,6 +31,7 @@ pub struct FdTable {
     fds: [Option<FileDescriptor>; MAX_FDS],
 }
 
+#[allow(clippy::new_without_default)] // const fn with non-trivial init for static
 impl FdTable {
     pub const fn new() -> Self {
         let mut fds = [const { None }; MAX_FDS];

@@ -3,6 +3,9 @@ name = "sumi-kernel"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 sumi-abi = { path = "../sumi-abi" }
 spin = "0.10.0"

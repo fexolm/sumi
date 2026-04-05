@@ -23,6 +23,16 @@ fn console_read(buf: &mut [u8]) -> usize {
     }
 }
 
+/// Read an iovec entry (base, len) from user memory.
+/// SAFETY: Valid in sumi's single-address-space model where user and kernel share memory.
+fn read_iovec(iov_ptr: usize, i: usize) -> (u64, u64) {
+    unsafe {
+        let base = core::ptr::read_volatile((iov_ptr + i * 16) as *const u64);
+        let len = core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64);
+        (base, len)
+    }
+}
+
 const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
@@ -134,13 +144,12 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
             match fs_transfer_chunked(|off, pa, cnt| fs.read(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
-                    if let Some(desc) = table.get_mut(fd_num) {
-                        if let FdKind::File {
+                    if let Some(desc) = table.get_mut(fd_num)
+                        && let FdKind::File {
                             ref mut offset, ..
                         } = desc.kind
-                        {
-                            *offset += n as u64;
-                        }
+                    {
+                        *offset += n as u64;
                     }
                     n as SyscallResult
                 }
@@ -181,13 +190,12 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
             match fs_transfer_chunked(|off, pa, cnt| fs.write(fuse_fh, off, pa, cnt), offset, buf_vaddr, count as u32) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
-                    if let Some(desc) = table.get_mut(fd_num) {
-                        if let FdKind::File {
+                    if let Some(desc) = table.get_mut(fd_num)
+                        && let FdKind::File {
                             ref mut offset, ..
                         } = desc.kind
-                        {
-                            *offset += n as u64;
-                        }
+                    {
+                        *offset += n as u64;
                     }
                     n as SyscallResult
                 }
@@ -269,28 +277,9 @@ pub fn sys_poll(args: &SyscallArgs) -> SyscallResult {
                 pfd.revents = POLLNVAL;
                 ready += 1;
             }
-            Some(desc) => {
-                let mut revents = 0i16;
-                match desc.kind {
-                    FdKind::Console => {
-                        // stdout/stderr always writable, stdin always "readable" for simplicity
-                        if pfd.events & POLLIN != 0 {
-                            revents |= POLLIN;
-                        }
-                        if pfd.events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        }
-                    }
-                    FdKind::File { .. } | FdKind::Directory { .. } => {
-                        // Files are always ready for I/O in our synchronous model
-                        if pfd.events & POLLIN != 0 {
-                            revents |= POLLIN;
-                        }
-                        if pfd.events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        }
-                    }
-                }
+            Some(_desc) => {
+                // All fd types are always ready in our synchronous model
+                let revents = pfd.events & (POLLIN | POLLOUT);
                 pfd.revents = revents;
                 if revents != 0 {
                     ready += 1;
@@ -365,11 +354,11 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
 
     // Write the new offset back under the lock.
     let mut table = crate::FD_TABLE.lock();
-    if let Some(desc) = table.get_mut(fd_num) {
-        if let FdKind::File { ref mut offset, .. } = desc.kind {
-            *offset = new_offset;
-            return new_offset as SyscallResult;
-        }
+    if let Some(desc) = table.get_mut(fd_num)
+        && let FdKind::File { ref mut offset, .. } = desc.kind
+    {
+        *offset = new_offset;
+        return new_offset as SyscallResult;
     }
     EBADF
 }
@@ -453,14 +442,9 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
         FdKind::Console => {
             let mut total = 0usize;
             for i in 0..iovcnt {
-                // SAFETY: Reading iovec entries from user-provided pointer; valid in
-                // sumi's single-address-space model where user and kernel share the
-                // same virtual address space.
-                let iov_base = unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) } as usize;
-                let iov_len = unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) } as usize;
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                let iov_len = iov_len as usize;
                 if iov_len == 0 { continue; }
-                // SAFETY: In sumi unikernel, all user virtual addresses are valid
-                // kernel-mapped memory. The caller guarantees iov_base points to iov_len bytes.
                 let buf = unsafe { core::slice::from_raw_parts_mut(iov_base as *mut u8, iov_len) };
                 let n = console_read(buf);
                 total += n;
@@ -480,12 +464,7 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
             let mut cur_offset = offset;
 
             for i in 0..iovcnt {
-                // SAFETY: Reading iov_base and iov_len from the iovec array
-                // at the user-provided address. The iovec struct is 16 bytes.
-                let iov_base =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) };
-                let iov_len_raw =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) };
+                let (iov_base, iov_len_raw) = read_iovec(iov_ptr, i);
                 let iov_len = iov_len_raw.min(u32::MAX as u64) as u32;
                 if iov_len == 0 {
                     continue;
@@ -509,13 +488,12 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
 
             // Update offset
             let mut table = crate::FD_TABLE.lock();
-            if let Some(desc) = table.get_mut(fd_num) {
-                if let FdKind::File {
+            if let Some(desc) = table.get_mut(fd_num)
+                && let FdKind::File {
                     ref mut offset, ..
                 } = desc.kind
-                {
-                    *offset = cur_offset;
-                }
+            {
+                *offset = cur_offset;
             }
             total as SyscallResult
         }
@@ -540,14 +518,9 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
         FdKind::Console => {
             let mut total = 0usize;
             for i in 0..iovcnt {
-                // SAFETY: Reading iovec entries from user-provided pointer; valid in
-                // sumi's single-address-space model where user and kernel share the
-                // same virtual address space.
-                let iov_base = unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) } as usize;
-                let iov_len = unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) } as usize;
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                let iov_len = iov_len as usize;
                 if iov_len == 0 { continue; }
-                // SAFETY: In sumi unikernel, all user virtual addresses are valid
-                // kernel-mapped memory. The caller guarantees iov_base points to iov_len bytes.
                 let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
                 total += console_write(data);
             }
@@ -565,11 +538,7 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             let mut cur_offset = offset;
 
             for i in 0..iovcnt {
-                // SAFETY: Reading iov_base and iov_len from the iovec array.
-                let iov_base =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) };
-                let iov_len_raw =
-                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) };
+                let (iov_base, iov_len_raw) = read_iovec(iov_ptr, i);
                 let iov_len = iov_len_raw.min(u32::MAX as u64) as u32;
                 if iov_len == 0 {
                     continue;
@@ -593,13 +562,12 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
 
             // Update offset
             let mut table = crate::FD_TABLE.lock();
-            if let Some(desc) = table.get_mut(fd_num) {
-                if let FdKind::File {
+            if let Some(desc) = table.get_mut(fd_num)
+                && let FdKind::File {
                     ref mut offset, ..
                 } = desc.kind
-                {
-                    *offset = cur_offset;
-                }
+            {
+                *offset = cur_offset;
             }
             total as SyscallResult
         }
@@ -703,10 +671,10 @@ pub fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
     };
 
     // Release FUSE resources for the evicted fd only if no other fd shares the handle.
-    if remaining_refs == 0 {
-        if let Some(ref evicted) = evicted {
-            release_fuse_resources(evicted);
-        }
+    if remaining_refs == 0
+        && let Some(ref evicted) = evicted
+    {
+        release_fuse_resources(evicted);
     }
 
     new_fd as SyscallResult

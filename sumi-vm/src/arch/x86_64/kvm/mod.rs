@@ -254,7 +254,7 @@ impl VCpu for KvmVCpu {
     fn run(&mut self) -> Result<()> {
         loop {
             match self.fd.run()? {
-                VcpuExit::IoOut(port, data) if port == 0xE9 => {
+                VcpuExit::IoOut(0xE9, data) => {
                     use std::io::Write;
                     let stdout = std::io::stdout();
                     let mut lock = stdout.lock();

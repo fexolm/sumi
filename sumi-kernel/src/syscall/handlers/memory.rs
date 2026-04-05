@@ -27,7 +27,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         return EINVAL;
     }
 
-    if flags & MAP_FIXED != 0 && addr_hint as usize % PAGE_SIZE != 0 {
+    if flags & MAP_FIXED != 0 && !(addr_hint as usize).is_multiple_of(PAGE_SIZE) {
         return EINVAL;
     }
 
@@ -76,9 +76,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         // Anonymous mapping path.
         let result = map_anonymous_pages(vaddr, pages);
         if let Err(e) = result {
-            if let Some(old) = saved_next {
-                *crate::MMAP_NEXT.lock() = old;
-            }
+            restore_mmap_next(saved_next);
             return e;
         }
 
@@ -96,9 +94,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
                 }
                 v = v.add(PAGE_SIZE);
             }
-            if let Some(old) = saved_next {
-                *crate::MMAP_NEXT.lock() = old;
-            }
+            restore_mmap_next(saved_next);
             return ENOMEM;
         }
 
@@ -337,14 +333,9 @@ fn private_copy_path(
 ) -> SyscallResult {
     let aligned_len = pages * PAGE_SIZE;
 
-    match map_anonymous_pages(vaddr, pages) {
-        Err(e) => {
-            if let Some(old) = saved_next {
-                *crate::MMAP_NEXT.lock() = old;
-            }
-            return e;
-        }
-        Ok(()) => {}
+    if let Err(e) = map_anonymous_pages(vaddr, pages) {
+        restore_mmap_next(saved_next);
+        return e;
     }
 
     // Read file content into the freshly mapped pages.
@@ -372,9 +363,7 @@ fn private_copy_path(
             }
             v = v.add(PAGE_SIZE);
         }
-        if let Some(old) = saved_next {
-            *crate::MMAP_NEXT.lock() = old;
-        }
+        restore_mmap_next(saved_next);
         return ENOMEM;
     }
 
@@ -451,6 +440,13 @@ fn dax_path(
     }
 
     Ok((vaddr.as_u64() + sub_page_offset as u64) as SyscallResult)
+}
+
+/// Restore the MMAP_NEXT pointer if we reserved address space but need to roll back.
+fn restore_mmap_next(saved_next: Option<VirtualAddr>) {
+    if let Some(old) = saved_next {
+        *crate::MMAP_NEXT.lock() = old;
+    }
 }
 
 /// Unmap and free all 2 MB pages in [from..to).
