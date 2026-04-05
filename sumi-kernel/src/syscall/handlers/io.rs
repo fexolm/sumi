@@ -30,6 +30,63 @@ fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
     }
 }
 
+/// How many bytes from `vaddr` until the next 2 MB page boundary.
+fn bytes_to_page_end(vaddr: u64) -> u32 {
+    use sumi_abi::arch::layout::PAGE_SIZE;
+    let offset = vaddr as usize & (PAGE_SIZE - 1);
+    (PAGE_SIZE - offset) as u32
+}
+
+/// Read from a FUSE file handle into a user buffer, splitting at 2 MB page
+/// boundaries so each DMA uses the correct physical address.
+fn fs_read_chunked(
+    fs: &crate::fs::virtio_fs::VirtioFsClient,
+    fh: u64,
+    mut file_offset: u64,
+    mut buf_vaddr: u64,
+    mut remaining: u32,
+) -> core::result::Result<u32, i32> {
+    let mut total = 0u32;
+    while remaining > 0 {
+        let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
+        let paddr = translate_vaddr(buf_vaddr).ok_or(EFAULT as i32)?;
+        let n = fs.read(fh, file_offset, paddr, chunk)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        buf_vaddr += n as u64;
+        file_offset += n as u64;
+        remaining -= n;
+    }
+    Ok(total)
+}
+
+/// Write to a FUSE file handle from a user buffer, splitting at 2 MB page
+/// boundaries so each DMA uses the correct physical address.
+fn fs_write_chunked(
+    fs: &crate::fs::virtio_fs::VirtioFsClient,
+    fh: u64,
+    mut file_offset: u64,
+    mut buf_vaddr: u64,
+    mut remaining: u32,
+) -> core::result::Result<u32, i32> {
+    let mut total = 0u32;
+    while remaining > 0 {
+        let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
+        let paddr = translate_vaddr(buf_vaddr).ok_or(EFAULT as i32)?;
+        let n = fs.write(fh, file_offset, paddr, chunk)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        buf_vaddr += n as u64;
+        file_offset += n as u64;
+        remaining -= n;
+    }
+    Ok(total)
+}
+
 pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
     let buf_vaddr = args.arg1;
@@ -48,15 +105,11 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match translate_vaddr(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.read(fuse_fh, offset, buf_phys, count) {
+            match fs_read_chunked(fs, fuse_fh, offset, buf_vaddr, count) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num) {
@@ -101,15 +154,11 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match translate_vaddr(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.write(fuse_fh, offset, buf_phys, count as u32) {
+            match fs_write_chunked(fs, fuse_fh, offset, buf_vaddr, count as u32) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num) {
@@ -307,15 +356,11 @@ pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match translate_vaddr(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.read(fuse_fh, offset, buf_phys, count) {
+            match fs_read_chunked(fs, fuse_fh, offset, buf_vaddr, count) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }
@@ -340,15 +385,11 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match translate_vaddr(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.write(fuse_fh, offset, buf_phys, count) {
+            match fs_write_chunked(fs, fuse_fh, offset, buf_vaddr, count) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }
