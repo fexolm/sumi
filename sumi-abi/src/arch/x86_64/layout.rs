@@ -46,6 +46,14 @@ pub const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// Base address for mmap region (grows downward).
 pub const USER_MMAP_BASE: VirtualAddr = VirtualAddr::new(0x0000_7FFF_0000_0000);
 
+/// Base address for loading PIE (ET_DYN) main binaries.
+/// Linux default for non-ASLR PIE on x86_64.
+pub const PIE_LOAD_BASE: u64 = 0x0040_0000;
+
+/// Base address for loading the dynamic linker (interpreter).
+/// Placed high in user space, well below the mmap region.
+pub const INTERP_LOAD_BASE: u64 = 0x7f00_0000_0000;
+
 /// Base physical address for virtio MMIO devices.
 /// Placed at 64 GB — above any reasonable guest RAM (2 TB max),
 /// within the direct-map range so the kernel can access it, and

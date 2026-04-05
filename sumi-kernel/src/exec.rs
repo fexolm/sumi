@@ -7,7 +7,10 @@ use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
 use sumi_abi::{
     address::{PhysicalAddr, VirtualAddr},
-    arch::layout::{DIRECT_MAP_OFFSET, PAGE_SIZE, USER_STACK_SIZE, USER_STACK_TOP},
+    arch::layout::{
+        DIRECT_MAP_OFFSET, INTERP_LOAD_BASE, PAGE_SIZE, PIE_LOAD_BASE, USER_STACK_SIZE,
+        USER_STACK_TOP,
+    },
     boot_info::{BOOT_INFO_FLAG_HAS_RUN_PATH, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo},
 };
 
@@ -19,7 +22,14 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
 
 #[derive(Debug)]
 pub enum ExecError {
@@ -33,6 +43,11 @@ struct ElfInfo {
     phdr_vaddr: u64,
     phnum: u64,
     phentsize: u64,
+}
+
+struct InterpInfo {
+    base: u64,
+    entry: u64,
 }
 
 /// Read boot info from the fixed physical address. Returns the run_path if present.
@@ -90,57 +105,113 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     // 2. Parse ELF
     let elf = Elf::parse(&file_data).map_err(|_| ExecError::InvalidElf("parse failed"))?;
 
-    // Validate
-    if elf.header.e_type != goblin::elf::header::ET_EXEC {
-        return Err(ExecError::InvalidElf("only static non-PIE (ET_EXEC) supported"));
-    }
     if elf.header.e_machine != goblin::elf::header::EM_X86_64 {
         return Err(ExecError::InvalidElf("not x86_64"));
     }
 
-    // 3. Load PT_LOAD segments
-    let brk_base = load_segments(&file_data, &elf)?;
+    // Determine base address by binary type
+    let base: u64 = match elf.header.e_type {
+        goblin::elf::header::ET_EXEC => 0,
+        goblin::elf::header::ET_DYN => PIE_LOAD_BASE,
+        _ => return Err(ExecError::InvalidElf("unsupported ELF type (need ET_EXEC or ET_DYN)")),
+    };
+
+    // 3. Load main binary PT_LOAD segments
+    let brk_base = load_segments_at_base(&file_data, &elf, base)?;
 
     // 4. Find phdr_vaddr for auxv
-    let phdr_vaddr = elf
+    let phdr_vaddr = if let Some(ph) = elf
         .program_headers
         .iter()
         .find(|ph| ph.p_type == goblin::elf::program_header::PT_PHDR)
-        .map(|ph| ph.p_vaddr)
-        .unwrap_or_else(|| {
-            let base_vaddr = elf
-                .program_headers
-                .iter()
-                .filter(|ph| ph.p_type == PT_LOAD)
-                .map(|ph| ph.p_vaddr)
-                .min()
-                .unwrap_or(0);
-            base_vaddr + elf.header.e_phoff
-        });
+    {
+        base.checked_add(ph.p_vaddr)
+            .ok_or(ExecError::InvalidElf("PT_PHDR vaddr overflow"))?
+    } else {
+        // Fallback: compute from first PT_LOAD segment.
+        // Assumes first LOAD maps file offset 0 (true for all modern toolchains).
+        let first_load = elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD)
+            .min_by_key(|ph| ph.p_vaddr);
+        match first_load {
+            Some(ph) => {
+                let mapped_base = base.checked_add(ph.p_vaddr)
+                    .ok_or(ExecError::InvalidElf("LOAD vaddr overflow"))?;
+                // e_phoff is relative to file start; subtract p_offset of the LOAD segment
+                // that contains offset 0, then add to mapped_base.
+                let file_base_offset = ph.p_offset;
+                mapped_base + (elf.header.e_phoff - file_base_offset)
+            }
+            None => return Err(ExecError::InvalidElf("no PT_LOAD segments")),
+        }
+    };
+
+    let main_entry = base.checked_add(elf.entry)
+        .ok_or(ExecError::InvalidElf("entry point overflow"))?;
 
     let elf_info = ElfInfo {
-        entry: elf.entry,
+        entry: main_entry,
         phdr_vaddr,
         phnum: elf.header.e_phnum as u64,
         phentsize: elf.header.e_phentsize as u64,
     };
 
-    // 5. Set up stack (needs elf_info for auxv)
-    let sp = setup_stack(path, &elf_info)?;
+    // 5. Check for dynamic linker (PT_INTERP)
+    let interp_info = if let Some(interp_path) = elf.interpreter {
+        kprintln!("[exec] interpreter: {}", interp_path);
 
-    // 6. Set brk state
+        let interp_data = read_file(interp_path)?;
+        let interp_elf =
+            Elf::parse(&interp_data).map_err(|_| ExecError::InvalidElf("interpreter parse failed"))?;
+
+        if interp_elf.header.e_type != goblin::elf::header::ET_DYN {
+            return Err(ExecError::InvalidElf("interpreter must be ET_DYN"));
+        }
+
+        // Load interpreter segments at INTERP_LOAD_BASE
+        load_segments_at_base(&interp_data, &interp_elf, INTERP_LOAD_BASE)?;
+
+        let interp_entry = INTERP_LOAD_BASE.checked_add(interp_elf.entry)
+            .ok_or(ExecError::InvalidElf("interpreter entry overflow"))?;
+
+        let info = InterpInfo {
+            base: INTERP_LOAD_BASE,
+            entry: interp_entry,
+        };
+
+        // Leak interpreter data — we never return from jump_to_user
+        core::mem::forget(interp_elf);
+        core::mem::forget(interp_data);
+
+        Some(info)
+    } else {
+        None
+    };
+
+    // 6. Set up stack (needs elf_info + interp_info for auxv)
+    let sp = setup_stack(path, &elf_info, interp_info.as_ref())?;
+
+    // 7. Set brk state
     *crate::BRK_BASE.lock() = brk_base;
     *crate::BRK_CURRENT.lock() = brk_base;
 
-    kprintln!("[exec] jumping to entry {:#x}", elf_info.entry);
+    // Entry point: interpreter's entry if present, else main binary's
+    let entry = match &interp_info {
+        Some(interp) => interp.entry,
+        None => elf_info.entry,
+    };
 
-    // 7. Intentionally leak elf and file_data — we're about to jump to user code
+    kprintln!("[exec] jumping to entry {:#x}", entry);
+
+    // 8. Intentionally leak elf and file_data — we're about to jump to user code
     // and never return. This avoids deallocation overhead.
     core::mem::forget(elf);
     core::mem::forget(file_data);
 
-    // 8. Jump to user — never returns
-    jump_to_user(elf_info.entry, sp);
+    // 9. Jump to user — never returns
+    jump_to_user(entry, sp);
 }
 
 fn read_file(path: &str) -> Result<Vec<u8>, ExecError> {
@@ -180,13 +251,18 @@ fn read_file(path: &str) -> Result<Vec<u8>, ExecError> {
     Ok(buf)
 }
 
-fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> {
+fn load_segments_at_base(
+    file_data: &[u8],
+    elf: &Elf,
+    base: u64,
+) -> Result<VirtualAddr, ExecError> {
     let mut brk_end: u64 = 0;
 
     for ph in elf.program_headers.iter().filter(|p| p.p_type == PT_LOAD) {
-        // Validate segment end doesn't overflow
-        let seg_end = ph
-            .p_vaddr
+        let vaddr = base
+            .checked_add(ph.p_vaddr)
+            .ok_or(ExecError::InvalidElf("segment vaddr overflow"))?;
+        let seg_end = vaddr
             .checked_add(ph.p_memsz)
             .ok_or(ExecError::InvalidElf("segment end overflow"))?;
 
@@ -210,12 +286,12 @@ fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> 
             return Err(ExecError::InvalidElf("segment data out of file bounds"));
         }
 
-        let start = align_down_2mb(ph.p_vaddr);
+        let start = align_down_2mb(vaddr);
         let end = align_up_2mb(seg_end);
 
-        let mut vaddr = start;
-        while vaddr < end {
-            let va = VirtualAddr::new(vaddr as usize);
+        let mut page_addr = start;
+        while page_addr < end {
+            let va = VirtualAddr::new(page_addr as usize);
             // Check if already mapped (two segments might share a 2 MB page)
             if crate::KERNEL_PAGE_TABLE
                 .get_if_present(va)
@@ -228,17 +304,17 @@ fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> 
                     .map_2mb(va, paddr)
                     .map_err(ExecError::Memory)?;
             }
-            vaddr += PAGE_SIZE as u64;
+            page_addr += PAGE_SIZE as u64;
         }
 
         // Copy segment data
         if file_size > 0 {
             // SAFETY: We validated file_offset + file_size <= file_data.len() above.
-            // The pages at ph.p_vaddr are mapped in the kernel page table.
+            // The pages at vaddr are mapped in the kernel page table.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     file_data.as_ptr().add(file_offset),
-                    ph.p_vaddr as *mut u8,
+                    vaddr as *mut u8,
                     file_size,
                 );
             }
@@ -248,10 +324,18 @@ fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> 
         brk_end = core::cmp::max(brk_end, seg_end);
     }
 
+    if brk_end == 0 {
+        return Err(ExecError::InvalidElf("no PT_LOAD segments"));
+    }
+
     Ok(VirtualAddr::new(align_up_2mb(brk_end) as usize))
 }
 
-fn setup_stack(path: &str, elf_info: &ElfInfo) -> Result<u64, ExecError> {
+fn setup_stack(
+    path: &str,
+    elf_info: &ElfInfo,
+    interp_info: Option<&InterpInfo>,
+) -> Result<u64, ExecError> {
     // Align stack bottom down to 2MB page boundary
     let stack_bottom = (USER_STACK_TOP.as_usize() - USER_STACK_SIZE) & !(PAGE_SIZE - 1);
     let stack_top_aligned = (USER_STACK_TOP.as_usize() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -266,10 +350,20 @@ fn setup_stack(path: &str, elf_info: &ElfInfo) -> Result<u64, ExecError> {
             .map_err(ExecError::Memory)?;
     }
 
-    Ok(prepare_initial_stack(USER_STACK_TOP, path, elf_info))
+    Ok(prepare_initial_stack(
+        USER_STACK_TOP,
+        path,
+        elf_info,
+        interp_info,
+    ))
 }
 
-fn prepare_initial_stack(stack_top: VirtualAddr, path: &str, info: &ElfInfo) -> u64 {
+fn prepare_initial_stack(
+    stack_top: VirtualAddr,
+    path: &str,
+    info: &ElfInfo,
+    interp_info: Option<&InterpInfo>,
+) -> u64 {
     let mut sp = stack_top.as_u64();
 
     // Write argv[0] string (path + null terminator)
@@ -281,12 +375,37 @@ fn prepare_initial_stack(stack_top: VirtualAddr, path: &str, info: &ElfInfo) -> 
         *(sp as *mut u8).add(path.len()) = 0;
     }
 
+    // Write 16 "random" bytes for AT_RANDOM (musl reads this for stack canary)
+    sp = (sp - 16) & !0xF; // align to 16 bytes
+    let random_addr = sp;
+    // SAFETY: Stack pages are mapped, writing deterministic random bytes.
+    unsafe {
+        let random: [u8; 16] = [
+            0x73, 0x75, 0x6D, 0x69, // "sumi"
+            0x72, 0x61, 0x6E, 0x64, // "rand"
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        core::ptr::copy_nonoverlapping(random.as_ptr(), sp as *mut u8, 16);
+    }
+
     // Align to 16 bytes
     sp &= !0xF;
 
     // Auxiliary vector (push pairs from bottom to top in memory)
     sp = push_auxv(sp, AT_NULL, 0);
+    sp = push_auxv(sp, AT_SECURE, 0);
+    sp = push_auxv(sp, AT_EGID, 0);
+    sp = push_auxv(sp, AT_GID, 0);
+    sp = push_auxv(sp, AT_EUID, 0);
+    sp = push_auxv(sp, AT_UID, 0);
+    sp = push_auxv(sp, AT_RANDOM, random_addr);
     sp = push_auxv(sp, AT_PAGESZ, 4096);
+
+    // AT_BASE: interpreter load base, or 0 if no interpreter
+    let at_base = interp_info.map_or(0, |i| i.base);
+    sp = push_auxv(sp, AT_BASE, at_base);
+
+    // AT_ENTRY: always the main binary's entry point
     sp = push_auxv(sp, AT_ENTRY, info.entry);
     sp = push_auxv(sp, AT_PHNUM, info.phnum);
     sp = push_auxv(sp, AT_PHENT, info.phentsize);

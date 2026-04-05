@@ -196,6 +196,89 @@ fn rust_hello() {
     );
 }
 
+fn musl_gcc_available() -> bool {
+    Command::new("musl-gcc").arg("--version").output().is_ok()
+}
+
+/// Compile a C fixture with musl-gcc, dynamically linked (the default for musl-gcc).
+fn compile_musl_dynamic(src: &str, out_dir: &Path) -> PathBuf {
+    let stem = Path::new(src).file_stem().unwrap().to_str().unwrap();
+    let out = out_dir.join("bin").join(stem);
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let fixture_path = project_root().join("tests/fixtures").join(src);
+
+    let status = Command::new("musl-gcc")
+        .args([
+            "-o",
+            out.to_str().unwrap(),
+            fixture_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run musl-gcc");
+    assert!(status.success(), "compiling {src} with musl-gcc failed");
+
+    out
+}
+
+/// Set up the shared directory with musl libc for dynamic linking tests.
+/// Copies ld-musl-x86_64.so.1 (and libc.so if separate) into lib/.
+fn setup_musl_libs(share_dir: &Path) {
+    let lib_dir = share_dir.join("lib");
+    std::fs::create_dir_all(&lib_dir).unwrap();
+
+    // Find the musl dynamic linker on the host system.
+    let interp_paths = [
+        "/lib/ld-musl-x86_64.so.1",
+        "/usr/lib/x86_64-linux-musl/libc.so",
+        "/lib/x86_64-linux-musl/libc.so",
+    ];
+
+    // The interpreter is typically a symlink to libc.so — copy the real file
+    // and create the expected symlink.
+    let ld_musl = interp_paths
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .expect("could not find musl dynamic linker on host");
+
+    let real_path = std::fs::canonicalize(ld_musl).unwrap();
+    let dest_libc = lib_dir.join("libc.so");
+    std::fs::copy(&real_path, &dest_libc).expect("failed to copy libc.so");
+
+    // Create the ld-musl symlink that PT_INTERP references.
+    let dest_ld = lib_dir.join("ld-musl-x86_64.so.1");
+    if !dest_ld.exists() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("libc.so", &dest_ld).expect("failed to create ld-musl symlink");
+    }
+}
+
+#[test]
+fn dynamic_hello_musl() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not available");
+        return;
+    }
+    if !musl_gcc_available() {
+        eprintln!("skipping: musl-gcc not available (install musl-tools)");
+        return;
+    }
+
+    ensure_built();
+    let tmp = TempDir::new();
+    compile_musl_dynamic("dynamic_hello.c", tmp.path());
+    setup_musl_libs(tmp.path());
+    let output = run_program("bin/dynamic_hello", tmp.path());
+
+    assert!(
+        output.contains("Hello from dynamic linking!"),
+        "expected 'Hello from dynamic linking!' in output, got:\n{output}"
+    );
+    assert!(
+        output.contains("[exit] code=0"),
+        "expected clean exit in output, got:\n{output}"
+    );
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {

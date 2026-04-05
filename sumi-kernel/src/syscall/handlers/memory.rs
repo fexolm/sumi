@@ -1,6 +1,5 @@
 use sumi_abi::address::VirtualAddr;
-use sumi_abi::arch::layout::{DAX_SLOT_COUNT, DAX_WINDOW_BASE, PAGE_SIZE};
-use sumi_abi::fuse::{FUSE_SETUPMAPPING_FLAG_READ, FUSE_SETUPMAPPING_FLAG_WRITE};
+use sumi_abi::arch::layout::{DAX_SLOT_COUNT, DAX_WINDOW_BASE, DAX_WINDOW_SIZE, PAGE_SIZE};
 
 use crate::exec::{align_up_2mb, zero_page};
 use crate::fs::FdKind;
@@ -27,6 +26,28 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         return EINVAL;
     }
 
+    // File-backed MAP_FIXED: fast path for dynamic linker segment placement.
+    // Accepts 4KB-aligned addresses (the reported AT_PAGESZ). Pages are managed
+    // at 2MB granularity internally, but the requested 4KB-aligned address is
+    // returned to the caller for sub-page data placement.
+    if flags & MAP_FIXED != 0 && flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+        if addr_hint % 4096 != 0 {
+            return EINVAL;
+        }
+        let (fuse_fh, _fuse_nodeid) = {
+            let table = crate::FD_TABLE.lock();
+            match table.get(fd as usize) {
+                Some(d) => match d.kind {
+                    FdKind::File { fuse_fh, fuse_nodeid, .. } => (fuse_fh, fuse_nodeid),
+                    _ => return EBADF,
+                },
+                None => return EBADF,
+            }
+        };
+        return map_fixed_file(addr_hint, len, fuse_fh, offset);
+    }
+
+    // For non-file-backed MAP_FIXED (anonymous or fallthrough), require 2MB alignment.
     if flags & MAP_FIXED != 0 && !(addr_hint as usize).is_multiple_of(PAGE_SIZE) {
         return EINVAL;
     }
@@ -123,9 +144,9 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
 
     // MAP_PRIVATE read-only or MAP_SHARED: try DAX first, fall back to private copy.
     let dax_flags = if flags & MAP_SHARED != 0 {
-        FUSE_SETUPMAPPING_FLAG_READ | FUSE_SETUPMAPPING_FLAG_WRITE
+        sumi_abi::fuse::FUSE_SETUPMAPPING_FLAG_READ | sumi_abi::fuse::FUSE_SETUPMAPPING_FLAG_WRITE
     } else {
-        FUSE_SETUPMAPPING_FLAG_READ
+        sumi_abi::fuse::FUSE_SETUPMAPPING_FLAG_READ
     };
 
     // Try DAX path.
@@ -142,6 +163,109 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
             )
         }
     }
+}
+
+/// Handle file-backed MAP_FIXED: ensure pages are mapped, read file data.
+/// This is the fast path for dynamic linker segment placement (per-segment MAP_FIXED
+/// into an already-reserved address range). Does not modify VMA table — pages are
+/// tracked by the reservation VMA from the initial mmap.
+fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> SyscallResult {
+    // Overflow check: addr + len must not wrap.
+    let end_addr = match addr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return EINVAL,
+    };
+
+    // Compute 2 MB-aligned page range covering [addr, addr + len).
+    let aligned_start = crate::exec::align_down_2mb(addr);
+    let aligned_end = align_up_2mb(end_addr);
+
+    // Ensure all 2 MB pages in range are mapped.
+    let mut page_addr = aligned_start;
+    while page_addr < aligned_end {
+        let va = VirtualAddr::new(page_addr as usize);
+        match crate::KERNEL_PAGE_TABLE.get_if_present(va) {
+            Ok(Some(entry)) => {
+                // Page exists. Check if it's a DAX page that needs COW.
+                let paddr = entry.addr();
+                if is_dax_page(paddr) {
+                    if let Err(e) = replace_dax_with_private(va, paddr) {
+                        return e;
+                    }
+                }
+                // Otherwise: regular page, reuse it.
+            }
+            Ok(None) => {
+                // Page not mapped — allocate.
+                let paddr = match crate::PAGE_ALLOCATOR.alloc(1) {
+                    Ok(p) => p,
+                    Err(_) => return ENOMEM,
+                };
+                zero_page(paddr);
+                if crate::KERNEL_PAGE_TABLE.map_2mb(va, paddr).is_err() {
+                    let _ = crate::PAGE_ALLOCATOR.free(paddr);
+                    return ENOMEM;
+                }
+            }
+            Err(_) => return ENOMEM,
+        }
+        page_addr += PAGE_SIZE as u64;
+    }
+
+    // Read file data at the exact requested address.
+    if let Some(fs) = crate::VIRTIO_FS.get() {
+        let read_len = (len as u64).min(u32::MAX as u64) as u32;
+        if fs_transfer_chunked(
+            |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
+            offset as u64,
+            addr,
+            read_len,
+        )
+        .is_err()
+        {
+            return EIO;
+        }
+    }
+
+    addr as SyscallResult
+}
+
+/// Check if a physical address falls within the DAX shared memory window.
+fn is_dax_page(paddr: sumi_abi::address::PhysicalAddr) -> bool {
+    let addr = paddr.as_usize();
+    let base = DAX_WINDOW_BASE.as_usize();
+    addr >= base && addr < base + DAX_WINDOW_SIZE
+}
+
+/// Replace a DAX-mapped page with a private physical copy.
+/// Allocates a new page, copies DAX content, remaps the virtual address.
+fn replace_dax_with_private(
+    va: VirtualAddr,
+    dax_paddr: sumi_abi::address::PhysicalAddr,
+) -> Result<(), SyscallResult> {
+    let new_paddr = crate::PAGE_ALLOCATOR.alloc(1).map_err(|_| ENOMEM)?;
+
+    // SAFETY: Both addresses are valid mapped memory. Copy DAX content to the new page.
+    let src = dax_paddr.to_virtual(&crate::KERNEL_DIRECT_MAP);
+    let dst = new_paddr.to_virtual(&crate::KERNEL_DIRECT_MAP);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src.as_ptr::<u8>(),
+            dst.as_ptr::<u8>() as *mut u8,
+            PAGE_SIZE,
+        );
+    }
+
+    // Replace mapping: unmap old, map new.
+    crate::KERNEL_PAGE_TABLE.unmap_2mb(va).map_err(|_| ENOMEM)?;
+    if let Err(_) = crate::KERNEL_PAGE_TABLE.map_2mb(va, new_paddr) {
+        // Try to restore the old DAX mapping to avoid leaving the page unmapped.
+        let _ = crate::KERNEL_PAGE_TABLE.map_2mb(va, dax_paddr);
+        let _ = crate::PAGE_ALLOCATOR.free(new_paddr);
+        return Err(ENOMEM);
+    }
+
+    Ok(())
 }
 
 pub fn sys_mprotect(_args: &SyscallArgs) -> SyscallResult {
@@ -162,30 +286,54 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
         Some(v) => v & !(PAGE_SIZE - 1),
         None => return EINVAL,
     };
-    let lookup_addr = VirtualAddr::new(aligned_start);
 
-    // Try to find a tracked VMA: use find() to locate by containment, then remove by its actual start.
-    let vma = {
-        let mut table = crate::VMA_TABLE.lock();
-        let found_start = table.find(lookup_addr).map(|v| v.start);
-        found_start.and_then(|start| table.remove(start))
+    // Check if this overlaps a tracked VMA.
+    let vma_info = {
+        let table = crate::VMA_TABLE.lock();
+        table
+            .find(VirtualAddr::new(aligned_start))
+            .map(|v| (v.start, v.end))
     };
 
-    if let Some(vma) = vma {
-        tear_down_vma(vma);
+    if let Some((vma_start, vma_end)) = vma_info {
+        let req_start = VirtualAddr::new(aligned_start);
+        let req_end = VirtualAddr::new(aligned_end);
+
+        if req_start.as_usize() <= vma_start.as_usize()
+            && req_end.as_usize() >= vma_end.as_usize()
+        {
+            // Full VMA unmap — remove and tear down.
+            if let Some(vma) = crate::VMA_TABLE.lock().remove(vma_start) {
+                tear_down_vma(vma);
+            }
+        } else {
+            // Partial munmap: only unmap the requested 2MB pages.
+            // Leave the VMA metadata intact — the pages outside the request
+            // remain valid. This handles musl's pattern of unmapping trailing
+            // gaps in library reservations.
+            unmap_pages_in_range(aligned_start, aligned_end);
+        }
         return 0;
     }
 
     // No VMA found — fall back to anonymous unmap behavior.
-    let mut vaddr = aligned_start;
-    while vaddr < aligned_end {
+    unmap_pages_in_range(aligned_start, aligned_end);
+
+    0
+}
+
+/// Unmap and free 2MB pages in [start, end), handling mixed DAX/private pages.
+fn unmap_pages_in_range(start: usize, end: usize) {
+    let mut vaddr = start;
+    while vaddr < end {
         if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr)) {
-            let _ = crate::PAGE_ALLOCATOR.free(paddr);
+            if !is_dax_page(paddr) {
+                let _ = crate::PAGE_ALLOCATOR.free(paddr);
+            }
+            // DAX pages: left for VMA teardown to free the slot range.
         }
         vaddr += PAGE_SIZE;
     }
-
-    0
 }
 
 pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
@@ -255,6 +403,8 @@ pub fn sys_madvise(_args: &SyscallArgs) -> SyscallResult {
 }
 
 /// Tear down a VMA: unmap pages, free DAX slot or physical pages as appropriate.
+/// For DAX-backed VMAs, handles mixed pages: some may have been replaced with
+/// private copies by `replace_dax_with_private` (COW from MAP_FIXED).
 fn tear_down_vma(vma: Vma) {
     let aligned_start = vma.start.as_usize();
     let aligned_end = vma.end.as_usize();
@@ -270,11 +420,17 @@ fn tear_down_vma(vma: Vma) {
                 vaddr += PAGE_SIZE;
             }
         }
-        MappingBacking::Dax { dax_offset, fuse_fh: _, fuse_nodeid: _, file_offset: _ } => {
-            // Unmap DAX pages from the page table.
+        MappingBacking::Dax { dax_offset, .. } => {
+            // Unmap all pages. Some may be original DAX, some replaced private copies.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
-                let _ = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr));
+                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr)) {
+                    if !is_dax_page(paddr) {
+                        // This page was replaced with a private copy — free it.
+                        let _ = crate::PAGE_ALLOCATOR.free(paddr);
+                    }
+                    // DAX pages: don't free individually — the slot range is freed below.
+                }
                 vaddr += PAGE_SIZE;
             }
             // Ask the host to unmap from the DAX window.
