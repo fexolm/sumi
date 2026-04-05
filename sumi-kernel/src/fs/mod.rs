@@ -80,6 +80,28 @@ impl FdTable {
         }
         self.fds[fd].take()
     }
+
+    /// Place a descriptor at a specific fd number. If the slot is occupied,
+    /// the old descriptor is returned so the caller can clean it up.
+    pub fn put(&mut self, fd: usize, desc: FileDescriptor) -> Option<FileDescriptor> {
+        if fd >= MAX_FDS {
+            return None;
+        }
+        let old = self.fds[fd].take();
+        self.fds[fd] = Some(desc);
+        old
+    }
+
+    /// Count how many open fds reference the given FUSE file handle.
+    /// Used to decide whether to release a handle after close/dup2.
+    pub fn count_fh_refs(&self, fh: u64) -> usize {
+        self.fds.iter().filter(|slot| {
+            matches!(slot, Some(d) if match d.kind {
+                FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => fuse_fh == fh,
+                _ => false,
+            })
+        }).count()
+    }
 }
 
 #[cfg(test)]

@@ -737,7 +737,192 @@ impl VirtioFsClient {
         let _ = self.submit_chain(&specs);
     }
 
+    /// FUSE_OPENDIR: open a directory by nodeid.
+    pub fn opendir(&self, nodeid: u64) -> Result<FuseOpenOut, i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseOpenIn>()];
+
+        // SAFETY: Writing repr(C) structs into a properly sized stack buffer.
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr() as *mut FuseInHeader,
+                FuseInHeader {
+                    len: req.len() as u32,
+                    opcode: FUSE_OPENDIR,
+                    unique: self.next_unique(),
+                    nodeid,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                    padding: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseOpenIn,
+                FuseOpenIn {
+                    flags: 0,
+                    open_flags: 0,
+                },
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseOpenOut>()];
+
+        let specs = [
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
+        ];
+
+        self.submit_chain(&specs)?;
+
+        // SAFETY: VM wrote FuseOutHeader + FuseOpenOut into resp buffer.
+        unsafe {
+            let out_header = core::ptr::read_volatile(resp.as_ptr() as *const FuseOutHeader);
+            if out_header.error != 0 {
+                return Err(out_header.error);
+            }
+            Ok(core::ptr::read_volatile(
+                resp.as_ptr().add(size_of::<FuseOutHeader>()) as *const FuseOpenOut,
+            ))
+        }
+    }
+
+    /// FUSE_RELEASEDIR: close a directory handle.
+    pub fn releasedir(&self, fh: u64) {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseReleaseIn>()];
+
+        // SAFETY: Writing repr(C) structs into a properly sized stack buffer.
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr() as *mut FuseInHeader,
+                FuseInHeader {
+                    len: req.len() as u32,
+                    opcode: FUSE_RELEASEDIR,
+                    unique: self.next_unique(),
+                    nodeid: 0,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                    padding: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseReleaseIn,
+                FuseReleaseIn {
+                    fh,
+                    flags: 0,
+                    release_flags: 0,
+                    lock_owner: 0,
+                },
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+
+        let specs = [
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
+        ];
+
+        let _ = self.submit_chain(&specs);
+    }
+
+    /// FUSE_READDIR: read directory entries into buf_phys. Returns bytes read.
+    pub fn readdir(
+        &self,
+        nodeid: u64,
+        fh: u64,
+        offset: u64,
+        buf_phys: PhysicalAddr,
+        count: u32,
+    ) -> Result<u32, i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseReadIn>()];
+
+        // SAFETY: Writing repr(C) structs into a properly sized stack buffer.
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr() as *mut FuseInHeader,
+                FuseInHeader {
+                    len: req.len() as u32,
+                    opcode: FUSE_READDIR,
+                    unique: self.next_unique(),
+                    nodeid,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                    padding: 0,
+                },
+            );
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseReadIn,
+                FuseReadIn {
+                    fh,
+                    offset,
+                    size: count,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                },
+            );
+        }
+
+        let resp_hdr = FuseOutHeader {
+            len: 0,
+            error: 0,
+            unique: 0,
+        };
+
+        let specs = [
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(&resp_hdr as *const _ as *const u8),
+                len: size_of::<FuseOutHeader>() as u32,
+                writable: true,
+            },
+            DescSpec {
+                addr: buf_phys,
+                len: count,
+                writable: true,
+            },
+        ];
+
+        self.submit_chain(&specs)?;
+
+        // SAFETY: VM wrote FuseOutHeader into resp_hdr via the writable descriptor.
+        unsafe {
+            let hdr = core::ptr::read_volatile(&resp_hdr);
+            if hdr.error != 0 {
+                return Err(hdr.error);
+            }
+            let bytes_read = hdr
+                .len
+                .saturating_sub(size_of::<FuseOutHeader>() as u32);
+            Ok(bytes_read)
+        }
+    }
+
     /// Resolve a path to a FUSE nodeid by walking each component via FUSE_LOOKUP.
+    /// Intermediate nodeids are forgotten so only the final nodeid is retained.
     pub fn resolve_path(&self, path: &[u8]) -> Result<u64, i32> {
         let mut nodeid = FUSE_ROOT_ID;
 
@@ -745,7 +930,21 @@ impl VirtioFsClient {
             if component.is_empty() {
                 continue;
             }
-            let entry = self.lookup(nodeid, component)?;
+            let prev = nodeid;
+            let entry = match self.lookup(nodeid, component) {
+                Ok(e) => e,
+                Err(e) => {
+                    // Forget the last intermediate (unless it's root)
+                    if prev != FUSE_ROOT_ID {
+                        self.forget(prev, 1);
+                    }
+                    return Err(e);
+                }
+            };
+            // Forget the previous intermediate (not the root, which is permanent)
+            if prev != FUSE_ROOT_ID {
+                self.forget(prev, 1);
+            }
             nodeid = entry.nodeid;
         }
 

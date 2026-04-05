@@ -184,3 +184,25 @@ pub struct FuseReleaseIn {
     pub release_flags: u32,
     pub lock_owner: u64,
 }
+
+/// FUSE directory entry (variable-length). The name follows this header
+/// and is padded to an 8-byte boundary in the READDIR response stream.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseDirent {
+    pub ino: u64,
+    pub off: u64,
+    pub namelen: u32,
+    pub typ: u32,
+    // name[namelen] follows, padded to 8-byte alignment
+}
+
+/// Round up to the next 8-byte boundary (FUSE dirent alignment).
+pub const fn fuse_dirent_align(x: usize) -> usize {
+    (x + 7) & !7
+}
+
+/// Total size of a FUSE dirent including the name and padding.
+pub const fn fuse_dirent_size(namelen: usize) -> usize {
+    fuse_dirent_align(core::mem::size_of::<FuseDirent>() + namelen)
+}

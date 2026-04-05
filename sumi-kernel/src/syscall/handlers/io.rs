@@ -8,6 +8,26 @@ const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
+/// Release FUSE resources for a file descriptor. Uses release() for files
+/// and releasedir() for directories, matching the FUSE protocol.
+fn release_fuse_resources(desc: &FileDescriptor) {
+    let fs = match crate::VIRTIO_FS.get() {
+        Some(fs) => fs,
+        None => return,
+    };
+    match desc.kind {
+        FdKind::File { fuse_fh, fuse_nodeid, .. } => {
+            fs.release(fuse_fh);
+            fs.forget(fuse_nodeid, 1);
+        }
+        FdKind::Directory { fuse_fh, fuse_nodeid, .. } => {
+            fs.releasedir(fuse_fh);
+            fs.forget(fuse_nodeid, 1);
+        }
+        FdKind::Console => {}
+    }
+}
+
 /// Translate a virtual address to physical. Works for both kernel (direct-map)
 /// and user (lower-half, page-table walk) addresses.
 fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
@@ -52,6 +72,7 @@ fn fs_transfer_chunked(
         match op(file_offset, paddr, chunk) {
             Ok(0) => break,
             Ok(n) => {
+                let n = n.min(remaining); // Clamp to prevent underflow
                 total += n;
                 buf_vaddr += n as u64;
                 file_offset += n as u64;
@@ -67,7 +88,7 @@ fn fs_transfer_chunked(
 pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
     let buf_vaddr = args.arg1;
-    let count = args.arg2 as u32;
+    let count = args.arg2.min(u32::MAX as u64) as u32;
 
     let (kind, _flags) = {
         let table = crate::FD_TABLE.lock();
@@ -109,7 +130,7 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
 pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
     let buf_vaddr = args.arg1;
-    let count = args.arg2 as usize;
+    let count = args.arg2.min(u32::MAX as u64) as usize;
 
     let (kind, _flags) = {
         let table = crate::FD_TABLE.lock();
@@ -182,7 +203,10 @@ pub fn sys_open(args: &SyscallArgs) -> SyscallResult {
 
     let open_out = match fs.open(nodeid, flags) {
         Ok(o) => o,
-        Err(e) => return e as SyscallResult,
+        Err(e) => {
+            fs.forget(nodeid, 1);
+            return e as SyscallResult;
+        }
     };
 
     let desc = FileDescriptor {
@@ -197,30 +221,38 @@ pub fn sys_open(args: &SyscallArgs) -> SyscallResult {
     let mut table = crate::FD_TABLE.lock();
     match table.alloc(desc) {
         Some(fd) => fd as SyscallResult,
-        None => EMFILE,
+        None => {
+            fs.release(open_out.fh);
+            fs.forget(nodeid, 1);
+            EMFILE
+        }
     }
 }
 
 pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
 
-    let old = {
+    let (old, remaining_refs) = {
         let mut table = crate::FD_TABLE.lock();
-        table.free(fd_num)
+        let old = table.free(fd_num);
+        let refs = match &old {
+            Some(desc) => match desc.kind {
+                FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => {
+                    table.count_fh_refs(fuse_fh)
+                }
+                _ => 0,
+            },
+            None => 0,
+        };
+        (old, refs)
     };
 
     match old {
         None => EBADF,
         Some(desc) => {
-            match desc.kind {
-                FdKind::Console => {}
-                FdKind::File { fuse_fh, fuse_nodeid, .. }
-                | FdKind::Directory { fuse_fh, fuse_nodeid, .. } => {
-                    if let Some(fs) = crate::VIRTIO_FS.get() {
-                        fs.release(fuse_fh);
-                        fs.forget(fuse_nodeid, 1);
-                    }
-                }
+            // Only release FUSE resources if no other fd shares this handle.
+            if remaining_refs == 0 {
+                release_fuse_resources(&desc);
             }
             0
         }
@@ -354,8 +386,74 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
-pub fn sys_readv(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
+    let fd_num = args.arg0 as usize;
+    let iov_ptr = args.arg1 as usize;
+    let iovcnt = args.arg2 as usize;
+
+    let (kind, _flags) = {
+        let table = crate::FD_TABLE.lock();
+        match table.get(fd_num) {
+            Some(d) => (d.kind, d.flags),
+            None => return EBADF,
+        }
+    };
+
+    match kind {
+        FdKind::Console => 0, // No stdin
+        FdKind::File {
+            fuse_fh, offset, ..
+        } => {
+            let fs = match crate::VIRTIO_FS.get() {
+                Some(fs) => fs,
+                None => return EIO,
+            };
+
+            let mut total = 0i64;
+            let mut cur_offset = offset;
+
+            for i in 0..iovcnt {
+                // SAFETY: Reading iov_base and iov_len from the iovec array
+                // at the user-provided address. The iovec struct is 16 bytes.
+                let iov_base =
+                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) };
+                let iov_len_raw =
+                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) };
+                let iov_len = iov_len_raw.min(u32::MAX as u64) as u32;
+                if iov_len == 0 {
+                    continue;
+                }
+
+                match fs_transfer_chunked(
+                    |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
+                    cur_offset,
+                    iov_base,
+                    iov_len,
+                ) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n as i64;
+                        cur_offset += n as u64;
+                    }
+                    Err(e) if total > 0 => break,
+                    Err(e) => return e as SyscallResult,
+                }
+            }
+
+            // Update offset
+            let mut table = crate::FD_TABLE.lock();
+            if let Some(desc) = table.get_mut(fd_num) {
+                if let FdKind::File {
+                    ref mut offset, ..
+                } = desc.kind
+                {
+                    *offset = cur_offset;
+                }
+            }
+            total as SyscallResult
+        }
+        _ => EBADF,
+    }
 }
 
 pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
@@ -388,7 +486,57 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             }
             total as SyscallResult
         }
-        _ => ENOSYS,
+        FdKind::File {
+            fuse_fh, offset, ..
+        } => {
+            let fs = match crate::VIRTIO_FS.get() {
+                Some(fs) => fs,
+                None => return EIO,
+            };
+
+            let mut total = 0i64;
+            let mut cur_offset = offset;
+
+            for i in 0..iovcnt {
+                // SAFETY: Reading iov_base and iov_len from the iovec array.
+                let iov_base =
+                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16) as *const u64) };
+                let iov_len_raw =
+                    unsafe { core::ptr::read_volatile((iov_ptr + i * 16 + 8) as *const u64) };
+                let iov_len = iov_len_raw.min(u32::MAX as u64) as u32;
+                if iov_len == 0 {
+                    continue;
+                }
+
+                match fs_transfer_chunked(
+                    |off, pa, cnt| fs.write(fuse_fh, off, pa, cnt),
+                    cur_offset,
+                    iov_base,
+                    iov_len,
+                ) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n as i64;
+                        cur_offset += n as u64;
+                    }
+                    Err(e) if total > 0 => break,
+                    Err(e) => return e as SyscallResult,
+                }
+            }
+
+            // Update offset
+            let mut table = crate::FD_TABLE.lock();
+            if let Some(desc) = table.get_mut(fd_num) {
+                if let FdKind::File {
+                    ref mut offset, ..
+                } = desc.kind
+                {
+                    *offset = cur_offset;
+                }
+            }
+            total as SyscallResult
+        }
+        _ => EBADF,
     }
 }
 
@@ -400,10 +548,66 @@ pub fn sys_select(_args: &SyscallArgs) -> SyscallResult {
     ENOSYS
 }
 
-pub fn sys_dup(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_dup(args: &SyscallArgs) -> SyscallResult {
+    let old_fd = args.arg0 as usize;
+
+    let mut table = crate::FD_TABLE.lock();
+    let desc = match table.get(old_fd) {
+        Some(d) => *d,
+        None => return EBADF,
+    };
+
+    match table.alloc(desc) {
+        Some(new_fd) => new_fd as SyscallResult,
+        None => EMFILE,
+    }
 }
 
-pub fn sys_dup2(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
+    let old_fd = args.arg0 as usize;
+    let new_fd = args.arg1 as usize;
+
+    if new_fd >= crate::fs::MAX_FDS {
+        return EBADF;
+    }
+
+    if old_fd == new_fd {
+        // If old_fd is valid, return new_fd. Otherwise EBADF.
+        let table = crate::FD_TABLE.lock();
+        return match table.get(old_fd) {
+            Some(_) => new_fd as SyscallResult,
+            None => EBADF,
+        };
+    }
+
+    let (evicted, remaining_refs) = {
+        let mut table = crate::FD_TABLE.lock();
+        let desc = match table.get(old_fd) {
+            Some(d) => *d,
+            None => return EBADF,
+        };
+
+        let old_occupant = table.put(new_fd, desc);
+
+        // Check if the evicted fd's handle is still referenced by other fds.
+        let refs = match &old_occupant {
+            Some(d) => match d.kind {
+                FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => {
+                    table.count_fh_refs(fuse_fh)
+                }
+                _ => 0,
+            },
+            None => 0,
+        };
+        (old_occupant, refs)
+    };
+
+    // Release FUSE resources for the evicted fd only if no other fd shares the handle.
+    if remaining_refs == 0 {
+        if let Some(ref evicted) = evicted {
+            release_fuse_resources(evicted);
+        }
+    }
+
+    new_fd as SyscallResult
 }

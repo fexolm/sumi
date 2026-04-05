@@ -48,6 +48,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         87  => handlers::fs::sys_unlink(args),
         88  => handlers::fs::sys_symlink(args),
         89  => handlers::fs::sys_readlink(args),
+        217 => handlers::fs::sys_getdents64(args),
         257 => handlers::fs::sys_openat(args),
         262 => handlers::fs::sys_newfstatat(args),
         263 => handlers::fs::sys_unlinkat(args),

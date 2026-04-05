@@ -3,7 +3,7 @@
 ## 1. Background
 
 sumi runs Linux ELF binaries that expect a POSIX filesystem. Since the unikernel has no
-block device or local filesystem, all file I/O must be forwarded to the host. We use virtio
+block device or local filesystem, all file I/O is forwarded to the host. We use virtio
 as the transport and a subset of the FUSE protocol for filesystem operations.
 
 **Key insight**: Because sumi is a single-process unikernel under KVM, every MMIO write
@@ -19,12 +19,13 @@ is a single MMIO round-trip.
 - Minimal complexity: no interrupt controller, no async I/O, no FUSE daemon.
 - Reusable transport: the virtio MMIO layer supports future devices (net, console).
 
-### Non-goals (for now)
+### Non-goals
 
-- DAX / shared memory mapping (Phase 2).
+- DAX / shared memory mapping.
 - mmap of files (requires DAX or page-fault forwarding).
 - File locking (flock/fcntl).
 - Extended attributes, ACLs, inotify.
+- Mutation operations (mkdir, rmdir, unlink, rename) — stubs return ENOSYS.
 
 ---
 
@@ -81,13 +82,12 @@ is a single MMIO round-trip.
 
 ## 3. VirtIO MMIO Transport
 
-We use the VirtIO MMIO transport (virtio spec v1.2, section 4.2) instead of PCI because
-sumi has no PCI bus. Each virtio device occupies a 4KB MMIO register region at a fixed
-physical address known at compile time.
+VirtIO MMIO transport (virtio spec v1.2, section 4.2). Each virtio device occupies a 4KB
+MMIO register region at a fixed physical address known at compile time.
 
 ### 3.1 MMIO Register Layout
 
-All registers are 32-bit unless noted. Offset from device base address:
+All registers are 32-bit. Offset from device base address:
 
 | Offset | Name              | R/W | Description                          |
 |--------|-------------------|-----|--------------------------------------|
@@ -115,370 +115,95 @@ All registers are 32-bit unless noted. Offset from device base address:
 | 0x0A4  | QueueUsedHigh     | W   | Used ring phys addr [63:32]          |
 | 0x100+ | Config space      | RW  | Device-specific (virtio-fs: tag)     |
 
-### 3.2 Device Initialization Sequence (kernel-side)
+### 3.2 MMIO Address
 
 ```
-1. Read MagicValue, verify == 0x74726976
-2. Read Version, verify == 2
-3. Read DeviceID, verify == 26 (filesystem)
-4. Write Status = 0 (reset)
-5. Write Status |= ACKNOWLEDGE (1)
-6. Write Status |= DRIVER (2)
-7. Read/negotiate features (DeviceFeatures/DriverFeatures)
-8. Write Status |= FEATURES_OK (8)
-9. Read Status, verify FEATURES_OK still set
-10. Set up virtqueues (see section 4)
-11. Write Status |= DRIVER_OK (4)
+VIRTIO_MMIO_BASE   = 0x10_0000_0000  (64 GB)
+VIRTIO_MMIO_STRIDE = 0x1000          (4 KB per device)
+VIRTIO_FS_MMIO     = VIRTIO_MMIO_BASE  (device 0)
 ```
 
-### 3.3 MMIO Address
-
-```rust
-// sumi-abi/src/arch/x86_64/layout.rs
-
-/// Base physical address for virtio MMIO devices.
-/// Placed at 127 TB — well above any reasonable guest RAM size,
-/// but within the 128 TB direct-map range so page tables cover it.
-pub const VIRTIO_MMIO_BASE: PhysicalAddr = PhysicalAddr::new(0x7F00_0000_0000);
-
-/// Each virtio device occupies 4KB (one MMIO page).
-pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-
-/// Device 0 = virtio-fs.
-pub const VIRTIO_FS_MMIO: PhysicalAddr = VIRTIO_MMIO_BASE;
-```
-
-The kernel accesses these through the direct map (128 TB, 1 GB huge pages):
-`VirtualAddr = DIRECT_MAP_OFFSET + VIRTIO_FS_MMIO`.
-
-The VM process does NOT register a KVM memory region for this range. Any guest access
-triggers `KVM_EXIT_MMIO`, which the VM handles.
+Placed above reasonable guest RAM, within the 128 TB direct-map range. The kernel
+accesses via `VirtualAddr = DIRECT_MAP_OFFSET + VIRTIO_FS_MMIO`. No KVM memory region
+is registered — all accesses trigger `KVM_EXIT_MMIO`.
 
 ---
 
 ## 4. Split Virtqueue
 
-We use the split virtqueue format (virtio spec section 2.7). It consists of three
-physically-contiguous regions, each allocated by the kernel from `PageAllocator`.
+Split virtqueue format (virtio spec section 2.7). Three physically-contiguous regions
+allocated by the kernel from `KernelAllocator`.
 
-### 4.1 Descriptor Table
+- **Descriptor Table**: 256 entries × 16 bytes. Chains form FUSE requests (2-3 descriptors).
+- **Available Ring**: Kernel publishes descriptor chain heads for the VM.
+- **Used Ring**: VM writes completed chain heads with bytes written.
 
-Array of `QueueNum` entries:
+`QUEUE_SIZE = 256`. Only queue 1 (request queue) is used.
 
-```rust
-#[repr(C)]
-pub struct VirtqDesc {
-    pub addr:  u64,    // Physical address of the buffer
-    pub len:   u32,    // Buffer length in bytes
-    pub flags: u16,    // NEXT (1), WRITE (2), INDIRECT (4)
-    pub next:  u16,    // Next descriptor index (if NEXT flag set)
-}
-```
+### 4.1 Synchronous Completion Model
 
-Size: `QueueNum * 16` bytes.
+Each vCPU independently submits descriptors and triggers KVM exits. The guest kernel
+protects the virtqueue with a `spin::Mutex`, held only during descriptor submission.
+The MMIO exit (I/O) happens outside the lock.
 
-Descriptors form chains: a FUSE request typically uses 2-3 descriptors chained via `next`:
-- Descriptor 0: FUSE request header (device-readable)
-- Descriptor 1: Response header + data buffer (device-writable, `WRITE` flag)
-
-For writes, an extra descriptor carries the write data (device-readable) before the
-response descriptor.
-
-### 4.2 Available Ring
-
-The kernel publishes descriptor chain heads here for the VM to consume:
-
-```rust
-#[repr(C)]
-pub struct VirtqAvail {
-    pub flags: u16,          // VIRTQ_AVAIL_F_NO_INTERRUPT = 1
-    pub idx:   u16,          // Next entry the kernel will write
-    pub ring:  [u16; QUEUE_SIZE],  // Descriptor chain head indices
-}
-```
-
-Size: `4 + 2 * QueueNum` bytes (+ 2 bytes padding for used_event, ignored).
-
-### 4.3 Used Ring
-
-The VM writes completed descriptor chain heads here:
-
-```rust
-#[repr(C)]
-pub struct VirtqUsed {
-    pub flags: u16,
-    pub idx:   u16,          // Next entry the VM will write
-    pub ring:  [VirtqUsedElem; QUEUE_SIZE],
-}
-
-#[repr(C)]
-pub struct VirtqUsedElem {
-    pub id:  u32,   // Descriptor chain head index
-    pub len: u32,   // Total bytes written by the device
-}
-```
-
-Size: `4 + 8 * QueueNum` bytes.
-
-### 4.4 Queue Size
-
-`QUEUE_SIZE = 256` — sized for up to 256 concurrent vCPUs. Each vCPU may have one
-FUSE request in flight, and each request uses 2-3 descriptors chained together.
-256 descriptors allow ~85 concurrent requests (at 3 descriptors each).
-
-### 4.5 Queue Count
-
-virtio-fs defines two queues:
-- **Queue 0 (hiprio)**: For `FUSE_FORGET` / `FUSE_INTERRUPT`. Initially unused — we
-  handle forget inline.
-- **Queue 1 (request)**: All FUSE requests go here.
-
-We allocate both but only use queue 1 initially.
-
-### 4.6 Synchronous Completion Model
-
-With up to 256 vCPUs, multiple FUSE requests can be in flight simultaneously. Each
-vCPU independently submits descriptors and triggers KVM exits.
-
-```
- vCPU A (kernel)     vCPU B (kernel)        VM process (host threads)
-   |                    |                      |
-   | lock queue         |                      |
-   | submit desc        |                      |
-   | unlock queue       |                      |
-   | QueueNotify --KVM_EXIT-->  thread A:      |
-   | (A paused)         |      read avail      |
-   |                    | lock queue            |
-   |                    | submit desc           |
-   |                    | unlock queue          |
-   |                    | QueueNotify --EXIT--> | thread B:
-   |                    | (B paused)            | read avail
-   |                    |          thread A:    | process B's FUSE req
-   |                    |          process A's  | host syscall
-   |                    |          FUSE request | write used ring
-   |                    |          host syscall |
-   |                    |          write used   |
-   | <--KVM_RUN-------- |          ring         |
-   | read used ring     | <--KVM_RUN---------- |
-   |                    | read used ring        |
-   v                    v                       v
-```
-
-Each vCPU's `KVM_EXIT_MMIO` is handled by its own host thread. The VM processes the
-request and returns — from that vCPU's perspective, the MMIO write blocks until the
-response is ready. Different vCPUs can have requests in flight concurrently.
-
-The guest kernel protects the virtqueue with a spinlock. The lock is held only during
-descriptor submission (fast — no I/O), not during the MMIO exit. Each vCPU identifies
-its response in the used ring by matching the FUSE `unique` field.
-
-The `avail.flags` is set to `VIRTQ_AVAIL_F_NO_INTERRUPT` since we never need
-host→guest notifications.
+The VM processes all pending requests in `process_queue()` before returning to the guest.
+`avail.flags = VIRTQ_AVAIL_F_NO_INTERRUPT` — no host→guest notifications needed.
 
 ---
 
 ## 5. FUSE Protocol
 
-FUSE (Filesystem in Userspace) protocol defines request/response messages carried over
-the virtqueue. We implement FUSE 7.31 (Linux 5.x compatible).
+FUSE 7.31. Every message starts with `FuseInHeader` (40 bytes) / `FuseOutHeader` (16 bytes).
 
-### 5.1 Message Format
+### 5.1 Implemented Operations
 
-Every FUSE message starts with a header:
+| Opcode | Name              | Descriptor Chain                        | Used By                      |
+|--------|-------------------|-----------------------------------------|------------------------------|
+| 26     | `FUSE_INIT`       | [hdr+body] → [out_hdr+body]            | Device init                  |
+| 1      | `FUSE_LOOKUP`     | [hdr+name\0] → [out_hdr+entry]         | open, stat, access, chdir    |
+| 3      | `FUSE_GETATTR`    | [hdr+body] → [out_hdr+attr]            | fstat, stat, lseek(SEEK_END) |
+| 14     | `FUSE_OPEN`       | [hdr+body] → [out_hdr+open]            | open, openat                 |
+| 28     | `FUSE_OPENDIR`    | [hdr+body] → [out_hdr+open]            | openat(O_DIRECTORY)          |
+| 35     | `FUSE_CREATE`     | [hdr+body+name\0] → [out_hdr+entry+open]| creat                       |
+| 15     | `FUSE_READ`       | [hdr+body] → [out_hdr] [data_buf]      | read, pread64, readv         |
+| 16     | `FUSE_WRITE`      | [hdr+body] [data_buf] → [out_hdr+write] | write, pwrite64, writev     |
+| 29     | `FUSE_READDIR`    | [hdr+body] → [out_hdr] [dirent_buf]    | getdents64                   |
+| 18     | `FUSE_RELEASE`    | [hdr+body] → [out_hdr]                 | close (file)                 |
+| 30     | `FUSE_RELEASEDIR` | [hdr+body] → [out_hdr]                 | close (directory)            |
+| 2      | `FUSE_FORGET`     | [hdr+body] (no response)               | close, path cleanup          |
 
-```rust
-/// Sent by kernel → VM
-#[repr(C)]
-pub struct FuseInHeader {
-    pub len:     u32,   // Total message length (header + body)
-    pub opcode:  u32,   // FUSE operation code
-    pub unique:  u64,   // Request ID (echoed in response)
-    pub nodeid:  u64,   // Inode number (operation target)
-    pub uid:     u32,   // (unused, set to 0)
-    pub gid:     u32,   // (unused, set to 0)
-    pub pid:     u32,   // (unused, set to 0)
-    pub padding: u32,
-}
-// Size: 40 bytes
+### 5.2 Path Resolution
 
-/// Sent by VM → kernel
-#[repr(C)]
-pub struct FuseOutHeader {
-    pub len:    u32,    // Total response length (header + body)
-    pub error:  i32,    // 0 on success, -errno on error
-    pub unique: u64,    // Echoed from request
-}
-// Size: 16 bytes
+FUSE resolves paths component-by-component from root (`nodeid = 1`):
+
+```
+open("/data/input.txt"):
+  FUSE_LOOKUP(parent=1, "data")      → nodeid=2
+  FUSE_LOOKUP(parent=2, "input.txt") → nodeid=3
+  FUSE_OPEN(nodeid=3, O_RDONLY)      → fh=1
 ```
 
-### 5.2 Required Operations
+**Intermediate nodeids are forgotten immediately** — `resolve_path()` calls
+`FUSE_FORGET` on each intermediate nodeid (except root) as it walks. Only the final
+nodeid is retained with its lookup reference.
 
-Minimum set for file I/O:
+### 5.3 READDIR Format
 
-| Opcode | Name              | Request Body          | Response Body          | Used By                |
-|--------|-------------------|-----------------------|------------------------|------------------------|
-| 1      | `FUSE_LOOKUP`     | filename (null-term)  | `FuseEntryOut`         | open, stat, access     |
-| 2      | `FUSE_FORGET`     | `FuseForgetIn`        | (no response)          | close, path cleanup    |
-| 3      | `FUSE_GETATTR`    | `FuseGetattrIn`       | `FuseAttrOut`          | stat, fstat            |
-| 14     | `FUSE_OPEN`       | `FuseOpenIn`          | `FuseOpenOut`          | open, openat           |
-| 15     | `FUSE_READ`       | `FuseReadIn`          | data bytes             | read, pread64          |
-| 16     | `FUSE_WRITE`      | `FuseWriteIn` + data  | `FuseWriteOut`         | write, pwrite64        |
-| 18     | `FUSE_RELEASE`    | `FuseReleaseIn`       | (empty)                | close                  |
-| 26     | `FUSE_INIT`       | `FuseInitIn`          | `FuseInitOut`          | mount / device init    |
-| 28     | `FUSE_OPENDIR`    | `FuseOpenIn`          | `FuseOpenOut`          | getdents               |
-| 29     | `FUSE_READDIR`    | `FuseReadIn`          | `FuseDirent` stream    | getdents               |
-| 30     | `FUSE_RELEASEDIR` | `FuseReleaseIn`       | (empty)                | close dir              |
+FUSE_READDIR returns a packed stream of `FuseDirent` entries (8-byte aligned):
 
-Extended set (Phase 2):
-
-| Opcode | Name              | Used By                          |
-|--------|-------------------|----------------------------------|
-| 4      | `FUSE_SETATTR`    | chmod, chown, truncate, utimes   |
-| 6      | `FUSE_SYMLINK`    | symlink                          |
-| 9      | `FUSE_LINK`       | link                             |
-| 10     | `FUSE_UNLINK`     | unlink, unlinkat                 |
-| 11     | `FUSE_RMDIR`      | rmdir                            |
-| 12     | `FUSE_RENAME`     | rename                           |
-| 14     | `FUSE_MKDIR`      | mkdir                            |
-| 22     | `FUSE_READLINK`   | readlink                         |
-| 34     | `FUSE_ACCESS`     | access                           |
-| 35     | `FUSE_CREATE`     | open(O_CREAT), creat             |
-| 44     | `FUSE_LSEEK`      | lseek (SEEK_DATA/SEEK_HOLE)      |
-
-### 5.3 Key FUSE Structures
-
-```rust
-#[repr(C)]
-pub struct FuseAttr {
-    pub ino:       u64,
-    pub size:      u64,
-    pub blocks:    u64,
-    pub atime:     u64,
-    pub mtime:     u64,
-    pub ctime:     u64,
-    pub atimensec: u32,
-    pub mtimensec: u32,
-    pub ctimensec: u32,
-    pub mode:      u32,
-    pub nlink:     u32,
-    pub uid:       u32,
-    pub gid:       u32,
-    pub rdev:      u32,
-    pub blksize:   u32,
-    pub flags:     u32,
-}
-
-#[repr(C)]
-pub struct FuseEntryOut {
-    pub nodeid:         u64,   // Assigned inode for this entry
-    pub generation:     u64,
-    pub entry_valid:    u64,   // Cache timeout (seconds)
-    pub attr_valid:     u64,
-    pub entry_valid_nsec: u32,
-    pub attr_valid_nsec:  u32,
-    pub attr:           FuseAttr,
-}
-
-#[repr(C)]
-pub struct FuseOpenIn {
-    pub flags:   u32,   // O_RDONLY, O_WRONLY, O_RDWR, etc.
-    pub open_flags: u32,
-}
-
-#[repr(C)]
-pub struct FuseOpenOut {
-    pub fh:         u64,   // File handle (opaque, assigned by VM)
-    pub open_flags: u32,
-    pub padding:    u32,
-}
-
-#[repr(C)]
-pub struct FuseReadIn {
-    pub fh:      u64,   // File handle from FUSE_OPEN
-    pub offset:  u64,   // Byte offset in file
-    pub size:    u32,   // Bytes to read
-    pub read_flags: u32,
-    pub lock_owner: u64,
-    pub flags:   u32,
-    pub padding: u32,
-}
-
-#[repr(C)]
-pub struct FuseWriteIn {
-    pub fh:      u64,
-    pub offset:  u64,
-    pub size:    u32,
-    pub write_flags: u32,
-    pub lock_owner: u64,
-    pub flags:   u32,
-    pub padding: u32,
-}
-// Followed by `size` bytes of write data.
-
-#[repr(C)]
-pub struct FuseWriteOut {
-    pub size:    u32,   // Bytes actually written
-    pub padding: u32,
-}
-
-#[repr(C)]
-pub struct FuseInitIn {
-    pub major:        u32,   // FUSE_KERNEL_VERSION (7)
-    pub minor:        u32,   // FUSE_KERNEL_MINOR_VERSION (31)
-    pub max_readahead: u32,
-    pub flags:        u32,
-}
-
-#[repr(C)]
-pub struct FuseInitOut {
-    pub major:         u32,
-    pub minor:         u32,
-    pub max_readahead:  u32,
-    pub flags:         u32,
-    pub max_background: u16,
-    pub congestion_threshold: u16,
-    pub max_write:     u32,
-    // ... additional fields (padded to 64 bytes)
-}
-
-#[repr(C)]
-pub struct FuseForgetIn {
-    pub nlookup: u64,   // Number of lookups to forget
+```
+struct FuseDirent {
+    ino: u64,      // Inode number
+    off: u64,      // Offset for next readdir call
+    namelen: u32,  // Length of name
+    typ: u32,      // File type (DT_REG=8, DT_DIR=4, etc.)
+    // name[namelen] follows, padded to 8-byte alignment
 }
 ```
 
-### 5.4 Session Initialization
-
-After virtio device init, the kernel sends `FUSE_INIT`:
-
-```
-Kernel → VM:  FuseInHeader { opcode: FUSE_INIT, nodeid: 0 }
-              FuseInitIn { major: 7, minor: 31, max_readahead: 0, flags: 0 }
-
-VM → Kernel:  FuseOutHeader { error: 0 }
-              FuseInitOut { major: 7, minor: 31, max_write: 1048576, ... }
-```
-
-`max_write` tells the kernel the maximum bytes per `FUSE_WRITE` request. We set this to
-1 MB (matching typical virtio-fs implementations). `max_read` is implicitly the same.
-
-### 5.5 Path Resolution
-
-FUSE resolves paths component-by-component from the root node (`nodeid = 1`).
-
-To open `/data/input.txt`:
-```
-FUSE_LOOKUP(parent=1, name="data")     → nodeid=2, attr={mode=S_IFDIR, ...}
-FUSE_LOOKUP(parent=2, name="input.txt") → nodeid=3, attr={mode=S_IFREG, size=4096, ...}
-FUSE_OPEN(nodeid=3, flags=O_RDONLY)     → fh=1
-```
-
-Each `FUSE_LOOKUP` is one virtqueue round-trip. Since each round-trip is a synchronous
-MMIO exit (no context switch, no interrupt — just a function call in the VM process),
-per-component resolution is fast (~microseconds per component).
-
-The kernel caches `nodeid` assignments in the FD table entries and issues `FUSE_FORGET`
-when all references to a node are released.
+The VM-side server synthesizes `.` and `..` entries, then iterates the host directory.
+Offset is a 1-based entry index. The kernel converts FUSE dirents to `linux_dirent64`
+format (19-byte header: d_ino u64, d_off i64, d_reclen u16, d_type u8, then name).
 
 ---
 
@@ -487,453 +212,189 @@ when all references to a node are released.
 ### 6.1 Design
 
 ```rust
-// sumi-kernel/src/fs/fd.rs
-
 pub const MAX_FDS: usize = 256;
 
-#[derive(Clone, Copy)]
 pub enum FdKind {
-    /// Console: debugcon port for output, no input yet.
     Console,
-    /// Host file accessed via virtio-fs FUSE.
-    File {
-        fuse_fh: u64,       // FUSE file handle from FUSE_OPEN
-        fuse_nodeid: u64,   // FUSE node ID for this file
-        offset: u64,        // Current file position (updated by read/write/lseek)
-    },
-    /// Host directory accessed via virtio-fs FUSE.
-    Directory {
-        fuse_fh: u64,
-        fuse_nodeid: u64,
-        offset: u64,
-    },
+    File { fuse_fh: u64, fuse_nodeid: u64, offset: u64 },
+    Directory { fuse_fh: u64, fuse_nodeid: u64, offset: u64 },
 }
 
-pub struct FileDescriptor {
-    pub kind: FdKind,
-    pub flags: u32,       // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-}
-
-pub struct FdTable {
-    fds: [Option<FileDescriptor>; MAX_FDS],
-}
+pub struct FileDescriptor { pub kind: FdKind, pub flags: u32 }
+pub struct FdTable { fds: [Option<FileDescriptor>; MAX_FDS] }
 ```
 
-### 6.2 Pre-allocated Descriptors
+Pre-allocated: fd 0 (stdin/Console), fd 1 (stdout/Console), fd 2 (stderr/Console).
 
-At boot, before any user code runs:
+### 6.2 Allocation
 
-| FD | Kind    | Purpose                              |
-|----|---------|--------------------------------------|
-| 0  | Console | stdin (returns 0 bytes / EOF for now) |
-| 1  | Console | stdout → debugcon port 0xE9          |
-| 2  | Console | stderr → debugcon port 0xE9          |
+`alloc()` scans from index 0 for the first `None` slot (Linux "lowest fd" guarantee).
+`put(fd, desc)` places a descriptor at a specific slot (for dup2), returning any evicted
+descriptor for cleanup. `free(fd)` removes and returns the old descriptor.
 
-### 6.3 FD Allocation
+### 6.3 dup/dup2 and Reference Counting
 
-`open()` / `openat()` scan from index 3 upward for the first `None` slot, matching
-Linux's "lowest available fd" guarantee. Returns `-EMFILE` if the table is full.
+`dup`/`dup2` copy the `FileDescriptor` including `fuse_fh`. Multiple fds may reference
+the same FUSE file handle. `FUSE_RELEASE` is sent only when the last fd referencing a
+given `fuse_fh` is closed.
 
-`dup()` / `dup2()` copy the `FileDescriptor` (including offset and fh) to the target slot.
-Both FDs share the same underlying FUSE file handle — `FUSE_RELEASE` is sent only when the
-last FD referencing a given `fuse_fh` is closed. A simple reference count on `fuse_fh`
-handles this.
+Implemented via `count_fh_refs(fh)` — scans the fd table for remaining references.
+`sys_close` and `sys_dup2` check this count after removing/replacing the fd slot:
+- If `remaining_refs == 0`: call `release(fh)` (or `releasedir(fh)`) and `forget(nodeid, 1)`.
+- Otherwise: just remove the fd slot, leave the FUSE handle open.
 
-### 6.4 Integration with KernelState
+### 6.4 Global State
 
 ```rust
-// sumi-kernel/src/lib.rs (KernelState)
-
-pub struct KernelState<'a, DM: DirectMap> {
-    pub page_alloc: &'a PageAllocator,
-    pub kernel_alloc: &'a KernelAllocator<DM>,
-    pub page_table: &'a RootPageTable<DM>,
-    pub fd_table: spin::Mutex<FdTable>,           // NEW
-    pub virtio_fs: Option<VirtioFsClient<'a, DM>>, // NEW
-}
+// sumi-kernel/src/lib.rs
+pub static FD_TABLE: spin::Mutex<FdTable> = spin::Mutex::new(FdTable::new());
+pub static VIRTIO_FS: spin::Once<VirtioFsClient> = spin::Once::new();
 ```
 
-`fd_table` is behind a `spin::Mutex` because syscall handlers from multiple vCPUs need
-mutable access. With up to 256 vCPUs doing concurrent I/O, the lock is held only for
-the brief FD lookup/update (not during the actual I/O operation). Each handler copies
-the `FileDescriptor` fields it needs under the lock, then releases before submitting
-the FUSE request.
+Handlers copy the fields they need under the lock, then release before FUSE I/O.
 
 ---
 
 ## 7. Syscall Handlers
 
-### 7.1 io.rs — File I/O through virtio-fs
+### 7.1 io.rs — File I/O
 
-**`sys_read(fd, buf, count)` → nr 0**
+| Syscall     | Nr  | Implementation                                              |
+|-------------|-----|-------------------------------------------------------------|
+| `read`      | 0   | Console→0, File→FUSE_READ via `fs_transfer_chunked`, updates offset |
+| `write`     | 1   | Console→debugcon, File→FUSE_WRITE chunked, updates offset   |
+| `open`      | 2   | `resolve_path` + FUSE_OPEN, alloc fd                        |
+| `close`     | 3   | Free fd, release/forget if last reference                    |
+| `lseek`     | 8   | SEEK_SET/CUR in-kernel, SEEK_END via FUSE_GETATTR           |
+| `pread64`   | 17  | FUSE_READ at explicit offset, no fd offset update            |
+| `pwrite64`  | 18  | FUSE_WRITE at explicit offset, no fd offset update           |
+| `readv`     | 19  | Iterate iovecs, chunked read per buffer                      |
+| `writev`    | 20  | Console→debugcon per byte, File→chunked write per iovec      |
+| `dup`       | 32  | Copy descriptor, alloc lowest fd                             |
+| `dup2`      | 33  | Copy descriptor to target fd, evict + cleanup old occupant   |
 
-```
-if fd.kind == Console:
-    return 0  (EOF — no stdin yet)
-if fd.kind == File:
-    send FUSE_READ { fh, offset: fd.offset, size: count }
-    descriptor chain:
-      [0] FuseInHeader + FuseReadIn          (device-readable)
-      [1] FuseOutHeader (16 bytes)           (device-writable)
-      [2] buf[0..count]                      (device-writable, ZERO-COPY)
-    kick virtqueue
-    on return: fd.offset += bytes_read
-    return bytes_read (or -errno)
-```
+**Chunked transfer**: `fs_transfer_chunked()` splits I/O at 2MB page boundaries for
+correct physical address translation. Each chunk is a separate FUSE request. Transfer
+counts are clamped to prevent underflow from unexpected device responses.
 
-The data buffer points directly to the caller's `buf` pointer. The VM writes read data
-directly into the guest's buffer through the virtqueue descriptor. No intermediate copy.
-
-If `count > max_read` (1 MB), the kernel splits the read into multiple FUSE_READ
-requests, each of at most `max_read` bytes, advancing offset between rounds. The total
-bytes read is accumulated and returned to the caller. A short read (fewer bytes than
-requested) terminates the loop early.
-
-**`sys_write(fd, buf, count)` → nr 1**
-
-```
-if fd.kind == Console:
-    for each byte in buf[0..count]:
-        outb(0xE9, byte)  // debugcon
-    return count
-if fd.kind == File:
-    send FUSE_WRITE { fh, offset: fd.offset, size: count }
-    descriptor chain:
-      [0] FuseInHeader + FuseWriteIn         (device-readable)
-      [1] buf[0..count]                      (device-readable, ZERO-COPY)
-      [2] FuseOutHeader + FuseWriteOut       (device-writable)
-    kick virtqueue
-    on return: fd.offset += bytes_written
-    return bytes_written (or -errno)
-```
-
-If `count > max_write` (1 MB), the kernel splits the write into multiple FUSE_WRITE
-requests, each of at most `max_write` bytes. A short write terminates the loop early.
-
-**`sys_open(path, flags, mode)` → nr 2**
-
-```
-resolve path component-by-component via FUSE_LOOKUP
-  (starting from root nodeid=1)
-if O_CREAT and file not found:
-    send FUSE_CREATE { parent_nodeid, name, flags, mode }
-else:
-    send FUSE_OPEN { nodeid, flags }
-allocate fd with FdKind::File { fuse_fh, fuse_nodeid, offset: 0 }
-return fd
-```
-
-**`sys_close(fd)` → nr 3**
-
-```
-match fd.kind:
-    Console → just free the FD slot
-    File    → send FUSE_RELEASE { fh }
-              send FUSE_FORGET { nodeid, nlookup }
-              free the FD slot
-    Directory → send FUSE_RELEASEDIR { fh }
-                send FUSE_FORGET { nodeid, nlookup }
-                free the FD slot
-return 0
-```
-
-**`sys_lseek(fd, offset, whence)` → nr 8**
-
-Handled entirely in the kernel by updating `fd.offset`:
-
-```
-match whence:
-    SEEK_SET → fd.offset = offset
-    SEEK_CUR → fd.offset += offset
-    SEEK_END → send FUSE_GETATTR to get file size
-               fd.offset = size + offset
-return fd.offset
-```
-
-**`sys_pread64(fd, buf, count, offset)` → nr 17**
-
-Same as `sys_read` but uses the explicit `offset` argument instead of `fd.offset`.
-Does not update `fd.offset`.
-
-**`sys_pwrite64(fd, buf, count, offset)` → nr 18**
-
-Same as `sys_write` but uses the explicit `offset` argument. Does not update `fd.offset`.
-
-**`sys_readv(fd, iov, iovcnt)` → nr 19**
-
-Iterates over the iovec array, calling the read path for each buffer. Could be optimized
-later with multi-descriptor chains, but serial read is correct and simple for Phase 1.
-
-**`sys_writev(fd, iov, iovcnt)` → nr 20**
-
-Same approach as readv — iterate iovecs, write each buffer.
+**iovec handling**: `iov_len` is clamped to `u32::MAX` before casting. `read`/`write`
+counts are similarly clamped.
 
 ### 7.2 fs.rs — Filesystem Metadata
 
-**`sys_stat(path, statbuf)` → nr 4**
+| Syscall       | Nr  | Implementation                                            |
+|---------------|-----|-----------------------------------------------------------|
+| `stat`        | 4   | `resolve_path` + FUSE_GETATTR → Linux `Stat`, forget     |
+| `fstat`       | 5   | FUSE_GETATTR by nodeid, Console→synthetic char device stat |
+| `lstat`       | 6   | Same as stat (no symlink distinction)                     |
+| `access`      | 21  | Resolve path (existence check only), forget               |
+| `getdents`    | 78  | Returns ENOSYS (old 32-bit format)                        |
+| `getcwd`      | 79  | Returns `"/\0"` (unikernel cwd is always root)           |
+| `chdir`       | 80  | Validates path exists, returns 0                          |
+| `fchdir`      | 81  | Returns 0                                                 |
+| `creat`       | 85  | Split path → FUSE_CREATE on parent, alloc fd              |
+| `readlink`    | 89  | Returns EINVAL (no symlinks)                              |
+| `getdents64`  | 217 | FUSE_READDIR → parse FuseDirent → write linux_dirent64    |
+| `openat`      | 257 | AT_FDCWD + O_DIRECTORY support, FUSE_OPEN or FUSE_OPENDIR |
+| `newfstatat`  | 262 | AT_EMPTY_PATH→fstat, otherwise stat by path               |
 
-```
-resolve path via FUSE_LOOKUP chain → nodeid
-send FUSE_GETATTR { nodeid }
-fill statbuf from FuseAttr
-send FUSE_FORGET { nodeid, nlookup }
-return 0
-```
+**getdents64 details**: Reads FUSE dirents into a 4KB kernel buffer, converts to
+`linux_dirent64` format (19-byte header written at raw offsets to match Linux ABI),
+updates directory fd offset from last `dirent.off`. Returns EINVAL if the user buffer
+is too small for even one entry. Guards against `d_reclen` u16 overflow.
 
-**`sys_fstat(fd, statbuf)` → nr 5**
+**Resource management**: All paths call `forget_if_not_root()` — a helper that only
+sends FUSE_FORGET for non-root nodeids. Error paths in `open`/`openat`/`creat` clean
+up both the FUSE file handle (release) and nodeid (forget) on failure.
 
-```
-send FUSE_GETATTR { nodeid: fd.fuse_nodeid }
-fill statbuf from FuseAttr
-return 0
-```
+### 7.3 Stubbed Syscalls (ENOSYS)
 
-**`sys_openat(dirfd, path, flags, mode)` → nr 257**
-
-```
-if dirfd == AT_FDCWD:
-    start_nodeid = cwd_nodeid  (tracked in KernelState)
-else:
-    start_nodeid = fd_table[dirfd].fuse_nodeid
-resolve path from start_nodeid via FUSE_LOOKUP chain
-FUSE_OPEN or FUSE_CREATE
-allocate fd
-return fd
-```
-
-**`sys_getdents(fd, dirent, count)` → nr 78**
-
-```
-send FUSE_READDIR { fh: fd.fuse_fh, offset: fd.offset, size: count }
-parse FuseDirent stream from response
-convert to Linux struct linux_dirent64 into dirent buffer
-update fd.offset from last dirent.off
-return bytes written to dirent buffer
-```
-
-**`sys_access(path, mode)` → nr 21**
-
-```
-resolve path via FUSE_LOOKUP → nodeid, attr
-check attr.mode against requested mode (F_OK, R_OK, W_OK, X_OK)
-FUSE_FORGET
-return 0 or -EACCES
-```
-
-**`sys_getcwd(buf, size)` → nr 79**
-
-Return the current working directory path stored in `KernelState`. Initially `"/"`.
-
-**`sys_chdir(path)` → nr 80**
-
-Resolve path via `FUSE_LOOKUP`, verify it's a directory, update `KernelState.cwd`.
-
-### 7.3 Linux stat Structure
-
-The kernel must fill the Linux `struct stat` from `FuseAttr`:
-
-```rust
-#[repr(C)]
-pub struct LinuxStat {
-    pub st_dev:     u64,
-    pub st_ino:     u64,
-    pub st_nlink:   u64,
-    pub st_mode:    u32,
-    pub st_uid:     u32,
-    pub st_gid:     u32,
-    pub __pad0:     u32,
-    pub st_rdev:    u64,
-    pub st_size:    i64,
-    pub st_blksize: i64,
-    pub st_blocks:  i64,
-    pub st_atime:   i64,
-    pub st_atime_nsec: i64,
-    pub st_mtime:   i64,
-    pub st_mtime_nsec: i64,
-    pub st_ctime:   i64,
-    pub st_ctime_nsec: i64,
-    pub __unused:   [i64; 3],
-}
-```
+`poll`, `ioctl`, `pipe`, `select`, `rename`, `mkdir`, `rmdir`, `link`, `unlink`,
+`symlink`, `unlinkat`.
 
 ---
 
-## 8. VM-Side Backend
+## 8. VM-Side FUSE Server
 
-### 8.1 VirtIO MMIO Device Emulation
-
-The VM process handles `KVM_EXIT_MMIO` by dispatching to a device model:
+### 8.1 Data Structures
 
 ```rust
-// sumi-vm/src/devices/virtio_mmio.rs
-
-pub struct VirtioMmioDevice {
-    // Standard virtio state
-    status: u32,
-    device_features: u64,
-    driver_features: u64,
-    queue_sel: u32,
-    queues: [VirtqueueState; 2],  // hiprio + request
-
-    // Device-specific backend
-    backend: Box<dyn VirtioDevice>,
-}
-
-pub trait VirtioDevice {
-    fn device_id(&self) -> u32;
-    fn device_features(&self) -> u64;
-    fn config_read(&self, offset: u64) -> u32;
-    fn process_queue(&mut self, queue: &mut VirtqueueState, mem: &GuestMemoryMmap<()>);
-}
-```
-
-### 8.2 MMIO Exit Handling
-
-Each vCPU runs on its own host thread. MMIO exits are handled per-thread:
-
-```rust
-// sumi-vm/src/arch/x86_64/kvm/mod.rs — updated VCpu::run()
-// `devices` is shared across vCPU threads via Arc<Mutex<DeviceRegistry>>
-
-loop {
-    match self.fd.run()? {
-        VcpuExit::IoOut(0xE9, data) => { /* debugcon */ }
-
-        VcpuExit::MmioRead(addr, data) => {
-            let mut devs = devices.lock();
-            if let Some(dev) = devs.find_device(addr) {
-                let val = dev.mmio_read(addr - dev.base, data.len());
-                data.copy_from_slice(&val.to_le_bytes()[..data.len()]);
-            }
-        }
-
-        VcpuExit::MmioWrite(addr, data) => {
-            let mut devs = devices.lock();
-            if let Some(dev) = devs.find_device(addr) {
-                let offset = addr - dev.base;
-                dev.mmio_write(offset, data);
-
-                // If this was a QueueNotify write, process pending requests NOW
-                if offset == 0x050 {
-                    dev.backend.process_queue(&mut dev.queues[queue_idx], &mem);
-                }
-            }
-        }
-
-        VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),
-        other => return Err(...),
-    }
-}
-```
-
-The critical insight: when `QueueNotify` is written, the VM processes all pending requests
-**before returning to the guest**. The guest resumes only after responses are in the used
-ring.
-
-### 8.3 FUSE Server
-
-```rust
-// sumi-vm/src/devices/virtio_fs.rs
-
 pub struct VirtioFs {
-    share_root: PathBuf,              // Host directory shared with guest
-    nodes: Vec<FuseNode>,             // nodeid → host state
-    file_handles: Vec<Option<File>>,  // fh → host File
-    next_nodeid: u64,
-    next_fh: u64,
+    nodes: Vec<Option<FuseNode>>,       // nodeid → host path
+    file_handles: Vec<Option<File>>,    // fh → host File
+    last_avail_idx: u16,
 }
 
 struct FuseNode {
-    host_path: PathBuf,       // Absolute path on host
-    parent: u64,              // Parent nodeid
-    lookup_count: u64,        // Incremented by LOOKUP, decremented by FORGET
+    host_path: PathBuf,
+    _lookup_count: u64,
 }
 ```
 
-**Security**: All host paths are resolved relative to `share_root`. The server uses
-`openat2(RESOLVE_BENEATH)` to prevent symlink escapes.
+- `nodes[0]` = None (FUSE convention), `nodes[1]` = root directory.
+- `alloc_nodeid()` appends to the vector, returns index.
+- `alloc_fh()` reuses freed slots or appends.
 
-**FUSE_LOOKUP** → `fstatat(parent_host_fd, name)`, assign nodeid, return attributes.
+### 8.2 FUSE Handlers
 
-**FUSE_OPEN** → `open(node.host_path, flags)`, assign fh, return handle.
+**FUSE_INIT**: Returns version 7.31, `max_write = 1MB`.
 
-**FUSE_READ** → `pread(host_fd, guest_buf_ptr, count, offset)`. The VM reads the
-guest buffer address from the virtqueue descriptor and writes data directly into guest
-memory via `GuestMemoryMmap::write_slice()`. Zero-copy from VM's perspective — one
-host syscall, one memcpy into guest RAM.
+**FUSE_LOOKUP**: Resolves name under parent's host path via `std::fs::metadata`.
+Allocates a new nodeid. Returns `FuseEntryOut` with attributes.
 
-**FUSE_WRITE** → `pwrite(host_fd, data, count, offset)`. The VM reads write data
-directly from guest memory via `GuestMemoryMmap::read_slice()`.
+**FUSE_GETATTR**: Reads host metadata for the node's path.
 
-**FUSE_GETATTR** → `fstat(host_fd)` or `stat(host_path)`, convert to `FuseAttr`.
+**FUSE_OPEN / FUSE_OPENDIR**: Opens the host file with translated flags
+(`O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT`, `O_TRUNC`, `O_APPEND`). Allocates fh.
 
-**FUSE_READDIR** → `getdents64(host_fd)`, convert to FUSE dirent stream.
+**FUSE_CREATE**: Creates and opens in one step. Returns `FuseEntryOut + FuseOpenOut`.
 
-### 8.4 CLI Integration
+**FUSE_READ**: Seeks to offset, reads in a loop until buffer is full or EOF.
+Retries on `EINTR`. Uses split descriptors: header in buf[0], data in buf[1].
 
-```bash
-sumi-vm run --kernel path/to/kernel --share /host/directory --mem 256M
-```
+**FUSE_WRITE**: Reads write data from second readable descriptor. Seeks and writes.
 
-The `--share` flag specifies the host directory mounted as `/` in the guest.
+**FUSE_READDIR**: Reads host directory via `std::fs::read_dir()`. Synthesizes `.` and
+`..` entries. Packs `FuseDirent` entries with 8-byte alignment. Uses `OsStrExt::as_bytes()`
+to preserve non-UTF-8 filenames. Offset is a 1-based entry index.
 
----
+**FUSE_RELEASE / FUSE_RELEASEDIR**: Drops the host `File` handle.
 
-## 9. Memory Layout Changes
+**FUSE_FORGET**: Clears the node entry (sets `nodes[nodeid] = None`).
 
-### 9.1 New Constants in sumi-abi
+### 8.3 Response Helpers
 
-```rust
-// sumi-abi/src/arch/x86_64/layout.rs
-
-/// VirtIO MMIO device region: 127 TB, within 128 TB direct map.
-pub const VIRTIO_MMIO_BASE: PhysicalAddr = PhysicalAddr::new(0x7F00_0000_0000);
-pub const VIRTIO_MMIO_STRIDE: usize = 0x1000; // 4KB per device
-```
-
-### 9.2 Virtqueue Allocation
-
-Virtqueue memory is allocated at boot from `PageAllocator`. For `QUEUE_SIZE = 256`:
-
-| Structure        | Size                  | Allocation         |
-|------------------|-----------------------|--------------------|
-| Descriptor table | 256 * 16 = 4096 B    | 1 page (2 MB)      |
-| Available ring   | 4 + 256*2 = 516 B    | (shares page)      |
-| Used ring        | 4 + 256*8 = 2052 B   | (shares page)      |
-
-All three structures total ~6.6 KB per queue. Allocated via `KernelAllocator` (kmalloc)
-from sub-page memory. The descriptor table is placed first, available ring after
-descriptors, used ring after available ring, all properly aligned.
-
-### 9.3 FUSE Request Buffers
-
-FUSE headers are small (40 + body bytes for request, 16 + body for response). These are
-allocated from `KernelAllocator` (sub-page allocation) as needed.
-
-For read/write data, the virtqueue descriptor points directly to the caller's buffer —
-no additional allocation.
+- `write_response(unique, body, writable_bufs, mem)` — writes `FuseOutHeader` + body,
+  handles cross-buffer splits (header in buf[0], overflow into buf[1]).
+- `write_error(unique, errno, writable_bufs, mem)` — writes error-only header.
 
 ---
 
-## 10. Module Layout
+## 9. Module Layout
 
 ### Kernel (sumi-kernel)
 
 ```
 sumi-kernel/src/
 ├── fs/
-│   ├── mod.rs              FdTable, FileDescriptor, FdKind
-│   └── virtio_fs.rs        VirtioFsClient: FUSE protocol, path resolution
+│   ├── mod.rs              FdTable, FileDescriptor, FdKind, count_fh_refs
+│   └── virtio_fs.rs        VirtioFsClient: 12 FUSE operations, path resolution
 ├── drivers/
 │   └── virtio/
-│       ├── mod.rs           Common virtio types
-│       ├── mmio.rs          MMIO register access (read/write device regs)
-│       └── virtqueue.rs     Split virtqueue: alloc, submit, complete
+│       ├── mmio.rs          MMIO register access (read32/write32)
+│       └── virtqueue.rs     Split virtqueue: alloc, submit, complete, free_chain
 ├── syscall/
+│   ├── mod.rs               Dispatch table (100+ syscalls)
+│   ├── errno.rs             EIO, EBADF, ENOMEM, EFAULT, ENOTDIR, EINVAL, EMFILE, ENOSYS
 │   └── handlers/
-│       ├── io.rs            sys_read/write/open/close/lseek/pread/pwrite (UPDATED)
-│       └── fs.rs            sys_stat/fstat/openat/getdents/access/... (UPDATED)
-└── kernel_main.rs           Init virtio-fs device, open FD 0/1/2 (UPDATED)
+│       ├── io.rs            read/write/open/close/lseek/pread/pwrite/readv/writev/dup/dup2
+│       └── fs.rs            stat/fstat/lstat/access/getdents64/getcwd/chdir/creat/openat/newfstatat
+├── selftest/
+│   ├── virtio/fs.rs         init, create_write_read, read_print
+│   └── syscalls/
+│       ├── io/              write, read, close
+│       └── fs/              open, pread, lseek, fstat, stat, openat, dup
+└── lib.rs                   FD_TABLE, VIRTIO_FS globals
 ```
 
 ### VM (sumi-vm)
@@ -941,95 +402,64 @@ sumi-kernel/src/
 ```
 sumi-vm/src/
 ├── devices/
-│   ├── mod.rs               Device registry, find_device()
-│   ├── virtio_mmio.rs       VirtIO MMIO register emulation
-│   └── virtio_fs.rs         FUSE server, host syscall translation
-├── arch/x86_64/kvm/
-│   └── mod.rs               Handle MmioRead/MmioWrite exits (UPDATED)
-└── cmd/
-    └── run.rs               --share flag (UPDATED)
+│   ├── mod.rs               Device registry, MMIO address routing
+│   ├── virtio_mmio.rs       VirtIO MMIO register emulation, queue state
+│   └── virtio_fs.rs         FUSE server: 12 handlers, host FS translation
+└── ...
 ```
 
 ### ABI (sumi-abi)
 
 ```
 sumi-abi/src/
-├── arch/x86_64/
-│   └── layout.rs            VIRTIO_MMIO_BASE constant (UPDATED)
-├── fuse.rs                  FUSE protocol types (NEW)
-└── virtio.rs                VirtqDesc, VirtqAvail, VirtqUsed (NEW)
+├── fuse.rs                  FUSE 7.31 types: headers, attrs, FuseDirent, etc.
+├── virtio.rs                VirtqDesc, VirtqAvail, VirtqUsed, MMIO constants
+├── stat.rs                  Linux Stat (144 bytes), linux_dirent64, AT_FDCWD, DT_* constants
+└── arch/x86_64/layout.rs    VIRTIO_MMIO_BASE, VIRTIO_FS_MMIO
 ```
 
-Shared types (`VirtqDesc`, FUSE structs) go in `sumi-abi` because both kernel and VM
-reference them. The kernel writes `VirtqDesc` entries; the VM reads them. The kernel
-writes `FuseInHeader`; the VM parses it.
+---
+
+## 10. Selftests
+
+17 tests run under KVM via `make self-test`:
+
+| Suite       | Test               | What it verifies                              |
+|-------------|--------------------|-----------------------------------------------|
+| fd_table    | console_fds        | fds 0-2 are Console                           |
+| fd_table    | alloc_free_lowest  | Lowest-fd allocation and reuse                |
+| syscall_io  | write_console      | write(1, "hi", 2) → 2                        |
+| syscall_io  | read_console_eof   | read(0) → 0                                   |
+| syscall_io  | close_bad_fd       | close(999) → -EBADF                           |
+| virtio_fs   | init               | VIRTIO_FS device probed                       |
+| virtio_fs   | create_write_read  | FUSE create/write/read round-trip             |
+| virtio_fs   | read_print         | Write+read+print via debugcon                 |
+| syscall_fs  | open_read_close    | Full open→read→close via syscalls             |
+| syscall_fs  | write_pread        | pread64 reads at offset without fd update     |
+| syscall_fs  | lseek              | SEEK_SET, SEEK_CUR, SEEK_END                  |
+| syscall_fs  | open_enoent        | open nonexistent → -ENOENT                    |
+| syscall_fs  | fstat_file_size    | fstat returns correct st_size                  |
+| syscall_fs  | stat_file          | stat by path returns correct st_size           |
+| syscall_fs  | stat_enoent        | stat nonexistent → -ENOENT                    |
+| syscall_fs  | openat_fdcwd       | openat(AT_FDCWD, path) works                  |
+| syscall_fs  | dup2_read          | dup2 then read from duped fd                  |
 
 ---
 
-## 11. Implementation Plan
+## 11. Known Limitations
 
-### Phase 1: Core Read/Write Path
+1. **readdir ordering**: The VM re-reads the host directory on every FUSE_READDIR call.
+   If the directory is modified between calls, entries may be skipped or duplicated.
 
-1. **sumi-abi**: Add `VIRTIO_MMIO_BASE` to layout, add `virtio.rs` (virtqueue types),
-   add `fuse.rs` (FUSE types for INIT, LOOKUP, OPEN, READ, WRITE, RELEASE, GETATTR,
-   FORGET).
+2. **access() ignores mode**: Only checks file existence, not permission bits.
 
-2. **sumi-kernel/drivers/virtio**: Implement MMIO register read/write helpers and
-   split virtqueue (alloc, submit descriptor chain, read used ring).
+3. **No mutation ops**: mkdir, rmdir, unlink, rename, symlink, link all return ENOSYS.
 
-3. **sumi-kernel/fs**: Implement `FdTable` with console FDs pre-allocated. Implement
-   `VirtioFsClient` with FUSE session init, lookup, open, read, write, release, forget.
+4. **No mmap of files**: Dynamic linking (loading .so via mmap) is not supported.
+   Only statically-linked ELF binaries work.
 
-4. **sumi-kernel/syscall/handlers/io.rs**: Implement `sys_read`, `sys_write`, `sys_open`,
-   `sys_close`, `sys_lseek` dispatching through FD table and VirtioFsClient.
+5. **No fcntl/ioctl**: Some libc runtimes call these at startup.
 
-5. **sumi-vm/devices**: Implement `VirtioMmioDevice` register emulation. Implement
-   `VirtioFs` FUSE server with INIT, LOOKUP, OPEN, READ, WRITE, RELEASE, GETATTR, FORGET
-   backed by host syscalls.
+6. **stdin returns EOF**: Console fd 0 always returns 0 bytes.
 
-6. **sumi-vm/kvm**: Handle `MmioRead`/`MmioWrite` exits, dispatch to device registry.
-
-7. **sumi-vm/cmd/run.rs**: Add `--share` CLI flag.
-
-8. **sumi-kernel/kernel_main.rs**: Initialize virtio-fs device at boot (probe, negotiate,
-   FUSE_INIT), set up console FDs.
-
-### Phase 2: Full Filesystem
-
-9. `sys_stat`, `sys_fstat`, `sys_lstat`, `sys_access`, `sys_openat`, `sys_newfstatat`.
-10. `sys_getdents` via FUSE_OPENDIR / FUSE_READDIR / FUSE_RELEASEDIR.
-11. `sys_getcwd`, `sys_chdir` — kernel-side CWD tracking.
-12. `sys_pread64`, `sys_pwrite64`, `sys_readv`, `sys_writev`.
-13. Mutation operations: `sys_mkdir`, `sys_rmdir`, `sys_unlink`, `sys_rename`,
-    `sys_symlink`, `sys_link`, `sys_readlink`, `sys_creat`.
-
-### Phase 3: Performance
-
-14. DAX window: map host file pages directly into guest physical memory. Requires
-    a dedicated physical memory region and KVM memslot management per mapping.
-    Eliminates virtqueue round-trip for read/write on mapped regions.
-15. Dirent caching: cache FUSE_LOOKUP results to avoid repeated lookups for the same path.
-16. Read-ahead: pre-fetch file data into a kernel buffer for sequential reads.
-
----
-
-## 12. Open Questions
-
-1. **FUSE_FORGET batching** — FUSE_FORGET has no response, so it doesn't need a
-   synchronous round-trip. We could batch forgets and send them on the hiprio queue,
-   or just send them inline on the request queue. Inline is simpler; batch if profiling
-   shows overhead.
-
-2. **dup() semantics** — When two FDs share a FUSE file handle, FUSE_RELEASE must only
-   be sent when the last FD is closed. Need a refcount on `(fuse_fh, fuse_nodeid)` pairs.
-   Simplest: a small array of `{ fuse_fh, refcount }` in VirtioFsClient.
-
-3. **stdin** — Currently returns EOF. A virtio-console device would provide real stdin
-   in the future. Not needed for file I/O.
-
-4. **O_APPEND** — Requires the kernel to seek to end-of-file before each write.
-   Can be done with FUSE_GETATTR + write at size, or by passing O_APPEND to the host
-   open() and ignoring the kernel-side offset for writes.
-
-5. **Error mapping** — FUSE returns `-errno` in `FuseOutHeader.error`. These match Linux
-   errno values, so the kernel can return them directly to the caller as `SyscallResult`.
+7. **Single-threaded readdir**: Directory listing is not cached per open handle.

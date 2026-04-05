@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
@@ -181,6 +182,7 @@ impl VirtioFs {
             FUSE_CREATE => self.handle_create(header, req_data, writable_bufs, mem),
             FUSE_OPEN | FUSE_OPENDIR => self.handle_open(header, req_data, writable_bufs, mem),
             FUSE_READ => self.handle_read(header, req_data, writable_bufs, mem),
+            FUSE_READDIR => self.handle_readdir(header, req_data, writable_bufs, mem),
             FUSE_WRITE => self.handle_write(header, req_data, readable_bufs, writable_bufs, mem),
             FUSE_RELEASE | FUSE_RELEASEDIR => {
                 self.handle_release(header, req_data, writable_bufs, mem)
@@ -547,13 +549,23 @@ impl VirtioFs {
         if file.seek(SeekFrom::Start(read_in.offset)).is_err() {
             return self.write_error(header.unique, -5, writable_bufs, mem);
         }
-        let bytes_read = match file.read(&mut data) {
-            Ok(n) => n,
-            Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(5);
-                return self.write_error(header.unique, -errno, writable_bufs, mem);
+
+        // Loop to fill the buffer completely (a single read() may return short).
+        let mut bytes_read = 0;
+        while bytes_read < size {
+            match file.read(&mut data[bytes_read..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => bytes_read += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    if bytes_read > 0 {
+                        break; // Return what we have
+                    }
+                    let errno = e.raw_os_error().unwrap_or(5);
+                    return self.write_error(header.unique, -errno, writable_bufs, mem);
+                }
             }
-        };
+        }
         data.truncate(bytes_read);
 
         // For read: writable_bufs[0] = FuseOutHeader, writable_bufs[1] = data buffer
@@ -580,6 +592,112 @@ impl VirtioFs {
             mem.write_slice(&data[..bytes_read], GuestAddress(data_addr))
                 .unwrap();
             total += bytes_read as u32;
+        }
+
+        total
+    }
+
+    fn handle_readdir(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let read_in = unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseReadIn) };
+
+        let path = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+
+        let entries: Vec<_> = match std::fs::read_dir(&path) {
+            Ok(iter) => iter.filter_map(|e| e.ok()).collect(),
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(5);
+                return self.write_error(header.unique, -errno, writable_bufs, mem);
+            }
+        };
+
+        let max_size = read_in.size as usize;
+        let start_offset = read_in.offset as usize;
+        let mut buf = Vec::new();
+        let dirent_hdr_size = core::mem::size_of::<FuseDirent>();
+
+        // Entries: ".", "..", then real entries. Offset is 1-based entry index.
+        let total_entries = 2 + entries.len();
+
+        for idx in start_offset..total_entries {
+            // Extract name bytes, ino, and type for this entry.
+            let owned_name: std::ffi::OsString;
+            let (name_bytes, ino, typ): (&[u8], u64, u32) = if idx == 0 {
+                (b".", header.nodeid, 4)
+            } else if idx == 1 {
+                (b"..", 1, 4)
+            } else {
+                let entry = &entries[idx - 2];
+                let ft = entry.file_type().ok();
+                let typ = match ft {
+                    Some(t) if t.is_dir() => 4,
+                    Some(t) if t.is_file() => 8,
+                    Some(t) if t.is_symlink() => 10,
+                    _ => 0,
+                };
+                owned_name = entry.file_name();
+                (owned_name.as_bytes(), (idx + 1) as u64, typ)
+            };
+
+            let namelen = name_bytes.len();
+            let entry_size = fuse_dirent_align(dirent_hdr_size + namelen);
+
+            if buf.len() + entry_size > max_size {
+                break;
+            }
+
+            let dirent = FuseDirent {
+                ino,
+                off: (idx + 1) as u64,
+                namelen: namelen as u32,
+                typ,
+            };
+
+            let dirent_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    &dirent as *const _ as *const u8,
+                    dirent_hdr_size,
+                )
+            };
+            buf.extend_from_slice(dirent_bytes);
+            buf.extend_from_slice(name_bytes);
+            while buf.len() % 8 != 0 {
+                buf.push(0);
+            }
+        }
+
+        // For READDIR, response format is: header in buf[0], data in buf[1]
+        let out_hdr_size = core::mem::size_of::<FuseOutHeader>();
+        let out_header = FuseOutHeader {
+            len: (out_hdr_size + buf.len()) as u32,
+            error: 0,
+            unique: header.unique,
+        };
+        let hdr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(&out_header as *const _ as *const u8, out_hdr_size)
+        };
+
+        if writable_bufs.is_empty() {
+            return 0;
+        }
+
+        let (hdr_addr, _) = writable_bufs[0];
+        mem.write_slice(hdr_bytes, GuestAddress(hdr_addr)).unwrap();
+        let mut total = out_hdr_size as u32;
+
+        if !buf.is_empty() && writable_bufs.len() > 1 {
+            let (data_addr, _) = writable_bufs[1];
+            mem.write_slice(&buf, GuestAddress(data_addr)).unwrap();
+            total += buf.len() as u32;
         }
 
         total
