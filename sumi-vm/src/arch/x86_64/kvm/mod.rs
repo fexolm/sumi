@@ -269,7 +269,14 @@ impl VCpu for KvmVCpu {
                     let mut devs = self.devices.lock().unwrap();
                     devs.handle_mmio_write(addr, data, &self.mem);
                 }
-                VcpuExit::Hlt | VcpuExit::Shutdown => return Ok(()),
+                VcpuExit::Hlt => return Ok(()),
+                VcpuExit::Shutdown => {
+                    eprintln!("[vm] SHUTDOWN (triple fault)");
+                    let regs = self.fd.get_regs()?;
+                    eprintln!("[vm]   RIP={:#018x} RSP={:#018x}", regs.rip, regs.rsp);
+                    eprintln!("[vm]   RAX={:#018x} RDI={:#018x}", regs.rax, regs.rdi);
+                    return Ok(());
+                }
                 other => return Err(Error::UnexpectedExit(format!("{:?}", other))),
             }
         }

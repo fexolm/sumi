@@ -24,6 +24,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         7  => handlers::io::sys_poll(args),
         8  => handlers::io::sys_lseek(args),
         16 => handlers::io::sys_ioctl(args),
+        72 => handlers::io::sys_fcntl(args),
         17 => handlers::io::sys_pread64(args),
         18 => handlers::io::sys_pwrite64(args),
         19 => handlers::io::sys_readv(args),
@@ -77,6 +78,9 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         62  => handlers::signal::sys_kill(args),
         129 => handlers::signal::sys_rt_sigsuspend(args),
         130 => handlers::signal::sys_rt_sigpending(args),
+        131 => handlers::signal::sys_sigaltstack(args),
+        200 => handlers::signal::sys_tkill(args),
+        234 => handlers::signal::sys_tgkill(args),
         35  => handlers::time::sys_nanosleep(args),
         96  => handlers::time::sys_gettimeofday(args),
         97  => handlers::time::sys_getrlimit(args),
@@ -100,6 +104,9 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         52 => handlers::net::sys_getpeername(args),
         54 => handlers::net::sys_setsockopt(args),
         55 => handlers::net::sys_getsockopt(args),
-        _  => errno::ENOSYS,
+        nr => {
+            crate::kprintln!("[syscall] unhandled nr={}", nr);
+            errno::ENOSYS
+        }
     }
 }

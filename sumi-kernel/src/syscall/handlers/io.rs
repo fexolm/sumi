@@ -199,56 +199,17 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
 }
 
 pub fn sys_open(args: &SyscallArgs) -> SyscallResult {
-    let path_ptr = args.arg0 as *const u8;
-    let flags = args.arg1 as u32;
-
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
+    // Rewrite as openat(AT_FDCWD, path, flags, mode) so O_CREAT etc. are handled uniformly.
+    let openat_args = crate::syscall::SyscallArgs {
+        nr: 257,
+        arg0: -100i64 as u64, // AT_FDCWD
+        arg1: args.arg0,      // path
+        arg2: args.arg1,      // flags
+        arg3: args.arg2,      // mode
+        arg4: 0,
+        arg5: 0,
     };
-
-    let path = unsafe {
-        let mut len = 0;
-        while core::ptr::read_volatile(path_ptr.add(len)) != 0 {
-            len += 1;
-            if len > 4095 {
-                return -36; // ENAMETOOLONG
-            }
-        }
-        core::slice::from_raw_parts(path_ptr, len)
-    };
-
-    let nodeid = match fs.resolve_path(path) {
-        Ok(id) => id,
-        Err(e) => return e as SyscallResult,
-    };
-
-    let open_out = match fs.open(nodeid, flags) {
-        Ok(o) => o,
-        Err(e) => {
-            fs.forget(nodeid, 1);
-            return e as SyscallResult;
-        }
-    };
-
-    let desc = FileDescriptor {
-        kind: FdKind::File {
-            fuse_fh: open_out.fh,
-            fuse_nodeid: nodeid,
-            offset: 0,
-        },
-        flags,
-    };
-
-    let mut table = crate::FD_TABLE.lock();
-    match table.alloc(desc) {
-        Some(fd) => fd as SyscallResult,
-        None => {
-            fs.release(open_out.fh);
-            fs.forget(nodeid, 1);
-            EMFILE
-        }
-    }
+    crate::syscall::handlers::fs::sys_openat(&openat_args)
 }
 
 pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
@@ -281,9 +242,76 @@ pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
-pub fn sys_poll(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_poll(args: &SyscallArgs) -> SyscallResult {
+    let fds_ptr = args.arg0 as *mut PollFd;
+    let nfds = args.arg1 as usize;
+    let _timeout = args.arg2 as i32;
+
+    // Limit nfds to prevent excessive iteration
+    if nfds > 256 {
+        return EINVAL;
+    }
+
+    let table = crate::FD_TABLE.lock();
+    let mut ready = 0i64;
+
+    for i in 0..nfds {
+        // SAFETY: User passed a valid pollfd array.
+        let pfd = unsafe { &mut *fds_ptr.add(i) };
+        pfd.revents = 0;
+
+        if pfd.fd < 0 {
+            continue;
+        }
+
+        match table.get(pfd.fd as usize) {
+            None => {
+                pfd.revents = POLLNVAL;
+                ready += 1;
+            }
+            Some(desc) => {
+                let mut revents = 0i16;
+                match desc.kind {
+                    FdKind::Console => {
+                        // stdout/stderr always writable, stdin always "readable" for simplicity
+                        if pfd.events & POLLIN != 0 {
+                            revents |= POLLIN;
+                        }
+                        if pfd.events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    FdKind::File { .. } | FdKind::Directory { .. } => {
+                        // Files are always ready for I/O in our synchronous model
+                        if pfd.events & POLLIN != 0 {
+                            revents |= POLLIN;
+                        }
+                        if pfd.events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                }
+                pfd.revents = revents;
+                if revents != 0 {
+                    ready += 1;
+                }
+            }
+        }
+    }
+
+    ready
 }
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const POLLNVAL: i16 = 0x0020;
 
 pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
@@ -576,6 +604,39 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             total as SyscallResult
         }
         _ => EBADF,
+    }
+}
+
+pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
+    let fd_num = args.arg0 as usize;
+    let cmd = args.arg1 as i32;
+
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const F_DUPFD: i32 = 0;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+
+    let table = crate::FD_TABLE.lock();
+    match table.get(fd_num) {
+        None => EBADF,
+        Some(desc) => match cmd {
+            F_GETFD => 0,                       // no close-on-exec in unikernel
+            F_SETFD => 0,                       // ignore
+            F_GETFL => desc.flags as SyscallResult,
+            F_SETFL => 0,                       // ignore
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let new_desc = *desc;
+                drop(table);
+                let mut table = crate::FD_TABLE.lock();
+                match table.alloc(new_desc) {
+                    Some(fd) => fd as SyscallResult,
+                    None => EMFILE,
+                }
+            }
+            _ => EINVAL,
+        },
     }
 }
 

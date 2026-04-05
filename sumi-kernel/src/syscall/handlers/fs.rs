@@ -7,6 +7,8 @@ use sumi_abi::stat::{
     write_linux_dirent64_header,
 };
 
+const O_CREAT: u32 = 0o100;
+
 /// Read a null-terminated path from user memory. Returns slice excluding the null.
 fn read_user_path(ptr: u64) -> Result<&'static [u8], SyscallResult> {
     let path_ptr = ptr as *const u8;
@@ -452,7 +454,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
         Err(e) => return e,
     };
     let flags = args.arg2 as u32;
-    let _mode = args.arg3 as u32;
+    let mode = args.arg3 as u32;
 
     // If path is absolute or dirfd is AT_FDCWD, use normal open logic.
     // We don't support relative-to-fd paths yet.
@@ -470,6 +472,43 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
 
     let nodeid = match fs.resolve_path(path) {
         Ok(id) => id,
+        Err(e) if e == -2 && flags & O_CREAT != 0 => {
+            // File doesn't exist but O_CREAT is set — create it.
+            let (parent_path, filename) = match split_path(path) {
+                Some(v) => v,
+                None => return EINVAL,
+            };
+            let parent_nodeid = match fs.resolve_path(parent_path) {
+                Ok(id) => id,
+                Err(e) => return e as SyscallResult,
+            };
+            let (entry, open) = match fs.create(parent_nodeid, filename, flags, mode) {
+                Ok(v) => v,
+                Err(e) => {
+                    forget_if_not_root(fs, parent_nodeid);
+                    return e as SyscallResult;
+                }
+            };
+            forget_if_not_root(fs, parent_nodeid);
+
+            let desc = FileDescriptor {
+                kind: FdKind::File {
+                    fuse_fh: open.fh,
+                    fuse_nodeid: entry.nodeid,
+                    offset: 0,
+                },
+                flags,
+            };
+            let mut table = crate::FD_TABLE.lock();
+            return match table.alloc(desc) {
+                Some(fd) => fd as SyscallResult,
+                None => {
+                    fs.release(open.fh);
+                    fs.forget(entry.nodeid, 1);
+                    EMFILE
+                }
+            };
+        }
         Err(e) => return e as SyscallResult,
     };
 
@@ -576,6 +615,7 @@ fn split_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     let (parent, name) = match path.iter().rposition(|&b| b == b'/') {
+        Some(0) => (b"/" as &[u8], &path[1..]),
         Some(pos) => (&path[..pos], &path[pos + 1..]),
         None => (b"" as &[u8], path),
     };

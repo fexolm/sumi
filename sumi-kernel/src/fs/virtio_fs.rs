@@ -133,10 +133,30 @@ impl VirtioFsClient {
         unsafe { mmio::write32(self.mmio_base, VIRTIO_MMIO_QUEUE_NOTIFY, 1) }
     }
 
-    /// Convert a kernel virtual address to physical via direct-map arithmetic.
+    /// Convert a virtual address to physical.
+    /// Handles kernel code/data addresses, direct-map addresses, and user-space
+    /// addresses (the latter via page-table walk).
     pub fn v2p(virt: *const u8) -> PhysicalAddr {
-        debug_assert!((virt as usize) >= DIRECT_MAP_OFFSET.as_usize());
-        PhysicalAddr::new((virt as usize) - DIRECT_MAP_OFFSET.as_usize())
+        use sumi_abi::layout::{KERNEL_CODE_VIRT, KERNEL_CODE_PHYS};
+
+        let addr = virt as usize;
+        if addr >= KERNEL_CODE_VIRT.as_usize() {
+            // Kernel code/data/BSS region: mapped at fixed offset
+            PhysicalAddr::new(addr - KERNEL_CODE_VIRT.as_usize() + KERNEL_CODE_PHYS.as_usize())
+        } else if addr >= DIRECT_MAP_OFFSET.as_usize() {
+            // Direct map region
+            PhysicalAddr::new(addr - DIRECT_MAP_OFFSET.as_usize())
+        } else {
+            // User-space address — walk the page table.
+            use sumi_abi::arch::layout::PAGE_SIZE;
+            let va = VirtualAddr::new(addr);
+            let entry = crate::KERNEL_PAGE_TABLE
+                .get_if_present(va)
+                .expect("v2p: page table walk failed")
+                .expect("v2p: address not mapped");
+            let page_offset = addr & (PAGE_SIZE - 1);
+            entry.addr().add(page_offset)
+        }
     }
 
     /// Submit a descriptor chain, kick, wait for completion, free descriptors.

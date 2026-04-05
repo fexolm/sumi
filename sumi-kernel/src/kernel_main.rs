@@ -61,11 +61,19 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    // Write "PANIC\n" to debugcon so we can see panics in VM output.
-    // Use raw byte writes — fmt machinery may not be safe in a panic handler.
-    for &b in b"PANIC\n" {
-        sumi_kernel::arch::debugcon_write_byte(b);
+fn panic(info: &PanicInfo<'_>) -> ! {
+    // Write panic info to debugcon. Try fmt first for full message,
+    // fall back to raw bytes if formatting fails.
+    use core::fmt::Write;
+    struct DebugconWriter;
+    impl Write for DebugconWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                sumi_kernel::arch::debugcon_write_byte(b);
+            }
+            Ok(())
+        }
     }
+    let _ = write!(DebugconWriter, "PANIC: {}\n", info);
     halt_forever()
 }
