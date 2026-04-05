@@ -122,7 +122,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
     }
 
     pub fn alloc_with_local(&self, _local: &mut LocalHeap, size: usize) -> Result<PhysicalAddr> {
-        self.alloc_internal(size)
+        self.alloc_internal(size, 0)
     }
 
     pub fn free_with_local(&self, _local: &mut LocalHeap, ptr: PhysicalAddr) -> Result<()> {
@@ -138,7 +138,12 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
     }
 
     pub fn alloc(&self, size: usize) -> Result<PhysicalAddr> {
-        self.alloc_internal(size)
+        self.alloc_internal(size, 0)
+    }
+
+    /// Allocate with an explicit minimum alignment (must be a power of two).
+    pub fn alloc_aligned(&self, size: usize, min_align: usize) -> Result<PhysicalAddr> {
+        self.alloc_internal(size, min_align)
     }
 
     pub fn free(&self, ptr: PhysicalAddr) -> Result<()> {
@@ -157,7 +162,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         self.dm
     }
 
-    fn alloc_internal(&self, requested_size: usize) -> Result<PhysicalAddr> {
+    fn alloc_internal(&self, requested_size: usize, min_align: usize) -> Result<PhysicalAddr> {
         let requested_size = requested_size.max(1);
         if requested_size > MAX_ALLOC {
             return Err(MemoryError::AllocationTooLarge {
@@ -167,7 +172,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         }
 
         let alloc_size = requested_size.max(MIN_FREE_BLOCK_SIZE);
-        let align = allocation_alignment(alloc_size);
+        let align = allocation_alignment(alloc_size).max(min_align);
         let mut inner = self.inner.lock();
 
         loop {

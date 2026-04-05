@@ -211,6 +211,11 @@ fn load_segments(file_data: &[u8], elf: &Elf) -> Result<VirtualAddr, ExecError> 
             return Err(ExecError::InvalidElf("segment extends beyond user space"));
         }
 
+        // Validate p_filesz <= p_memsz (file data must fit within the segment)
+        if ph.p_filesz > ph.p_memsz {
+            return Err(ExecError::InvalidElf("p_filesz > p_memsz"));
+        }
+
         // Validate file data bounds
         let file_offset = ph.p_offset as usize;
         let file_size = ph.p_filesz as usize;

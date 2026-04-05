@@ -48,16 +48,23 @@ fn fs_read_chunked(
 ) -> core::result::Result<u32, i32> {
     let mut total = 0u32;
     while remaining > 0 {
+        let paddr = match translate_vaddr(buf_vaddr) {
+            Some(p) => p,
+            None if total > 0 => return Ok(total),
+            None => return Err(EFAULT as i32),
+        };
         let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
-        let paddr = translate_vaddr(buf_vaddr).ok_or(EFAULT as i32)?;
-        let n = fs.read(fh, file_offset, paddr, chunk)?;
-        if n == 0 {
-            break;
+        match fs.read(fh, file_offset, paddr, chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                buf_vaddr += n as u64;
+                file_offset += n as u64;
+                remaining -= n;
+            }
+            Err(e) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
         }
-        total += n;
-        buf_vaddr += n as u64;
-        file_offset += n as u64;
-        remaining -= n;
     }
     Ok(total)
 }
@@ -73,16 +80,25 @@ fn fs_write_chunked(
 ) -> core::result::Result<u32, i32> {
     let mut total = 0u32;
     while remaining > 0 {
+        let paddr = match translate_vaddr(buf_vaddr) {
+            Some(p) => p,
+            // If bytes were already written, return the partial count
+            // so the caller advances the fd offset correctly.
+            None if total > 0 => return Ok(total),
+            None => return Err(EFAULT as i32),
+        };
         let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
-        let paddr = translate_vaddr(buf_vaddr).ok_or(EFAULT as i32)?;
-        let n = fs.write(fh, file_offset, paddr, chunk)?;
-        if n == 0 {
-            break;
+        match fs.write(fh, file_offset, paddr, chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                buf_vaddr += n as u64;
+                file_offset += n as u64;
+                remaining -= n;
+            }
+            Err(e) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
         }
-        total += n;
-        buf_vaddr += n as u64;
-        file_offset += n as u64;
-        remaining -= n;
     }
     Ok(total)
 }

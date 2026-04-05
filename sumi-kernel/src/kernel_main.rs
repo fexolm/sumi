@@ -12,7 +12,7 @@ struct GlobalKernelAlloc;
 
 unsafe impl GlobalAlloc for GlobalKernelAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        match sumi_kernel::KERNEL_ALLOCATOR.alloc(layout.size()) {
+        match sumi_kernel::KERNEL_ALLOCATOR.alloc_aligned(layout.size(), layout.align()) {
             Ok(paddr) => paddr
                 .to_virtual(sumi_kernel::KERNEL_ALLOCATOR.direct_map())
                 .as_ptr::<u8>(),
