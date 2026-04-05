@@ -1,7 +1,7 @@
 /// Kernel selftests — run inside the actual kernel under KVM.
 ///
 /// Each suite runs if its preconditions are met. Suites are independent.
-use crate::arch::debugcon_write_byte;
+use crate::{kprint, kprintln};
 use crate::fs::virtio_fs::VirtioFsClient;
 use crate::syscall::{SyscallArgs, syscall_dispatch};
 
@@ -14,26 +14,16 @@ pub(crate) struct SelfTest {
     pub func: fn() -> bool,
 }
 
-pub(crate) fn debugcon_puts(s: &str) {
-    for &b in s.as_bytes() {
-        debugcon_write_byte(b);
-    }
-}
-
 fn run_suite(name: &str, tests: &[SelfTest]) -> bool {
-    debugcon_puts("[suite] ");
-    debugcon_puts(name);
-    debugcon_puts("\n");
+    kprintln!("[suite] {}", name);
 
     let mut all_passed = true;
     for test in tests {
-        debugcon_puts("  ");
-        debugcon_puts(test.name);
-        debugcon_puts(" ... ");
+        kprint!("  {} ... ", test.name);
         if (test.func)() {
-            debugcon_puts("ok\n");
+            kprintln!("ok");
         } else {
-            debugcon_puts("FAIL\n");
+            kprintln!("FAIL");
             all_passed = false;
         }
     }
@@ -42,7 +32,7 @@ fn run_suite(name: &str, tests: &[SelfTest]) -> bool {
 
 /// Run all selftest suites. Each suite checks its own preconditions.
 pub fn run_all() -> bool {
-    debugcon_puts("\n=== kernel selftests ===\n");
+    kprintln!("\n=== kernel selftests ===");
     let mut all_passed = true;
 
     all_passed &= run_suite("fd_table", &fd_table::TESTS);
@@ -52,14 +42,14 @@ pub fn run_all() -> bool {
         all_passed &= run_suite("virtio_fs", &virtio::fs::TESTS);
         all_passed &= run_suite("syscall_fs", &syscalls::fs::TESTS);
     } else {
-        debugcon_puts("[suite] virtio_fs ... skipped (no device)\n");
-        debugcon_puts("[suite] syscall_fs ... skipped (no device)\n");
+        kprintln!("[suite] virtio_fs ... skipped (no device)");
+        kprintln!("[suite] syscall_fs ... skipped (no device)");
     }
 
     if all_passed {
-        debugcon_puts("=== all tests passed ===\n");
+        kprintln!("=== all tests passed ===");
     } else {
-        debugcon_puts("=== SOME TESTS FAILED ===\n");
+        kprintln!("=== SOME TESTS FAILED ===");
     }
     all_passed
 }

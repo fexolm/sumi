@@ -1,20 +1,67 @@
 use crate::arch::KernelDirectMap;
 use crate::fs::{FdKind, FileDescriptor};
-use crate::syscall::{ENOSYS, SyscallArgs, SyscallResult};
+use crate::syscall::errno::*;
+use crate::syscall::{SyscallArgs, SyscallResult};
 use sumi_abi::address::VirtualAddr;
-
-const EBADF: SyscallResult = -9;
-const EFAULT: SyscallResult = -14;
-const EINVAL: SyscallResult = -22;
-const EMFILE: SyscallResult = -24;
-const EIO: SyscallResult = -5;
 
 const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
-fn user_v2p(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
-    VirtualAddr::new(vaddr as usize).to_physical(&KernelDirectMap)
+/// Translate a virtual address to physical. Works for both kernel (direct-map)
+/// and user (lower-half, page-table walk) addresses.
+fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
+    use sumi_abi::arch::layout::{DIRECT_MAP_OFFSET, PAGE_SIZE};
+
+    let va = VirtualAddr::new(vaddr as usize);
+    if va.as_usize() >= DIRECT_MAP_OFFSET.as_usize() {
+        // Kernel address — use direct map
+        va.to_physical(&KernelDirectMap)
+    } else {
+        // User address — walk page table
+        let entry = crate::KERNEL_PAGE_TABLE.get_if_present(va).ok()??;
+        let page_offset = vaddr as usize & (PAGE_SIZE - 1);
+        Some(entry.addr().add(page_offset))
+    }
+}
+
+/// How many bytes from `vaddr` until the next 2 MB page boundary.
+fn bytes_to_page_end(vaddr: u64) -> u32 {
+    use sumi_abi::arch::layout::PAGE_SIZE;
+    let offset = vaddr as usize & (PAGE_SIZE - 1);
+    (PAGE_SIZE - offset) as u32
+}
+
+/// Transfer data between a FUSE file handle and a user buffer, splitting at
+/// 2 MB page boundaries so each DMA uses the correct physical address.
+/// `op` is called with (file_offset, physical_addr, chunk_size) for each chunk.
+fn fs_transfer_chunked(
+    op: impl Fn(u64, sumi_abi::address::PhysicalAddr, u32) -> core::result::Result<u32, i32>,
+    mut file_offset: u64,
+    mut buf_vaddr: u64,
+    mut remaining: u32,
+) -> core::result::Result<u32, i32> {
+    let mut total = 0u32;
+    while remaining > 0 {
+        let paddr = match translate_vaddr(buf_vaddr) {
+            Some(p) => p,
+            None if total > 0 => return Ok(total),
+            None => return Err(EFAULT as i32),
+        };
+        let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
+        match op(file_offset, paddr, chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                buf_vaddr += n as u64;
+                file_offset += n as u64;
+                remaining -= n;
+            }
+            Err(e) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
@@ -35,15 +82,11 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.read(fuse_fh, offset, buf_phys, count) {
+            match fs_transfer_chunked(|off, pa, cnt| fs.read(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num) {
@@ -88,15 +131,11 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.write(fuse_fh, offset, buf_phys, count as u32) {
+            match fs_transfer_chunked(|off, pa, cnt| fs.write(fuse_fh, off, pa, cnt), offset, buf_vaddr, count as u32) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num) {
@@ -175,21 +214,8 @@ pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
         Some(desc) => {
             match desc.kind {
                 FdKind::Console => {}
-                FdKind::File {
-                    fuse_fh,
-                    fuse_nodeid,
-                    ..
-                } => {
-                    if let Some(fs) = crate::VIRTIO_FS.get() {
-                        fs.release(fuse_fh);
-                        fs.forget(fuse_nodeid, 1);
-                    }
-                }
-                FdKind::Directory {
-                    fuse_fh,
-                    fuse_nodeid,
-                    ..
-                } => {
+                FdKind::File { fuse_fh, fuse_nodeid, .. }
+                | FdKind::Directory { fuse_fh, fuse_nodeid, .. } => {
                     if let Some(fs) = crate::VIRTIO_FS.get() {
                         fs.release(fuse_fh);
                         fs.forget(fuse_nodeid, 1);
@@ -207,45 +233,37 @@ pub fn sys_poll(_args: &SyscallArgs) -> SyscallResult {
 
 pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
-    let offset = args.arg1 as i64;
+    let seek_offset = args.arg1 as i64;
     let whence = args.arg2;
 
-    let mut table = crate::FD_TABLE.lock();
-    let desc = match table.get_mut(fd_num) {
-        Some(d) => d,
-        None => return EBADF,
+    // Read current offset and nodeid under the lock, then release it.
+    let (cur, nodeid) = {
+        let table = crate::FD_TABLE.lock();
+        match table.get(fd_num) {
+            Some(d) => match d.kind {
+                FdKind::File { offset, fuse_nodeid, .. } => (offset, fuse_nodeid),
+                FdKind::Console => return -29, // ESPIPE
+                _ => return EBADF,
+            },
+            None => return EBADF,
+        }
     };
 
-    let (cur_offset, nodeid) = match &mut desc.kind {
-        FdKind::File {
-            offset,
-            fuse_nodeid,
-            ..
-        } => (offset as *mut u64, *fuse_nodeid),
-        FdKind::Console => return -29, // ESPIPE
-        _ => return EBADF,
-    };
-
-    match whence {
+    let new_offset = match whence {
         SEEK_SET => {
-            if offset < 0 {
+            if seek_offset < 0 {
                 return EINVAL;
             }
-            // SAFETY: cur_offset points into the FD table entry we hold via table lock.
-            unsafe { *cur_offset = offset as u64 };
-            offset as SyscallResult
+            seek_offset as u64
         }
         SEEK_CUR => {
-            let cur = unsafe { *cur_offset };
-            let new = cur as i64 + offset;
+            let new = cur as i64 + seek_offset;
             if new < 0 {
                 return EINVAL;
             }
-            unsafe { *cur_offset = new as u64 };
-            new as SyscallResult
+            new as u64
         }
         SEEK_END => {
-            drop(table);
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
@@ -254,24 +272,24 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
                 Ok(a) => a,
                 Err(e) => return e as SyscallResult,
             };
-            let new = attr.attr.size as i64 + offset;
+            let new = attr.attr.size as i64 + seek_offset;
             if new < 0 {
                 return EINVAL;
             }
-            let mut table = crate::FD_TABLE.lock();
-            if let Some(desc) = table.get_mut(fd_num) {
-                if let FdKind::File {
-                    offset: cur, ..
-                } = &mut desc.kind
-                {
-                    *cur = new as u64;
-                    return new as SyscallResult;
-                }
-            }
-            EBADF
+            new as u64
         }
-        _ => EINVAL,
+        _ => return EINVAL,
+    };
+
+    // Write the new offset back under the lock.
+    let mut table = crate::FD_TABLE.lock();
+    if let Some(desc) = table.get_mut(fd_num) {
+        if let FdKind::File { ref mut offset, .. } = desc.kind {
+            *offset = new_offset;
+            return new_offset as SyscallResult;
+        }
     }
+    EBADF
 }
 
 pub fn sys_ioctl(_args: &SyscallArgs) -> SyscallResult {
@@ -294,15 +312,11 @@ pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.read(fuse_fh, offset, buf_phys, count) {
+            match fs_transfer_chunked(|off, pa, cnt| fs.read(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }
@@ -327,15 +341,11 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
-                Some(p) => p,
-                None => return EFAULT,
-            };
             let fs = match crate::VIRTIO_FS.get() {
                 Some(fs) => fs,
                 None => return EIO,
             };
-            match fs.write(fuse_fh, offset, buf_phys, count) {
+            match fs_transfer_chunked(|off, pa, cnt| fs.write(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }

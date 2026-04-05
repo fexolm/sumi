@@ -95,15 +95,6 @@ struct Placement {
     suffix_size: usize,
 }
 
-// Kept for API compatibility. The simple freelist allocator has no per-thread state.
-pub struct LocalHeap;
-
-impl LocalHeap {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
 pub struct KernelAllocator<'i, DM: DirectMap> {
     inner: spin::Mutex<AllocatorInner>,
     palloc: &'i PageAllocator,
@@ -121,24 +112,13 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         }
     }
 
-    pub fn alloc_with_local(&self, _local: &mut LocalHeap, size: usize) -> Result<PhysicalAddr> {
-        self.alloc_internal(size)
-    }
-
-    pub fn free_with_local(&self, _local: &mut LocalHeap, ptr: PhysicalAddr) -> Result<()> {
-        self.free_internal(ptr)
-    }
-
-    pub fn calloc_with_local(&self, local: &mut LocalHeap, size: usize) -> Result<PhysicalAddr> {
-        let addr = self.alloc_with_local(local, size)?;
-        unsafe {
-            write_bytes(addr.to_virtual(self.dm).as_ptr::<u8>(), 0, size);
-        }
-        Ok(addr)
-    }
-
     pub fn alloc(&self, size: usize) -> Result<PhysicalAddr> {
-        self.alloc_internal(size)
+        self.alloc_internal(size, 0)
+    }
+
+    /// Allocate with an explicit minimum alignment (must be a power of two).
+    pub fn alloc_aligned(&self, size: usize, min_align: usize) -> Result<PhysicalAddr> {
+        self.alloc_internal(size, min_align)
     }
 
     pub fn free(&self, ptr: PhysicalAddr) -> Result<()> {
@@ -157,7 +137,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         self.dm
     }
 
-    fn alloc_internal(&self, requested_size: usize) -> Result<PhysicalAddr> {
+    fn alloc_internal(&self, requested_size: usize, min_align: usize) -> Result<PhysicalAddr> {
         let requested_size = requested_size.max(1);
         if requested_size > MAX_ALLOC {
             return Err(MemoryError::AllocationTooLarge {
@@ -167,7 +147,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         }
 
         let alloc_size = requested_size.max(MIN_FREE_BLOCK_SIZE);
-        let align = allocation_alignment(alloc_size);
+        let align = allocation_alignment(alloc_size).max(min_align);
         let mut inner = self.inner.lock();
 
         loop {
@@ -385,86 +365,39 @@ fn place_allocation(
 mod tests {
     use super::*;
     use std::{collections::HashSet, sync::Arc};
-    use sumi_abi::{address::VirtualAddr, arch::layout::KERNEL_STACK};
-
-    struct TestDirectMap {
-        phys_base: usize,
-        buf: Vec<u8>,
-    }
-
-    impl TestDirectMap {
-        fn new(pages: usize) -> Self {
-            Self {
-                phys_base: KERNEL_STACK.as_usize(),
-                buf: vec![0u8; pages * PAGE_SIZE],
-            }
-        }
-    }
-
-    impl sumi_abi::address::DirectMap for TestDirectMap {
-        fn p2v(&self, paddr: PhysicalAddr) -> VirtualAddr {
-            VirtualAddr::new(self.buf.as_ptr() as usize + (paddr.as_usize() - self.phys_base))
-        }
-
-        fn v2p(&self, vaddr: VirtualAddr) -> Option<PhysicalAddr> {
-            let base = self.buf.as_ptr() as usize;
-            let len = self.buf.len();
-            if vaddr.as_usize() < base || vaddr.as_usize() >= base + len {
-                return None;
-            }
-
-            Some(PhysicalAddr::new(vaddr.as_usize() - base + self.phys_base))
-        }
-    }
-
-    fn make_alloc(
-        pages: usize,
-    ) -> (
-        Box<TestDirectMap>,
-        Box<PageAllocator>,
-        Box<KernelAllocator<'static, TestDirectMap>>,
-    ) {
-        let dm = Box::new(TestDirectMap::new(pages));
-        let pa = Box::new(PageAllocator::new());
-        let dm_ref: &'static TestDirectMap = unsafe { &*(dm.as_ref() as *const _) };
-        let pa_ref: &'static PageAllocator = unsafe { &*(pa.as_ref() as *const _) };
-        (dm, pa, Box::new(KernelAllocator::new(dm_ref, pa_ref)))
-    }
+    use crate::memory::test_utils::{TestDirectMap, make_alloc};
 
     #[test]
     fn small_alloc_and_free_reuses_address() {
         let (_dm, _pa, alloc) = make_alloc(4);
-        let mut local = LocalHeap::new();
-        let a = alloc.alloc_with_local(&mut local, 64).unwrap();
-        let b = alloc.alloc_with_local(&mut local, 64).unwrap();
+        let a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
         assert_ne!(a, b);
 
-        alloc.free_with_local(&mut local, a).unwrap();
-        let c = alloc.alloc_with_local(&mut local, 64).unwrap();
+        alloc.free(a).unwrap();
+        let c = alloc.alloc(64).unwrap();
         assert_eq!(c, a);
     }
 
     #[test]
     fn small_allocs_do_not_overlap() {
         let (_dm, _pa, alloc) = make_alloc(4);
-        let mut local = LocalHeap::new();
-        let a = alloc.alloc_with_local(&mut local, 4096).unwrap();
-        let b = alloc.alloc_with_local(&mut local, 4096).unwrap();
+        let a = alloc.alloc(4096).unwrap();
+        let b = alloc.alloc(4096).unwrap();
         assert!(a.as_usize().abs_diff(b.as_usize()) >= 4096);
     }
 
     #[test]
     fn calloc_zeroes_memory() {
         let (dm, _pa, alloc) = make_alloc(4);
-        let mut local = LocalHeap::new();
 
-        let ptr = alloc.alloc_with_local(&mut local, 128).unwrap();
+        let ptr = alloc.alloc(128).unwrap();
         unsafe {
             *ptr.to_virtual(&*dm).as_ptr::<u64>() = 0xDEAD_BEEF_CAFE_BABE;
         }
-        alloc.free_with_local(&mut local, ptr).unwrap();
+        alloc.free(ptr).unwrap();
 
-        let zeroed = alloc.calloc_with_local(&mut local, 128).unwrap();
+        let zeroed = alloc.calloc(128).unwrap();
         let slice =
             unsafe { core::slice::from_raw_parts(zeroed.to_virtual(&*dm).as_ptr::<u8>(), 128) };
         assert!(slice.iter().all(|&byte| byte == 0));
@@ -473,64 +406,56 @@ mod tests {
     #[test]
     fn page_table_alloc_is_aligned() {
         let (_dm, _pa, alloc) = make_alloc(4);
-        let mut local = LocalHeap::new();
-        let ptr = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
+        let ptr = alloc.alloc(PAGE_TABLE_SIZE).unwrap();
         assert_eq!(ptr.as_usize() % PAGE_TABLE_SIZE, 0);
     }
 
     #[test]
     fn adjacent_frees_are_coalesced() {
         let (_dm, _pa, alloc) = make_alloc(4);
-        let mut local = LocalHeap::new();
-        let a = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
-        let b = alloc.alloc_with_local(&mut local, PAGE_TABLE_SIZE).unwrap();
+        let a = alloc.alloc(PAGE_TABLE_SIZE).unwrap();
+        let b = alloc.alloc(PAGE_TABLE_SIZE).unwrap();
         assert_eq!(b.as_usize(), a.as_usize() + PAGE_TABLE_SIZE);
 
-        alloc.free_with_local(&mut local, b).unwrap();
-        alloc.free_with_local(&mut local, a).unwrap();
+        alloc.free(b).unwrap();
+        alloc.free(a).unwrap();
 
-        let big = alloc
-            .alloc_with_local(&mut local, PAGE_TABLE_SIZE * 2)
-            .unwrap();
+        let big = alloc.alloc(PAGE_TABLE_SIZE * 2).unwrap();
         assert_eq!(big, a);
     }
 
     #[test]
     fn large_allocs_dont_overlap() {
         let (_dm, _pa, alloc) = make_alloc(8);
-        let mut local = LocalHeap::new();
-        let a = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
-        let b = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        let a = alloc.alloc(1 << 22).unwrap();
+        let b = alloc.alloc(1 << 22).unwrap();
         assert!(a.as_usize().abs_diff(b.as_usize()) >= (1 << 22));
     }
 
     #[test]
     fn large_free_and_realloc_reuses_address() {
         let (_dm, _pa, alloc) = make_alloc(8);
-        let mut local = LocalHeap::new();
-        let a = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
-        let b = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        let a = alloc.alloc(1 << 22).unwrap();
+        let b = alloc.alloc(1 << 22).unwrap();
         assert_ne!(a, b);
 
-        alloc.free_with_local(&mut local, b).unwrap();
-        let c = alloc.alloc_with_local(&mut local, 1 << 22).unwrap();
+        alloc.free(b).unwrap();
+        let c = alloc.alloc(1 << 22).unwrap();
         assert_eq!(c, b);
     }
 
     #[test]
     fn zero_size_alloc_succeeds() {
         let (_dm, _pa, alloc) = make_alloc(2);
-        let mut local = LocalHeap::new();
-        let ptr = alloc.alloc_with_local(&mut local, 0).unwrap();
-        alloc.free_with_local(&mut local, ptr).unwrap();
+        let ptr = alloc.alloc(0).unwrap();
+        alloc.free(ptr).unwrap();
     }
 
     #[test]
     fn alloc_too_large_fails() {
         let (_dm, _pa, alloc) = make_alloc(8);
-        let mut local = LocalHeap::new();
         assert!(matches!(
-            alloc.alloc_with_local(&mut local, MAX_ALLOC + 1),
+            alloc.alloc(MAX_ALLOC + 1),
             Err(MemoryError::AllocationTooLarge { .. })
         ));
     }
@@ -538,11 +463,10 @@ mod tests {
     #[test]
     fn double_free_is_detected() {
         let (_dm, _pa, alloc) = make_alloc(2);
-        let mut local = LocalHeap::new();
-        let ptr = alloc.alloc_with_local(&mut local, 64).unwrap();
-        alloc.free_with_local(&mut local, ptr).unwrap();
+        let ptr = alloc.alloc(64).unwrap();
+        alloc.free(ptr).unwrap();
 
-        let result = alloc.free_with_local(&mut local, ptr);
+        let result = alloc.free(ptr);
         assert!(matches!(result, Err(MemoryError::UnknownAllocation { .. })));
     }
 
@@ -551,18 +475,15 @@ mod tests {
         let (_dm, _pa, alloc) = make_alloc(4);
         let alloc: Arc<KernelAllocator<'static, TestDirectMap>> = Arc::from(alloc);
 
-        let mut owner = LocalHeap::new();
-        let ptr = alloc.alloc_with_local(&mut owner, 64).unwrap();
+        let ptr = alloc.alloc(64).unwrap();
 
         let worker_alloc = Arc::clone(&alloc);
         let worker = std::thread::spawn(move || {
-            let mut local = LocalHeap::new();
-            worker_alloc.free_with_local(&mut local, ptr).unwrap();
+            worker_alloc.free(ptr).unwrap();
         });
         worker.join().unwrap();
 
-        let mut local = LocalHeap::new();
-        let next = alloc.alloc_with_local(&mut local, 64).unwrap();
+        let next = alloc.alloc(64).unwrap();
         assert_eq!(next, ptr);
     }
 
@@ -579,9 +500,8 @@ mod tests {
             .map(|_| {
                 let alloc = Arc::clone(&alloc);
                 std::thread::spawn(move || {
-                    let mut local = LocalHeap::new();
                     (0..OPS)
-                        .map(|_| alloc.alloc_with_local(&mut local, SIZE).unwrap().as_usize())
+                        .map(|_| alloc.alloc(SIZE).unwrap().as_usize())
                         .collect::<Vec<_>>()
                 })
             })
@@ -596,12 +516,9 @@ mod tests {
             }
         }
 
-        let mut local = LocalHeap::new();
         for ptrs in allocations {
             for addr in ptrs {
-                alloc
-                    .free_with_local(&mut local, PhysicalAddr::new(addr))
-                    .unwrap();
+                alloc.free(PhysicalAddr::new(addr)).unwrap();
             }
         }
     }

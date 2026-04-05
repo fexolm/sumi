@@ -12,6 +12,10 @@ pub struct RunCommand {
     /// Host directory to share with the guest as its root filesystem.
     #[arg(long = "share", value_name = "DIR")]
     share_dir: Option<PathBuf>,
+
+    /// Path to the user program, relative to the share root.
+    #[arg(long = "run", value_name = "PATH")]
+    run_path: Option<String>,
 }
 
 impl RunCommand {
@@ -22,6 +26,7 @@ impl RunCommand {
             mem_size: 2 << 30,
             kernel_path: self.program,
             share_dir: self.share_dir,
+            run_path: self.run_path,
         };
 
         run_sumi_vm(&info)

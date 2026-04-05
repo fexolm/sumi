@@ -1,6 +1,6 @@
-use crate::arch::debugcon_write_byte;
+use crate::kprint;
 use crate::fs::virtio_fs::VirtioFsClient;
-use crate::selftest::{SelfTest, debugcon_puts, fs};
+use crate::selftest::{SelfTest, fs};
 use sumi_abi::fuse::FUSE_ROOT_ID;
 
 pub(crate) const TESTS: [SelfTest; 3] = [
@@ -90,9 +90,9 @@ fn test_read_print() -> bool {
     fs.release(open.fh);
     fs.forget(entry.nodeid, 1);
 
-    debugcon_puts("    | ");
+    kprint!("    | ");
     for &b in &buf[..n] {
-        debugcon_write_byte(b);
+        crate::arch::debugcon_write_byte(b);
     }
 
     n == msg.len()

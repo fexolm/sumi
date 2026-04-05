@@ -1,4 +1,5 @@
-use crate::syscall::{ENOSYS, SyscallArgs, SyscallResult};
+use crate::syscall::errno::*;
+use crate::syscall::{SyscallArgs, SyscallResult};
 
 pub fn sys_socket(_args: &SyscallArgs) -> SyscallResult {
     ENOSYS

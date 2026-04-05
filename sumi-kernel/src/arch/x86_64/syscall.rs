@@ -1,18 +1,15 @@
 use core::arch::asm;
 
-const MSR_EFER:   u32 = 0xC000_0080;
 const MSR_STAR:   u32 = 0xC000_0081;
 const MSR_LSTAR:  u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 
-const EFER_SCE: u64 = 1 << 0;
 // STAR[47:32] = 0x0008 => CS=0x0008, SS=0x0010 on syscall entry
 const STAR_VALUE: u64 = 0x0008u64 << 32;
 // Clear IF (bit 9) and DF (bit 10)
 const SFMASK_VALUE: u64 = 0x600;
 
-#[cfg(not(test))]
-unsafe fn rdmsr(msr: u32) -> u64 {
+pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
     let eax: u32;
     let edx: u32;
     // SAFETY: Caller ensures the MSR address is valid and we are in ring 0.
@@ -28,8 +25,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((edx as u64) << 32) | (eax as u64)
 }
 
-#[cfg(not(test))]
-unsafe fn wrmsr(msr: u32, value: u64) {
+pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
     let eax = value as u32;
     let edx = (value >> 32) as u32;
     // SAFETY: Caller ensures the MSR address and value are valid and we are in ring 0.
@@ -44,29 +40,21 @@ unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
-#[cfg(not(test))]
 unsafe extern "C" {
     fn syscall_entry();
 }
 
 /// Initialize MSRs to enable syscall handling. Call once at boot before running any user code.
-#[cfg(not(test))]
 pub fn init() {
     // SAFETY: We are in ring 0 during kernel boot. All MSR addresses and values
     // are correct for 64-bit long mode.
     unsafe {
-        // Enable SCE in EFER via KVM sregs (set in VM init) to avoid WRMSR #GP.
-        // Set LSTAR, STAR, SFMASK for syscall handling.
         wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
         wrmsr(MSR_STAR, STAR_VALUE);
         wrmsr(MSR_SFMASK, SFMASK_VALUE);
     }
 }
 
-#[cfg(test)]
-pub fn init() {}
-
-#[cfg(not(test))]
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",

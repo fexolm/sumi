@@ -1,3 +1,4 @@
+pub mod errno;
 pub mod handlers;
 
 #[repr(C)]
@@ -12,7 +13,6 @@ pub struct SyscallArgs {
 }
 
 pub type SyscallResult = i64;
-pub const ENOSYS: SyscallResult = -38;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
@@ -82,6 +82,9 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         228 => handlers::time::sys_clock_gettime(args),
         229 => handlers::time::sys_clock_getres(args),
         230 => handlers::time::sys_clock_nanosleep(args),
+        63  => handlers::process::sys_uname(args),
+        218 => handlers::process::sys_set_tid_address(args),
+        302 => handlers::time::sys_prlimit64(args),
         41 => handlers::net::sys_socket(args),
         42 => handlers::net::sys_connect(args),
         43 => handlers::net::sys_accept(args),
@@ -96,6 +99,6 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         52 => handlers::net::sys_getpeername(args),
         54 => handlers::net::sys_setsockopt(args),
         55 => handlers::net::sys_getsockopt(args),
-        _  => ENOSYS,
+        _  => errno::ENOSYS,
     }
 }

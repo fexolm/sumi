@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["sumi-vm"]
-members = ["sumi-vm", "sumi-abi", "sumi-kernel"]
+members = ["sumi-vm", "sumi-abi", "sumi-kernel", "sumi-integration-tests"]
 resolver = "3"
 
 [workspace.package]
