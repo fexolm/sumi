@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 pub mod pagetable;
+#[cfg(not(test))]
 pub mod syscall;
 
 pub use self::pagetable::RootPageTable;

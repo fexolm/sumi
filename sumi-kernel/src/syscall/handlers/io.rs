@@ -13,8 +13,21 @@ const SEEK_SET: u64 = 0;
 const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
-fn user_v2p(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
-    VirtualAddr::new(vaddr as usize).to_physical(&KernelDirectMap)
+/// Translate a virtual address to physical. Works for both kernel (direct-map)
+/// and user (lower-half, page-table walk) addresses.
+fn translate_vaddr(vaddr: u64) -> Option<sumi_abi::address::PhysicalAddr> {
+    use sumi_abi::arch::layout::{DIRECT_MAP_OFFSET, PAGE_SIZE};
+
+    let va = VirtualAddr::new(vaddr as usize);
+    if va.as_usize() >= DIRECT_MAP_OFFSET.as_usize() {
+        // Kernel address — use direct map
+        va.to_physical(&KernelDirectMap)
+    } else {
+        // User address — walk page table
+        let entry = crate::KERNEL_PAGE_TABLE.get_if_present(va).ok()??;
+        let page_offset = vaddr as usize & (PAGE_SIZE - 1);
+        Some(entry.addr().add(page_offset))
+    }
 }
 
 pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
@@ -35,7 +48,7 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
+            let buf_phys = match translate_vaddr(buf_vaddr) {
                 Some(p) => p,
                 None => return EFAULT,
             };
@@ -88,7 +101,7 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
+            let buf_phys = match translate_vaddr(buf_vaddr) {
                 Some(p) => p,
                 None => return EFAULT,
             };
@@ -294,7 +307,7 @@ pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
+            let buf_phys = match translate_vaddr(buf_vaddr) {
                 Some(p) => p,
                 None => return EFAULT,
             };
@@ -327,7 +340,7 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
-            let buf_phys = match user_v2p(buf_vaddr) {
+            let buf_phys = match translate_vaddr(buf_vaddr) {
                 Some(p) => p,
                 None => return EFAULT,
             };

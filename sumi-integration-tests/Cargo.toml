@@ -1,0 +1,10 @@
+[package]
+name = "sumi-integration-tests"
+version.workspace = true
+edition.workspace = true
+
+[[test]]
+name = "user_programs"
+harness = true
+
+[dev-dependencies]

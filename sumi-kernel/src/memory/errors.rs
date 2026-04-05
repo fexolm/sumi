@@ -12,6 +12,8 @@ pub enum MemoryError {
     SlabAlignmentMismatch { addr: usize, block_size: usize },
     InvalidSlabCapacity,
     SlabEmpty,
+    AlreadyMapped { addr: usize },
+    NotMapped { addr: usize },
 }
 
 pub type Result<T> = core::result::Result<T, MemoryError>;
@@ -41,6 +43,12 @@ impl fmt::Display for MemoryError {
             ),
             Self::InvalidSlabCapacity => write!(f, "invalid slab capacity"),
             Self::SlabEmpty => write!(f, "slab is empty"),
+            Self::AlreadyMapped { addr } => {
+                write!(f, "virtual address {addr:#x} is already mapped")
+            }
+            Self::NotMapped { addr } => {
+                write!(f, "virtual address {addr:#x} is not mapped")
+            }
         }
     }
 }

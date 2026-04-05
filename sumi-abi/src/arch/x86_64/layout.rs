@@ -34,6 +34,18 @@ pub const KERNEL_STACK: PhysicalAddr = KERNEL_CODE_PD
     .add(PAGE_TABLE_SIZE + KERNEL_STACK_SIZE)
     .align_up(PAGE_SIZE);
 
+/// Boot info location: just past the kernel's 4 MB physical region.
+pub const BOOT_INFO_ADDR: PhysicalAddr = PhysicalAddr::new(0x40_0000);
+/// Maximum boot info region size (one 4 KB page).
+pub const BOOT_INFO_MAX_SIZE: usize = 0x1000;
+
+/// Default stack top for the user program (page-aligned, within lower half).
+pub const USER_STACK_TOP: VirtualAddr = VirtualAddr::new(0x0000_7FFF_FFFF_F000);
+/// User stack size: 8 MB = 4 x 2 MB pages.
+pub const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Base address for mmap region (grows downward).
+pub const USER_MMAP_BASE: VirtualAddr = VirtualAddr::new(0x0000_7FFF_0000_0000);
+
 /// Base physical address for virtio MMIO devices.
 /// Placed at 64 GB — above any reasonable guest RAM (2 TB max),
 /// within the direct-map range so the kernel can access it, and

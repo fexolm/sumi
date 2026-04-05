@@ -31,6 +31,7 @@ pub struct VmCreateInfo {
     pub mem_size: usize,
     pub kernel_path: PathBuf,
     pub share_dir: Option<PathBuf>,
+    pub run_path: Option<String>,
 }
 
 pub trait VirtBackend: Sized {
@@ -74,6 +75,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         }
 
         let kernel_entry = Self::load_elf(&mem, &info.kernel_path)?;
+        Self::write_boot_info(&mem, info)?;
 
         Ok(Self {
             mem,
@@ -98,6 +100,56 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 
         for t in threads {
             t.join().unwrap()?;
+        }
+
+        Ok(())
+    }
+
+    fn write_boot_info(mem: &GuestMemoryMmap<()>, info: &VmCreateInfo) -> Result<()> {
+        use sumi_abi::arch::layout::{BOOT_INFO_ADDR, BOOT_INFO_MAX_SIZE};
+        use sumi_abi::boot_info::*;
+
+        let mut flags = 0u32;
+        let mut path_bytes: &[u8] = &[];
+
+        if let Some(ref path) = info.run_path {
+            flags |= BOOT_INFO_FLAG_HAS_RUN_PATH;
+            path_bytes = path.as_bytes();
+        }
+
+        let header_size = core::mem::size_of::<BootInfo>();
+        let total_size = header_size + path_bytes.len();
+        if total_size > BOOT_INFO_MAX_SIZE {
+            return Err(Error::InvalidVmConfig(format!(
+                "boot info too large: {} bytes (max {})",
+                total_size, BOOT_INFO_MAX_SIZE
+            )));
+        }
+
+        let boot_info = BootInfo {
+            magic: BOOT_INFO_MAGIC,
+            version: BOOT_INFO_VERSION,
+            flags,
+            _reserved: 0,
+            mem_size: info.mem_size as u64,
+            run_path_offset: header_size as u32,
+            run_path_len: path_bytes.len() as u32,
+        };
+
+        // SAFETY: BootInfo is repr(C) with no padding holes that matter.
+        let struct_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                &boot_info as *const _ as *const u8,
+                header_size,
+            )
+        };
+        mem.write_slice(struct_bytes, GuestAddress(BOOT_INFO_ADDR.as_u64()))?;
+
+        if !path_bytes.is_empty() {
+            mem.write_slice(
+                path_bytes,
+                GuestAddress(BOOT_INFO_ADDR.as_u64() + header_size as u64),
+            )?;
         }
 
         Ok(())
