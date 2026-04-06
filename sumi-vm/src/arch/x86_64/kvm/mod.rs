@@ -195,6 +195,10 @@ impl KvmVCpu {
 }
 
 impl VCpu for KvmVCpu {
+    fn tsc_khz(&self) -> u32 {
+        self.fd.get_tsc_khz().unwrap_or(0)
+    }
+
     fn init(&mut self, entry_point: u64) -> Result<()> {
         // General purpose registers:
         // - RIP: instruction pointer where the guest will start executing

@@ -80,7 +80,8 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         }
 
         let kernel_entry = Self::load_elf(&mem, &info.kernel_path)?;
-        Self::write_boot_info(&mem, info)?;
+        let tsc_khz = vcpus.first().map(|v| v.tsc_khz()).unwrap_or(0);
+        Self::write_boot_info(&mem, info, tsc_khz)?;
 
         Ok(Self {
             _mem: mem,
@@ -110,9 +111,10 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         Ok(())
     }
 
-    fn write_boot_info(mem: &GuestMemoryMmap<()>, info: &VmCreateInfo) -> Result<()> {
+    fn write_boot_info(mem: &GuestMemoryMmap<()>, info: &VmCreateInfo, tsc_khz: u32) -> Result<()> {
         use sumi_abi::arch::layout::{BOOT_INFO_ADDR, BOOT_INFO_MAX_SIZE};
         use sumi_abi::boot_info::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut flags = 0u32;
         let mut path_bytes: &[u8] = &[];
@@ -131,6 +133,26 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             )));
         }
 
+        let (wall_clock_sec, wall_clock_nsec) = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| (d.as_secs(), d.subsec_nanos()))
+            .unwrap_or((0, 0));
+
+        let mut rng_seed = [0u8; 32];
+        // SAFETY: rng_seed is a valid 32-byte buffer. getrandom may return fewer
+        // than 32 bytes (or -1 on error); the remainder stays zeroed, which is
+        // non-fatal — the kernel fallback RNG can tolerate a partially-seeded buffer.
+        let ret = unsafe {
+            libc::getrandom(
+                rng_seed.as_mut_ptr() as *mut libc::c_void,
+                32,
+                0,
+            )
+        };
+        if ret != 32 {
+            // Non-fatal: leave whatever bytes getrandom wrote (possibly none).
+        }
+
         let boot_info = BootInfo {
             magic: BOOT_INFO_MAGIC,
             version: BOOT_INFO_VERSION,
@@ -139,6 +161,10 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             mem_size: info.mem_size as u64,
             run_path_offset: header_size as u32,
             run_path_len: path_bytes.len() as u32,
+            tsc_freq_khz: tsc_khz,
+            wall_clock_sec,
+            wall_clock_nsec,
+            rng_seed,
         };
 
         // SAFETY: BootInfo is repr(C) with no padding holes that matter.
@@ -278,4 +304,5 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 pub trait VCpu: Send {
     fn init(&mut self, entry_point: u64) -> Result<()>;
     fn run(&mut self) -> Result<()>;
+    fn tsc_khz(&self) -> u32;
 }

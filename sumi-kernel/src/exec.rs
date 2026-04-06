@@ -11,7 +11,7 @@ use sumi_abi::{
         DIRECT_MAP_OFFSET, INTERP_LOAD_BASE, PAGE_SIZE, PIE_LOAD_BASE, USER_STACK_SIZE,
         USER_STACK_TOP,
     },
-    boot_info::{BOOT_INFO_FLAG_HAS_RUN_PATH, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo},
+    boot_info::{BOOT_INFO_FLAG_HAS_RUN_PATH, BOOT_INFO_MAGIC, BootInfo},
 };
 
 use crate::kprintln;
@@ -58,8 +58,13 @@ pub fn read_boot_info() -> Option<&'static str> {
     // The memory is valid and mapped via the direct map.
     let info = unsafe { &*boot_info_vaddr.as_ptr::<BootInfo>() };
 
-    if info.magic != BOOT_INFO_MAGIC || info.version != BOOT_INFO_VERSION {
+    if info.magic != BOOT_INFO_MAGIC || info.version < 1 {
         return None;
+    }
+
+    if info.version >= 2 {
+        crate::time::init(info.tsc_freq_khz, info.wall_clock_sec, info.wall_clock_nsec);
+        crate::RNG_SEED.call_once(|| info.rng_seed);
     }
 
     if info.flags & BOOT_INFO_FLAG_HAS_RUN_PATH == 0 {
@@ -378,13 +383,19 @@ fn prepare_initial_stack(
     // Write 16 "random" bytes for AT_RANDOM (musl reads this for stack canary)
     sp = (sp - 16) & !0xF; // align to 16 bytes
     let random_addr = sp;
-    // SAFETY: Stack pages are mapped, writing deterministic random bytes.
+    // SAFETY: Stack pages are mapped, writing random bytes for the stack canary.
     unsafe {
-        let random: [u8; 16] = [
-            0x73, 0x75, 0x6D, 0x69, // "sumi"
-            0x72, 0x61, 0x6E, 0x64, // "rand"
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        ];
+        let random: [u8; 16] = match crate::RNG_SEED.get() {
+            Some(seed) => {
+                let mut r = [0u8; 16];
+                r.copy_from_slice(&seed[..16]);
+                r
+            }
+            None => [
+                0x73, 0x75, 0x6D, 0x69, 0x72, 0x61, 0x6E, 0x64, 0x01, 0x02, 0x03, 0x04, 0x05,
+                0x06, 0x07, 0x08,
+            ],
+        };
         core::ptr::copy_nonoverlapping(random.as_ptr(), sp as *mut u8, 16);
     }
 

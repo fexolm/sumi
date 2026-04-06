@@ -2,6 +2,7 @@ use super::SyscallResult;
 
 pub const EIO: SyscallResult = -5;
 pub const EBADF: SyscallResult = -9;
+pub const EAGAIN: SyscallResult = -11;
 pub const ENOMEM: SyscallResult = -12;
 pub const EFAULT: SyscallResult = -14;
 pub const ENOTDIR: SyscallResult = -20;

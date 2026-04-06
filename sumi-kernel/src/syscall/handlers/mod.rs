@@ -3,5 +3,7 @@ pub mod io;
 pub mod memory;
 pub mod net;
 pub mod process;
+pub mod random;
 pub mod signal;
+pub mod thread;
 pub mod time;

@@ -9,6 +9,7 @@ pub mod fs;
 pub mod memory;
 pub mod selftest;
 pub mod syscall;
+pub mod time;
 
 use arch::{KernelDirectMap, RootPageTable};
 use memory::alloc::{kmalloc::KernelAllocator, palloc::PageAllocator};
@@ -28,6 +29,7 @@ pub static KERNEL_PAGE_TABLE: spin::Mutex<RootPageTable<KernelDirectMap>> =
 pub static FD_TABLE: spin::Mutex<fs::FdTable> = spin::Mutex::new(fs::FdTable::new());
 pub static VIRTIO_FS: spin::Once<fs::virtio_fs::VirtioFsClient> = spin::Once::new();
 pub static VIRTIO_CONSOLE: spin::Once<drivers::virtio::console::VirtioConsole> = spin::Once::new();
+pub static RNG_SEED: spin::Once<[u8; 32]> = spin::Once::new();
 
 // User program memory state
 pub static BRK_BASE: spin::Mutex<VirtualAddr> = spin::Mutex::new(VirtualAddr::new(0));

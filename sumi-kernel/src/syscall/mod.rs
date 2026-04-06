@@ -90,6 +90,9 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         63  => handlers::process::sys_uname(args),
         218 => handlers::process::sys_set_tid_address(args),
         302 => handlers::time::sys_prlimit64(args),
+        202 => handlers::thread::sys_futex(args),
+        318 => handlers::random::sys_getrandom(args),
+        334 => errno::ENOSYS, // rseq: glibc falls back gracefully
         41 => handlers::net::sys_socket(args),
         42 => handlers::net::sys_connect(args),
         43 => handlers::net::sys_accept(args),
