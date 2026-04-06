@@ -1,13 +1,18 @@
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
+use sumi_abi::arch::layout::{INTERP_LOAD_BASE, PIE_LOAD_BASE};
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use crate::debug::{self, GdbServer, VCpuDebugReceiver};
 use crate::devices::DeviceRegistry;
 use crate::error::{Error, Result};
 use std::{
     fmt::{self, Display},
+    fs::File,
+    io::Write as _,
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
     thread,
 };
@@ -32,6 +37,7 @@ pub struct VmCreateInfo {
     pub kernel_path: PathBuf,
     pub share_dir: Option<PathBuf>,
     pub run_path: Option<String>,
+    pub gdb_port: Option<u16>,
 }
 
 pub trait VirtBackend: Sized {
@@ -51,11 +57,28 @@ pub trait VirtBackend: Sized {
     ) -> Result<Self::VCpuType>;
 }
 
+/// Symbol file info for GDB: host path + .text load address.
+#[derive(Clone)]
+struct SymbolFile {
+    host_path: PathBuf,
+    text_load_addr: u64,
+}
+
+/// Info about user binaries for GDB auto-loading.
+#[derive(Clone)]
+struct UserDebugInfo {
+    binary: SymbolFile,
+    interpreter: Option<SymbolFile>,
+}
+
 pub struct SumiVm<Backend: VirtBackend + 'static> {
-    _mem: Arc<GuestMemoryMmap<()>>,
+    mem: Arc<GuestMemoryMmap<()>>,
     _backend: Backend,
     kernel_entry: u64,
     vcpus: Vec<Backend::VCpuType>,
+    gdb_port: Option<u16>,
+    kernel_path: PathBuf,
+    user_debug: Option<UserDebugInfo>,
 }
 
 impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
@@ -83,32 +106,251 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         let tsc_khz = vcpus.first().map(|v| v.tsc_khz()).unwrap_or(0);
         Self::write_boot_info(&mem, info, tsc_khz)?;
 
+        // Resolve user binary path and load address for GDB symbol loading.
+        let user_debug = match (&info.share_dir, &info.run_path) {
+            (Some(share), Some(run)) => {
+                let rel = run.strip_prefix('/').unwrap_or(run);
+                let host_path = share.join(rel);
+                Self::resolve_user_debug(share, &host_path).ok()
+            }
+            _ => None,
+        };
+
+        // Always emit /tmp/perf-<pid>.map for `perf record`. The cost is a one-time
+        // ELF parse at startup and there is no runtime overhead.
+        Self::write_perf_map(&info.kernel_path, &info.share_dir, &info.run_path)?;
+
         Ok(Self {
-            _mem: mem,
+            mem,
             vcpus,
             _backend: backend,
             kernel_entry,
+            gdb_port: info.gdb_port,
+            kernel_path: info.kernel_path.clone(),
+            user_debug,
         })
     }
 
     pub fn run(self) -> Result<()> {
-        let threads = self
-            .vcpus
-            .into_iter()
-            .map(|mut cpu| {
-                let kernel_entry = self.kernel_entry;
-                thread::spawn(move || {
-                    cpu.init(kernel_entry)?;
-                    cpu.run()
-                })
-            })
-            .collect::<Vec<_>>();
+        if let Some(port) = self.gdb_port {
+            // Capture GDB launch info before moving fields out of self.
+            let kernel_path = self.kernel_path.clone();
+            let user_debug = self.user_debug.clone();
 
-        for t in threads {
-            t.join().unwrap()?;
+            // Debug mode: single vCPU with GDB stub
+            let (cmd_tx, event_rx, vcpu_dbg) = debug::create_debug_channels();
+            let mem = Arc::clone(&self.mem);
+
+            let mut vcpus = self.vcpus;
+            let mut cpu = vcpus.remove(0);
+            let kernel_entry = self.kernel_entry;
+
+            // Spawn vCPU thread
+            let vcpu_thread = thread::spawn(move || {
+                cpu.init(kernel_entry)?;
+                cpu.run_debug(vcpu_dbg)
+            });
+
+            // Spawn GDB stub thread
+            let stub_thread = thread::spawn(move || {
+                let server = GdbServer::new(cmd_tx, event_rx, mem);
+                server.run(port);
+            });
+
+            // Launch GDB as a child process
+            Self::launch_gdb(&kernel_path, user_debug.as_ref(), port);
+
+            // Wait for threads to finish
+            let _ = stub_thread.join();
+            match vcpu_thread.join() {
+                Ok(r) => r?,
+                Err(_) => eprintln!("[vm] vCPU thread panicked"),
+            }
+        } else {
+            // Normal (non-debug) mode
+            let threads = self
+                .vcpus
+                .into_iter()
+                .map(|mut cpu| {
+                    let kernel_entry = self.kernel_entry;
+                    thread::spawn(move || {
+                        cpu.init(kernel_entry)?;
+                        cpu.run()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for t in threads {
+                t.join().unwrap()?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Parse user ELF to find .text load address and interpreter info.
+    fn resolve_user_debug(share_dir: &PathBuf, host_path: &PathBuf) -> Result<UserDebugInfo> {
+        let data = std::fs::read(host_path)?;
+        let elf = Elf::parse(&data)?;
+
+        let base: u64 = match elf.header.e_type {
+            goblin::elf::header::ET_EXEC => 0,
+            goblin::elf::header::ET_DYN => PIE_LOAD_BASE as u64,
+            _ => 0,
+        };
+
+        let binary = SymbolFile {
+            host_path: host_path.clone(),
+            text_load_addr: base + Self::find_text_vaddr(&elf),
+        };
+
+        // Check for dynamic linker (PT_INTERP)
+        let interpreter = elf.interpreter.and_then(|interp_path| {
+            let rel = interp_path.strip_prefix('/').unwrap_or(interp_path);
+            let interp_host = share_dir.join(rel);
+            let interp_data = std::fs::read(&interp_host).ok()?;
+            let interp_elf = Elf::parse(&interp_data).ok()?;
+            Some(SymbolFile {
+                host_path: interp_host,
+                text_load_addr: INTERP_LOAD_BASE + Self::find_text_vaddr(&interp_elf),
+            })
+        });
+
+        Ok(UserDebugInfo {
+            binary,
+            interpreter,
+        })
+    }
+
+    fn find_text_vaddr(elf: &Elf) -> u64 {
+        elf.section_headers
+            .iter()
+            .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".text"))
+            .map(|sh| sh.sh_addr)
+            .unwrap_or(0)
+    }
+
+    /// Extract function symbols from an ELF and append them to the perf map file.
+    fn append_elf_symbols(f: &mut File, elf_data: &[u8], base: u64) -> Result<()> {
+        use goblin::elf::sym::STT_FUNC;
+
+        let elf = Elf::parse(elf_data)?;
+
+        // Collect from both .symtab and .dynsym
+        let all_syms = elf.syms.iter().chain(elf.dynsyms.iter());
+        for sym in all_syms {
+            if sym.st_type() == STT_FUNC && sym.st_value != 0 {
+                if let Some(name) = elf.strtab.get_at(sym.st_name)
+                    .or_else(|| elf.dynstrtab.get_at(sym.st_name))
+                {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let addr = base + sym.st_value;
+                    // Use st_size if known, otherwise default to 1
+                    let size = if sym.st_size > 0 { sym.st_size } else { 1 };
+                    writeln!(f, "{:x} {:x} {}", addr, size, name)
+                        .map_err(Error::Io)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write /tmp/perf-<pid>.map with symbols from kernel + user binaries.
+    fn write_perf_map(
+        kernel_path: &PathBuf,
+        share_dir: &Option<PathBuf>,
+        run_path: &Option<String>,
+    ) -> Result<()> {
+        let pid = std::process::id();
+        let path = format!("/tmp/perf-{}.map", pid);
+        let mut f = File::create(&path).map_err(Error::Io)?;
+
+        // Kernel symbols (base = 0, addresses are already virtual)
+        let kernel_data = std::fs::read(kernel_path)?;
+        Self::append_elf_symbols(&mut f, &kernel_data, 0)?;
+
+        // User binary symbols
+        if let (Some(share), Some(run)) = (share_dir, run_path) {
+            let rel = run.strip_prefix('/').unwrap_or(run);
+            let user_path = share.join(rel);
+            if let Ok(user_data) = std::fs::read(&user_path) {
+                let elf = Elf::parse(&user_data)?;
+                let base: u64 = match elf.header.e_type {
+                    goblin::elf::header::ET_EXEC => 0,
+                    goblin::elf::header::ET_DYN => PIE_LOAD_BASE as u64,
+                    _ => 0,
+                };
+                Self::append_elf_symbols(&mut f, &user_data, base)?;
+
+                // Interpreter symbols
+                if let Some(interp_path) = elf.interpreter {
+                    let interp_rel = interp_path.strip_prefix('/').unwrap_or(interp_path);
+                    let interp_host = share.join(interp_rel);
+                    if let Ok(interp_data) = std::fs::read(&interp_host) {
+                        Self::append_elf_symbols(&mut f, &interp_data, INTERP_LOAD_BASE)?;
+                    }
+                }
+            }
+        }
+
+        eprintln!("[perf] wrote {}", path);
+        Ok(())
+    }
+
+    /// Build GDB command-line args and spawn GDB interactively.
+    fn launch_gdb(kernel_path: &PathBuf, user_debug: Option<&UserDebugInfo>, port: u16) {
+        let kernel_path_str = kernel_path.display().to_string();
+
+        let mut args: Vec<String> = vec![
+            "-q".into(),
+            "-ex".into(), "set confirm off".into(),
+            "-ex".into(), format!("file {}", kernel_path_str),
+            "-ex".into(), format!("target remote :{}", port),
+        ];
+
+        // If there's a user binary, set up automatic symbol loading
+        if let Some(info) = user_debug {
+            // Break at jump_to_user_asm — at this point the kernel has loaded
+            // and mapped the user ELF, so we can safely add symbols.
+            args.extend([
+                "-ex".into(), "break jump_to_user_asm".into(),
+                "-ex".into(), "continue".into(),
+                "-ex".into(), "delete breakpoints".into(),
+                "-ex".into(),
+                format!(
+                    "add-symbol-file {} {:#x}",
+                    info.binary.host_path.display(),
+                    info.binary.text_load_addr
+                ),
+            ]);
+            if let Some(ref interp) = info.interpreter {
+                args.extend([
+                    "-ex".into(),
+                    format!(
+                        "add-symbol-file {} {:#x}",
+                        interp.host_path.display(),
+                        interp.text_load_addr
+                    ),
+                ]);
+            }
+        }
+
+        eprintln!("[gdb] launching GDB...");
+        match Command::new("gdb").args(&args).status() {
+            Ok(status) => {
+                if !status.success() {
+                    eprintln!("[gdb] GDB exited with {}", status);
+                }
+            }
+            Err(e) => {
+                eprintln!("[gdb] failed to launch GDB: {}", e);
+                eprintln!("[gdb] connect manually: gdb -ex 'target remote :{}'", port);
+                // Fall back to waiting for the stub thread
+                std::thread::park();
+            }
+        }
     }
 
     fn write_boot_info(mem: &GuestMemoryMmap<()>, info: &VmCreateInfo, tsc_khz: u32) -> Result<()> {
@@ -304,5 +546,6 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 pub trait VCpu: Send {
     fn init(&mut self, entry_point: u64) -> Result<()>;
     fn run(&mut self) -> Result<()>;
+    fn run_debug(&mut self, dbg: VCpuDebugReceiver) -> Result<()>;
     fn tsc_khz(&self) -> u32;
 }

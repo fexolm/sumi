@@ -16,6 +16,10 @@ pub struct RunCommand {
     /// Path to the user program, relative to the share root.
     #[arg(long = "run", value_name = "PATH")]
     run_path: Option<String>,
+
+    /// Start GDB stub on this TCP port (e.g. --gdb 1234).
+    #[arg(long = "gdb", value_name = "PORT")]
+    gdb_port: Option<u16>,
 }
 
 impl RunCommand {
@@ -27,6 +31,7 @@ impl RunCommand {
             kernel_path: self.program,
             share_dir: self.share_dir,
             run_path: self.run_path,
+            gdb_port: self.gdb_port,
         };
 
         run_sumi_vm(&info)

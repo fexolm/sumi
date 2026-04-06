@@ -1,4 +1,7 @@
-use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::{
+    kvm_guest_debug, kvm_userspace_memory_region, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
+    KVM_GUESTDBG_USE_SW_BP,
+};
 use kvm_ioctls::VcpuExit;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +15,10 @@ use sumi_abi::arch::layout::{
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
+use crate::debug::breakpoints::{BreakpointManager, read_guest_memory, write_guest_memory};
+use crate::debug::{
+    DebugCommand, DebugEvent, RegisterFile, StopReason, VCpuDebugReceiver,
+};
 use crate::devices::DeviceRegistry;
 use crate::{
     error::Result,
@@ -194,6 +201,59 @@ impl KvmVCpu {
     }
 }
 
+impl KvmVCpu {
+    /// Enable guest debugging with software breakpoints and optional single-step.
+    fn set_debug_mode(&self, single_step: bool) -> Result<()> {
+        let mut control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP;
+        if single_step {
+            control |= KVM_GUESTDBG_SINGLESTEP;
+        }
+        let debug = kvm_guest_debug {
+            control,
+            pad: 0,
+            arch: Default::default(),
+        };
+        self.fd.set_guest_debug(&debug)?;
+        Ok(())
+    }
+
+    /// Read the current register state into our RegisterFile.
+    fn read_registers(&self) -> Result<RegisterFile> {
+        let regs = self.fd.get_regs()?;
+        let sregs = self.fd.get_sregs()?;
+        Ok(RegisterFile {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rbp: regs.rbp,
+            rsp: regs.rsp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            eflags: regs.rflags as u32,
+            cs: sregs.cs.selector as u32,
+            ss: sregs.ss.selector as u32,
+            ds: sregs.ds.selector as u32,
+            es: sregs.es.selector as u32,
+            fs: sregs.fs.selector as u32,
+            gs: sregs.gs.selector as u32,
+        })
+    }
+
+    fn get_cr3(&self) -> Result<u64> {
+        Ok(self.fd.get_sregs()?.cr3)
+    }
+}
+
 impl VCpu for KvmVCpu {
     fn tsc_khz(&self) -> u32 {
         self.fd.get_tsc_khz().unwrap_or(0)
@@ -280,6 +340,194 @@ impl VCpu for KvmVCpu {
                     eprintln!("[vm]   RIP={:#018x} RSP={:#018x}", regs.rip, regs.rsp);
                     eprintln!("[vm]   RAX={:#018x} RDI={:#018x}", regs.rax, regs.rdi);
                     return Ok(());
+                }
+                other => return Err(Error::UnexpectedExit(format!("{:?}", other))),
+            }
+        }
+    }
+
+    fn run_debug(&mut self, dbg: VCpuDebugReceiver) -> Result<()> {
+        let mut breakpoints = BreakpointManager::new();
+        // Address where we need to single-step past a breakpoint then re-insert
+        let mut stepping_past_bp: Option<u64> = false.then_some(0);
+
+        // Enable debug mode (software breakpoints intercepted by KVM)
+        self.set_debug_mode(false)?;
+
+        // Start paused — wait for GDB to send Continue
+        let mut paused = true;
+
+        loop {
+            if paused {
+                // Block until GDB sends a command
+                let cmd = match dbg.cmd_rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => return Ok(()), // channel closed
+                };
+
+                match cmd {
+                    DebugCommand::Continue => {
+                        if stepping_past_bp.is_some() {
+                            // Need to single-step one instruction past the breakpoint
+                            self.set_debug_mode(true)?;
+                        } else {
+                            self.set_debug_mode(false)?;
+                        }
+                        paused = false;
+                    }
+                    DebugCommand::SingleStep => {
+                        // If stepping past a bp, we already restored the byte
+                        self.set_debug_mode(true)?;
+                        // Clear stepping_past_bp so the step reports to GDB
+                        stepping_past_bp = None;
+                        paused = false;
+                    }
+                    DebugCommand::ReadRegisters => {
+                        let regs = self.read_registers()?;
+                        dbg.event_tx.send(DebugEvent::Registers(regs)).ok();
+                        continue;
+                    }
+                    DebugCommand::ReadMemory { addr, len } => {
+                        let cr3 = self.get_cr3()?;
+                        match read_guest_memory(&self.mem, cr3, addr, len) {
+                            Ok(data) => dbg.event_tx.send(DebugEvent::Memory(data)).ok(),
+                            Err(e) => dbg
+                                .event_tx
+                                .send(DebugEvent::Error(e.to_string()))
+                                .ok(),
+                        };
+                        continue;
+                    }
+                    DebugCommand::WriteMemory { addr, data } => {
+                        let cr3 = self.get_cr3()?;
+                        match write_guest_memory(&self.mem, cr3, addr, &data) {
+                            Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
+                            Err(e) => dbg
+                                .event_tx
+                                .send(DebugEvent::Error(e.to_string()))
+                                .ok(),
+                        };
+                        continue;
+                    }
+                    DebugCommand::InsertSwBreakpoint(addr) => {
+                        let cr3 = self.get_cr3()?;
+                        match breakpoints.insert_sw(addr, &self.mem, cr3) {
+                            Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
+                            Err(e) => dbg
+                                .event_tx
+                                .send(DebugEvent::Error(e.to_string()))
+                                .ok(),
+                        };
+                        continue;
+                    }
+                    DebugCommand::RemoveSwBreakpoint(addr) => {
+                        let cr3 = self.get_cr3()?;
+                        match breakpoints.remove_sw(addr, &self.mem, cr3) {
+                            Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
+                            Err(e) => dbg
+                                .event_tx
+                                .send(DebugEvent::Error(e.to_string()))
+                                .ok(),
+                        };
+                        continue;
+                    }
+                    DebugCommand::Detach => {
+                        // Remove all breakpoints and resume
+                        let cr3 = self.get_cr3()?;
+                        breakpoints.remove_all(&self.mem, cr3);
+                        // Disable debug mode
+                        let debug = kvm_guest_debug {
+                            control: 0,
+                            pad: 0,
+                            arch: Default::default(),
+                        };
+                        self.fd.set_guest_debug(&debug)?;
+                        // Run normally until exit
+                        return self.run();
+                    }
+                    DebugCommand::Kill => {
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+
+            // Not paused — run the vCPU
+            match self.fd.run()? {
+                VcpuExit::IoOut(0xE9, data) => {
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    let _ = lock.write_all(data);
+                    let _ = lock.flush();
+                }
+                VcpuExit::MmioRead(addr, data) => {
+                    let devs = self.devices.lock().unwrap();
+                    devs.handle_mmio_read(addr, data);
+                }
+                VcpuExit::MmioWrite(addr, data) => {
+                    let mut devs = self.devices.lock().unwrap();
+                    devs.handle_mmio_write(addr, data, &self.mem);
+                }
+                VcpuExit::Debug(debug_exit) => {
+                    // Check if we were single-stepping past a breakpoint
+                    if let Some(bp_addr) = stepping_past_bp.take() {
+                        // Re-insert the breakpoint we temporarily removed
+                        let cr3 = self.get_cr3()?;
+                        let _ = breakpoints.reinstate_sw(bp_addr, &self.mem, cr3);
+                        // Continue running (this single-step was internal, not user-requested)
+                        self.set_debug_mode(false)?;
+                        continue;
+                    }
+
+                    let pc = debug_exit.pc;
+                    paused = true;
+
+                    if debug_exit.exception == 3 && breakpoints.has_sw(pc) {
+                        // Software breakpoint hit.
+                        // RIP points to the int3 byte. We need to set up
+                        // "step past breakpoint" for when Continue is issued.
+                        // Temporarily restore original byte and single-step.
+                        let cr3 = self.get_cr3()?;
+                        let _ = breakpoints.suspend_sw(pc, &self.mem, cr3);
+                        stepping_past_bp = Some(pc);
+                        dbg.event_tx
+                            .send(DebugEvent::Stopped(StopReason::Breakpoint))
+                            .ok();
+                    } else if debug_exit.exception == 1 {
+                        // Single-step completed (user-requested)
+                        dbg.event_tx
+                            .send(DebugEvent::Stopped(StopReason::SingleStep))
+                            .ok();
+                    } else {
+                        // Other debug exception
+                        dbg.event_tx
+                            .send(DebugEvent::Stopped(StopReason::Signal(5)))
+                            .ok();
+                    }
+                }
+                VcpuExit::Hlt => {
+                    dbg.event_tx
+                        .send(DebugEvent::Stopped(StopReason::Exited))
+                        .ok();
+                    return Ok(());
+                }
+                VcpuExit::Shutdown => {
+                    eprintln!("[vm] SHUTDOWN (triple fault)");
+                    let regs = self.fd.get_regs()?;
+                    eprintln!("[vm]   RIP={:#018x} RSP={:#018x}", regs.rip, regs.rsp);
+                    eprintln!("[vm]   RAX={:#018x} RDI={:#018x}", regs.rax, regs.rdi);
+                    dbg.event_tx
+                        .send(DebugEvent::Stopped(StopReason::Signal(11)))
+                        .ok();
+                    paused = true;
+                }
+                VcpuExit::Intr => {
+                    // Signal interrupted KVM_RUN — check for pending commands
+                    match dbg.cmd_rx.try_recv() {
+                        Ok(DebugCommand::Kill) => return Ok(()),
+                        _ => {} // re-enter KVM_RUN
+                    }
                 }
                 other => return Err(Error::UnexpectedExit(format!("{:?}", other))),
             }

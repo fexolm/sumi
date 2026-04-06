@@ -1,6 +1,7 @@
 pub mod error;
 
 mod arch;
+pub mod debug;
 pub mod devices;
 mod vm;
 
