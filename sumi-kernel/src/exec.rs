@@ -215,7 +215,7 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
 }
 
 fn read_file(path: &str) -> Result<Vec<u8>, ExecError> {
-    let fs = crate::VIRTIO_FS.get().ok_or(ExecError::Fs(-5))?; // EIO
+    let fs = crate::fs();
 
     // Resolve path
     let nodeid = fs.resolve_path(path.as_bytes()).map_err(ExecError::Fs)?;
@@ -293,14 +293,14 @@ fn load_segments_at_base(
         while page_addr < end {
             let va = VirtualAddr::new(page_addr as usize);
             // Check if already mapped (two segments might share a 2 MB page)
-            if crate::KERNEL_PAGE_TABLE
+            if crate::KERNEL_PAGE_TABLE.lock()
                 .get_if_present(va)
                 .map_err(ExecError::Memory)?
                 .is_none()
             {
                 let paddr = crate::PAGE_ALLOCATOR.alloc(1).map_err(ExecError::Memory)?;
                 zero_page(paddr);
-                crate::KERNEL_PAGE_TABLE
+                crate::KERNEL_PAGE_TABLE.lock()
                     .map_2mb(va, paddr)
                     .map_err(ExecError::Memory)?;
             }
@@ -345,7 +345,7 @@ fn setup_stack(
         let vaddr = VirtualAddr::new(stack_bottom + i * PAGE_SIZE);
         let paddr = crate::PAGE_ALLOCATOR.alloc(1).map_err(ExecError::Memory)?;
         zero_page(paddr);
-        crate::KERNEL_PAGE_TABLE
+        crate::KERNEL_PAGE_TABLE.lock()
             .map_2mb(vaddr, paddr)
             .map_err(ExecError::Memory)?;
     }

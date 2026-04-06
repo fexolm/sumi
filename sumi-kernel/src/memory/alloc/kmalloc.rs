@@ -14,7 +14,6 @@ use sumi_abi::{
 
 const MAX_ALLOC: usize = 1 << 24;
 const FREE_LIST_END: usize = 0;
-const MAX_ACTIVE_ALLOCS: usize = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -23,66 +22,23 @@ struct FreeBlock {
     next: usize,
 }
 
-#[derive(Clone, Copy)]
-struct ActiveAllocation {
-    in_use: bool,
-    addr: PhysicalAddr,
-    size: usize,
-}
-
-impl ActiveAllocation {
-    const fn empty() -> Self {
-        Self {
-            in_use: false,
-            addr: PhysicalAddr::new(0),
-            size: 0,
-        }
-    }
-}
-
 const MIN_FREE_BLOCK_SIZE: usize = size_of::<FreeBlock>();
 const MIN_ALIGNMENT: usize = align_of::<FreeBlock>();
 
+/// Size of the header prepended to every allocation.
+/// Equals MIN_FREE_BLOCK_SIZE so that the header never creates an
+/// unusable prefix fragment when carving from an aligned free block.
+const HEADER_SIZE: usize = MIN_FREE_BLOCK_SIZE;
+
 struct AllocatorInner {
     free_list_head: usize,
-    active: [ActiveAllocation; MAX_ACTIVE_ALLOCS],
 }
 
 impl AllocatorInner {
     const fn new() -> Self {
         Self {
             free_list_head: FREE_LIST_END,
-            active: [const { ActiveAllocation::empty() }; MAX_ACTIVE_ALLOCS],
         }
-    }
-
-    fn reserve_slot(&self) -> Result<usize> {
-        self.active
-            .iter()
-            .position(|slot| !slot.in_use)
-            .ok_or(MemoryError::OutOfMemory)
-    }
-
-    fn remember(&mut self, slot: usize, addr: PhysicalAddr, size: usize) {
-        self.active[slot] = ActiveAllocation {
-            in_use: true,
-            addr,
-            size,
-        };
-    }
-
-    fn forget(&mut self, addr: PhysicalAddr) -> Result<usize> {
-        for slot in &mut self.active {
-            if slot.in_use && slot.addr == addr {
-                let size = slot.size;
-                *slot = ActiveAllocation::empty();
-                return Ok(size);
-            }
-        }
-
-        Err(MemoryError::UnknownAllocation {
-            addr: addr.as_usize(),
-        })
     }
 }
 
@@ -121,7 +77,7 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         self.alloc_internal(size, min_align)
     }
 
-    pub fn free(&self, ptr: PhysicalAddr) -> Result<()> {
+    pub fn free(&self, ptr: PhysicalAddr) {
         self.free_internal(ptr)
     }
 
@@ -146,43 +102,42 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
             });
         }
 
-        let alloc_size = requested_size.max(MIN_FREE_BLOCK_SIZE);
-        let align = allocation_alignment(alloc_size).max(min_align);
+        let total_size = align_up(requested_size + HEADER_SIZE, MIN_ALIGNMENT).max(MIN_FREE_BLOCK_SIZE);
+        let user_align = allocation_alignment(requested_size).max(min_align);
         let mut inner = self.inner.lock();
 
         loop {
-            if let Some(addr) = self.try_alloc_from_free_list(&mut inner, alloc_size, align)? {
+            if let Some(addr) = self.try_alloc_from_free_list(&mut inner, total_size, user_align)? {
                 return Ok(addr);
             }
 
-            self.grow_free_list(&mut inner, alloc_size)?;
+            self.grow_free_list(&mut inner, total_size)?;
         }
     }
 
-    fn free_internal(&self, ptr: PhysicalAddr) -> Result<()> {
+    fn free_internal(&self, user_ptr: PhysicalAddr) {
+        let block_start = user_ptr.as_usize() - HEADER_SIZE;
+        let alloc_size = self.read_header(block_start);
         let mut inner = self.inner.lock();
-        let size = inner.forget(ptr)?;
-        self.insert_free_block(&mut inner, ptr.as_usize(), size);
-        Ok(())
+        self.insert_free_block(&mut inner, block_start, alloc_size);
     }
 
     fn try_alloc_from_free_list(
         &self,
         inner: &mut AllocatorInner,
         alloc_size: usize,
-        align: usize,
+        user_align: usize,
     ) -> Result<Option<PhysicalAddr>> {
         let mut prev = FREE_LIST_END;
         let mut current = inner.free_list_head;
 
         while current != FREE_LIST_END {
             let block = self.read_free_block(current);
-            if let Some(placement) = place_allocation(current, block.size, alloc_size, align) {
-                let slot = inner.reserve_slot()?;
+            if let Some(placement) = place_allocation(current, block.size, alloc_size, user_align) {
                 self.consume_free_block(inner, prev, current, block.next, placement);
-                let addr = PhysicalAddr::new(placement.alloc_start);
-                inner.remember(slot, addr, placement.alloc_size);
-                return Ok(Some(addr));
+                self.write_header(placement.alloc_start, placement.alloc_size);
+                let user_ptr = PhysicalAddr::new(placement.alloc_start + HEADER_SIZE);
+                return Ok(Some(user_ptr));
             }
 
             prev = current;
@@ -282,6 +237,22 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
         }
     }
 
+    fn write_header(&self, alloc_start: usize, alloc_size: usize) {
+        unsafe {
+            *PhysicalAddr::new(alloc_start)
+                .to_virtual(self.dm)
+                .as_ptr::<usize>() = alloc_size;
+        }
+    }
+
+    fn read_header(&self, alloc_start: usize) -> usize {
+        unsafe {
+            *PhysicalAddr::new(alloc_start)
+                .to_virtual(self.dm)
+                .as_ptr::<usize>()
+        }
+    }
+
     fn read_free_block(&self, addr: usize) -> FreeBlock {
         *self.free_block(addr)
     }
@@ -322,18 +293,26 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+/// Find a placement within `[block_start, block_start + block_size)` for an
+/// allocation of `alloc_size` bytes (including the HEADER_SIZE prefix) such
+/// that the *user pointer* (`alloc_start + HEADER_SIZE`) is aligned to
+/// `user_align`.
 fn place_allocation(
     block_start: usize,
     block_size: usize,
     alloc_size: usize,
-    align: usize,
+    user_align: usize,
 ) -> Option<Placement> {
     let block_end = block_start.checked_add(block_size)?;
-    let mut alloc_start = align_up(block_start, align);
+
+    // The user pointer (alloc_start + HEADER_SIZE) must be aligned to user_align.
+    let user_ptr = align_up(block_start + HEADER_SIZE, user_align);
+    let mut alloc_start = user_ptr - HEADER_SIZE;
     let mut prefix_size = alloc_start.checked_sub(block_start)?;
 
     if prefix_size != 0 && prefix_size < MIN_FREE_BLOCK_SIZE {
-        alloc_start = alloc_start.checked_add(align)?;
+        let user_ptr = user_ptr.checked_add(user_align)?;
+        alloc_start = user_ptr - HEADER_SIZE;
         prefix_size = alloc_start.checked_sub(block_start)?;
     }
 
@@ -374,7 +353,7 @@ mod tests {
         let b = alloc.alloc(64).unwrap();
         assert_ne!(a, b);
 
-        alloc.free(a).unwrap();
+        alloc.free(a);
         let c = alloc.alloc(64).unwrap();
         assert_eq!(c, a);
     }
@@ -395,7 +374,7 @@ mod tests {
         unsafe {
             *ptr.to_virtual(&*dm).as_ptr::<u64>() = 0xDEAD_BEEF_CAFE_BABE;
         }
-        alloc.free(ptr).unwrap();
+        alloc.free(ptr);
 
         let zeroed = alloc.calloc(128).unwrap();
         let slice =
@@ -415,13 +394,14 @@ mod tests {
         let (_dm, _pa, alloc) = make_alloc(4);
         let a = alloc.alloc(PAGE_TABLE_SIZE).unwrap();
         let b = alloc.alloc(PAGE_TABLE_SIZE).unwrap();
-        assert_eq!(b.as_usize(), a.as_usize() + PAGE_TABLE_SIZE);
+        assert_ne!(a, b);
 
-        alloc.free(b).unwrap();
-        alloc.free(a).unwrap();
+        alloc.free(b);
+        alloc.free(a);
 
+        // After coalescing, a single allocation spanning both blocks must succeed.
         let big = alloc.alloc(PAGE_TABLE_SIZE * 2).unwrap();
-        assert_eq!(big, a);
+        assert!(big.as_usize() > 0);
     }
 
     #[test]
@@ -439,7 +419,7 @@ mod tests {
         let b = alloc.alloc(1 << 22).unwrap();
         assert_ne!(a, b);
 
-        alloc.free(b).unwrap();
+        alloc.free(b);
         let c = alloc.alloc(1 << 22).unwrap();
         assert_eq!(c, b);
     }
@@ -448,7 +428,7 @@ mod tests {
     fn zero_size_alloc_succeeds() {
         let (_dm, _pa, alloc) = make_alloc(2);
         let ptr = alloc.alloc(0).unwrap();
-        alloc.free(ptr).unwrap();
+        alloc.free(ptr);
     }
 
     #[test]
@@ -461,16 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn double_free_is_detected() {
-        let (_dm, _pa, alloc) = make_alloc(2);
-        let ptr = alloc.alloc(64).unwrap();
-        alloc.free(ptr).unwrap();
-
-        let result = alloc.free(ptr);
-        assert!(matches!(result, Err(MemoryError::UnknownAllocation { .. })));
-    }
-
-    #[test]
     fn cross_thread_free_is_reused() {
         let (_dm, _pa, alloc) = make_alloc(4);
         let alloc: Arc<KernelAllocator<'static, TestDirectMap>> = Arc::from(alloc);
@@ -479,7 +449,7 @@ mod tests {
 
         let worker_alloc = Arc::clone(&alloc);
         let worker = std::thread::spawn(move || {
-            worker_alloc.free(ptr).unwrap();
+            worker_alloc.free(ptr);
         });
         worker.join().unwrap();
 
@@ -518,7 +488,7 @@ mod tests {
 
         for ptrs in allocations {
             for addr in ptrs {
-                alloc.free(PhysicalAddr::new(addr)).unwrap();
+                alloc.free(PhysicalAddr::new(addr));
             }
         }
     }

@@ -24,7 +24,7 @@ unsafe impl GlobalAlloc for GlobalKernelAlloc {
         use sumi_abi::address::VirtualAddr;
         let vaddr = VirtualAddr::new(ptr as usize);
         if let Some(paddr) = vaddr.to_physical(sumi_kernel::KERNEL_ALLOCATOR.direct_map()) {
-            let _ = sumi_kernel::KERNEL_ALLOCATOR.free(paddr);
+            sumi_kernel::KERNEL_ALLOCATOR.free(paddr);
         }
     }
 }
@@ -35,6 +35,7 @@ static GLOBAL_ALLOC: GlobalKernelAlloc = GlobalKernelAlloc;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     syscall::init();
+    sumi_kernel::FD_TABLE.lock().init_defaults();
 
     // Initialize virtio-fs if the device is present
     if let Some(fs) = VirtioFsClient::init(&sumi_kernel::KERNEL_ALLOCATOR) {

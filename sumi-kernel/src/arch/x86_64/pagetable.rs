@@ -193,12 +193,12 @@ impl PageTable {
             for i in 0..end {
                 let entry = self.entries[i];
                 if entry.is_present() {
-                    kalloc.free(entry.addr())?;
+                    kalloc.free(entry.addr());
                 }
             }
         }
 
-        kalloc.free(to_physical_checked(self.self_vaddr(), kalloc.direct_map())?)?;
+        kalloc.free(to_physical_checked(self.self_vaddr(), kalloc.direct_map())?);
         Ok(())
     }
 
@@ -307,7 +307,8 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
 
 impl<DM: DirectMap> Drop for RootPageTable<'_, DM> {
     fn drop(&mut self) {
-        self.get_pml4().free(self.kalloc).unwrap();
+        // PageTable::free can only fail if v2p fails, which is a bug.
+        self.get_pml4().free(self.kalloc).expect("page table free");
     }
 }
 
@@ -337,7 +338,7 @@ mod tests {
     }
 
     /// Allocates a "data page" through kalloc so that the page-table Drop can
-    /// free the PD entry without hitting UnknownAllocation.
+    /// free the PD entry.
     fn alloc_data_page<'a>(
         kalloc: &'a KernelAllocator<'a, TestDirectMap>,
     ) -> PhysicalAddr {
@@ -393,7 +394,7 @@ mod tests {
             "unmap_2mb should return the physical address that was mapped"
         );
         // Free the data page ourselves — unmap_2mb does not free it.
-        kalloc.free(pdata).expect("free data page after unmap");
+        kalloc.free(pdata);
     }
 
     #[test]
@@ -416,7 +417,7 @@ mod tests {
 
         pt.map_2mb(VADDR_A, pdata).unwrap();
         let first = pt.unmap_2mb(VADDR_A).unwrap();
-        kalloc.free(first).unwrap();
+        kalloc.free(first);
 
         let result = pt.unmap_2mb(VADDR_A);
         assert!(
@@ -465,7 +466,7 @@ mod tests {
 
         let returned = pt.unmap_2mb(VADDR_A).expect("unmap");
         assert_eq!(returned, pdata1);
-        kalloc.free(returned).expect("free first data page");
+        kalloc.free(returned);
 
         pt.map_2mb(VADDR_A, pdata2).expect("remap after unmap should succeed");
         assert_eq!(
@@ -498,7 +499,7 @@ mod tests {
         pt.map_2mb(VADDR_B, pdata_b).expect("map B");
 
         let returned_a = pt.unmap_2mb(VADDR_A).expect("unmap A");
-        kalloc.free(returned_a).expect("free A data page");
+        kalloc.free(returned_a);
 
         // B must still be intact after A is unmapped.
         assert_eq!(

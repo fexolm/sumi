@@ -150,7 +150,7 @@ impl VirtioFsClient {
             // User-space address — walk the page table.
             use sumi_abi::arch::layout::PAGE_SIZE;
             let va = VirtualAddr::new(addr);
-            let entry = crate::KERNEL_PAGE_TABLE
+            let entry = crate::KERNEL_PAGE_TABLE.lock()
                 .get_if_present(va)
                 .expect("v2p: page table walk failed")
                 .expect("v2p: address not mapped");

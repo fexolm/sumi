@@ -6,7 +6,6 @@ pub enum MemoryError {
     InvalidPageCount { pages: usize },
     OutOfMemory,
     AllocationTooLarge { requested: usize, max: usize },
-    UnknownAllocation { addr: usize },
     AlreadyMapped { addr: usize },
     NotMapped { addr: usize },
 }
@@ -25,9 +24,6 @@ impl fmt::Display for MemoryError {
                 f,
                 "allocation too large: requested {requested} bytes, max {max} bytes"
             ),
-            Self::UnknownAllocation { addr } => {
-                write!(f, "unknown allocation at physical address {addr:#x}")
-            }
             Self::AlreadyMapped { addr } => {
                 write!(f, "virtual address {addr:#x} is already mapped")
             }

@@ -1,7 +1,7 @@
+use alloc::vec::Vec;
+
 pub mod dax;
 pub mod virtio_fs;
-
-pub const MAX_FDS: usize = 256;
 
 #[derive(Clone, Copy)]
 pub enum FdKind {
@@ -28,66 +28,62 @@ pub struct FileDescriptor {
 }
 
 pub struct FdTable {
-    fds: [Option<FileDescriptor>; MAX_FDS],
+    fds: Vec<Option<FileDescriptor>>,
 }
 
-#[allow(clippy::new_without_default)] // const fn with non-trivial init for static
 impl FdTable {
     pub const fn new() -> Self {
-        let mut fds = [const { None }; MAX_FDS];
-        fds[0] = Some(FileDescriptor {
+        Self { fds: Vec::new() }
+    }
+
+    /// Set up stdin/stdout/stderr. Must be called once after the allocator is ready.
+    pub fn init_defaults(&mut self) {
+        self.fds.push(Some(FileDescriptor {
             kind: FdKind::Console,
             flags: 0,
-        }); // stdin
-        fds[1] = Some(FileDescriptor {
+        })); // stdin
+        self.fds.push(Some(FileDescriptor {
             kind: FdKind::Console,
             flags: 1,
-        }); // stdout (O_WRONLY)
-        fds[2] = Some(FileDescriptor {
+        })); // stdout (O_WRONLY)
+        self.fds.push(Some(FileDescriptor {
             kind: FdKind::Console,
             flags: 1,
-        }); // stderr (O_WRONLY)
-        Self { fds }
+        })); // stderr (O_WRONLY)
     }
 
     pub fn get(&self, fd: usize) -> Option<&FileDescriptor> {
-        if fd >= MAX_FDS {
-            return None;
-        }
-        self.fds[fd].as_ref()
+        self.fds.get(fd)?.as_ref()
     }
 
     pub fn get_mut(&mut self, fd: usize) -> Option<&mut FileDescriptor> {
-        if fd >= MAX_FDS {
-            return None;
-        }
-        self.fds[fd].as_mut()
+        self.fds.get_mut(fd)?.as_mut()
     }
 
     /// Allocate the lowest available fd, matching Linux's guarantee.
-    pub fn alloc(&mut self, desc: FileDescriptor) -> Option<usize> {
+    pub fn alloc(&mut self, desc: FileDescriptor) -> usize {
         for (i, slot) in self.fds.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(desc);
-                return Some(i);
+                return i;
             }
         }
-        None
+        let fd = self.fds.len();
+        self.fds.push(Some(desc));
+        fd
     }
 
     /// Free an fd slot and return the old descriptor.
     pub fn free(&mut self, fd: usize) -> Option<FileDescriptor> {
-        if fd >= MAX_FDS {
-            return None;
-        }
-        self.fds[fd].take()
+        self.fds.get_mut(fd)?.take()
     }
 
     /// Place a descriptor at a specific fd number. If the slot is occupied,
     /// the old descriptor is returned so the caller can clean it up.
     pub fn put(&mut self, fd: usize, desc: FileDescriptor) -> Option<FileDescriptor> {
-        if fd >= MAX_FDS {
-            return None;
+        // Grow the table if needed.
+        if fd >= self.fds.len() {
+            self.fds.resize(fd + 1, None);
         }
         let old = self.fds[fd].take();
         self.fds[fd] = Some(desc);
@@ -110,9 +106,15 @@ impl FdTable {
 mod tests {
     use super::*;
 
+    fn make_table() -> FdTable {
+        let mut t = FdTable::new();
+        t.init_defaults();
+        t
+    }
+
     #[test]
     fn default_fds_are_console() {
-        let table = FdTable::new();
+        let table = make_table();
         for fd in 0..3 {
             let desc = table.get(fd).expect("fd 0-2 should exist");
             assert!(matches!(desc.kind, FdKind::Console));
@@ -121,68 +123,65 @@ mod tests {
 
     #[test]
     fn alloc_returns_lowest_free() {
-        let mut table = FdTable::new();
+        let mut table = make_table();
         let desc = FileDescriptor {
             kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
             flags: 0,
         };
         // First alloc should return fd 3 (0-2 are console)
-        assert_eq!(table.alloc(desc), Some(3));
-        assert_eq!(table.alloc(desc), Some(4));
+        assert_eq!(table.alloc(desc), 3);
+        assert_eq!(table.alloc(desc), 4);
     }
 
     #[test]
     fn free_and_realloc_reuses_slot() {
-        let mut table = FdTable::new();
+        let mut table = make_table();
         let desc = FileDescriptor {
             kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
             flags: 0,
         };
-        let fd = table.alloc(desc).unwrap();
+        let fd = table.alloc(desc);
         assert_eq!(fd, 3);
         table.free(fd);
         // Re-alloc should reuse fd 3
-        assert_eq!(table.alloc(desc), Some(3));
+        assert_eq!(table.alloc(desc), 3);
     }
 
     #[test]
     fn get_invalid_fd_returns_none() {
-        let table = FdTable::new();
-        assert!(table.get(MAX_FDS).is_none());
-        assert!(table.get(MAX_FDS + 1).is_none());
+        let table = make_table();
+        assert!(table.get(1000).is_none());
         assert!(table.get(3).is_none()); // unallocated
     }
 
     #[test]
     fn free_unallocated_returns_none() {
-        let mut table = FdTable::new();
+        let mut table = make_table();
         assert!(table.free(3).is_none());
-        assert!(table.free(MAX_FDS).is_none());
+        assert!(table.free(1000).is_none());
     }
 
     #[test]
-    fn alloc_full_returns_none() {
-        let mut table = FdTable::new();
+    fn alloc_grows_table() {
+        let mut table = make_table();
         let desc = FileDescriptor {
             kind: FdKind::Console,
             flags: 0,
         };
-        // Fill all remaining slots (3..MAX_FDS)
-        for _ in 3..MAX_FDS {
-            assert!(table.alloc(desc).is_some());
+        // Alloc many fds — table should grow without limit.
+        for expected_fd in 3..300 {
+            assert_eq!(table.alloc(desc), expected_fd);
         }
-        // Table is full
-        assert!(table.alloc(desc).is_none());
     }
 
     #[test]
     fn get_mut_updates_offset() {
-        let mut table = FdTable::new();
+        let mut table = make_table();
         let desc = FileDescriptor {
             kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
             flags: 0,
         };
-        let fd = table.alloc(desc).unwrap();
+        let fd = table.alloc(desc);
         if let Some(d) = table.get_mut(fd) {
             if let FdKind::File { ref mut offset, .. } = d.kind {
                 *offset = 42;

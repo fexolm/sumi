@@ -78,18 +78,11 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     };
 
     // If MAP_FIXED, tear down any overlapping VMAs first.
-    // Loop because remove_overlapping only returns up to 4 at a time.
     if flags & MAP_FIXED != 0 {
         let vaddr_end = VirtualAddr::new(vaddr.as_usize() + aligned_len);
-        loop {
-            let removed = crate::VMA_TABLE.lock().remove_overlapping(vaddr, vaddr_end);
-            let any_found = removed.iter().any(|r| r.is_some());
-            for maybe_vma in removed.into_iter().flatten() {
-                tear_down_vma(maybe_vma);
-            }
-            if !any_found {
-                break;
-            }
+        let removed = crate::VMA_TABLE.lock().remove_overlapping(vaddr, vaddr_end);
+        for vma in removed {
+            tear_down_vma(vma);
         }
     }
 
@@ -106,18 +99,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
             end: VirtualAddr::new(vaddr.as_usize() + aligned_len),
             backing: MappingBacking::Anonymous,
         };
-        if crate::VMA_TABLE.lock().insert(vma).is_err() {
-            // VMA table full: roll back the pages we just mapped.
-            let mut v = vaddr;
-            for _ in 0..pages {
-                if let Ok(p) = crate::KERNEL_PAGE_TABLE.unmap_2mb(v) {
-                    let _ = crate::PAGE_ALLOCATOR.free(p);
-                }
-                v = v.add(PAGE_SIZE);
-            }
-            restore_mmap_next(saved_next);
-            return ENOMEM;
-        }
+        crate::VMA_TABLE.lock().insert(vma);
 
         return vaddr.as_u64() as SyscallResult;
     }
@@ -184,7 +166,7 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
     let mut page_addr = aligned_start;
     while page_addr < aligned_end {
         let va = VirtualAddr::new(page_addr as usize);
-        match crate::KERNEL_PAGE_TABLE.get_if_present(va) {
+        match crate::KERNEL_PAGE_TABLE.lock().get_if_present(va) {
             Ok(Some(entry)) => {
                 // Page exists. Check if it's a DAX page that needs COW.
                 let paddr = entry.addr();
@@ -202,7 +184,7 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
                     Err(_) => return ENOMEM,
                 };
                 zero_page(paddr);
-                if crate::KERNEL_PAGE_TABLE.map_2mb(va, paddr).is_err() {
+                if crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, paddr).is_err() {
                     let _ = crate::PAGE_ALLOCATOR.free(paddr);
                     return ENOMEM;
                 }
@@ -213,7 +195,8 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
     }
 
     // Read file data at the exact requested address.
-    if let Some(fs) = crate::VIRTIO_FS.get() {
+    {
+        let fs = crate::fs();
         let read_len = (len as u64).min(u32::MAX as u64) as u32;
         if fs_transfer_chunked(
             |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
@@ -257,10 +240,10 @@ fn replace_dax_with_private(
     }
 
     // Replace mapping: unmap old, map new.
-    crate::KERNEL_PAGE_TABLE.unmap_2mb(va).map_err(|_| ENOMEM)?;
-    if let Err(_) = crate::KERNEL_PAGE_TABLE.map_2mb(va, new_paddr) {
+    crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(va).map_err(|_| ENOMEM)?;
+    if let Err(_) = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, new_paddr) {
         // Try to restore the old DAX mapping to avoid leaving the page unmapped.
-        let _ = crate::KERNEL_PAGE_TABLE.map_2mb(va, dax_paddr);
+        let _ = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, dax_paddr);
         let _ = crate::PAGE_ALLOCATOR.free(new_paddr);
         return Err(ENOMEM);
     }
@@ -326,7 +309,7 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
 fn unmap_pages_in_range(start: usize, end: usize) {
     let mut vaddr = start;
     while vaddr < end {
-        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr)) {
+        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
             if !is_dax_page(paddr) {
                 let _ = crate::PAGE_ALLOCATOR.free(paddr);
             }
@@ -359,7 +342,7 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
                 }
             };
             zero_page(paddr);
-            if crate::KERNEL_PAGE_TABLE
+            if crate::KERNEL_PAGE_TABLE.lock()
                 .map_2mb(VirtualAddr::new(vaddr as usize), paddr)
                 .is_err()
             {
@@ -373,7 +356,7 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
         let mut vaddr = new_end;
         while vaddr < old_end {
             if let Ok(paddr) =
-                crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr as usize))
+                crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr as usize))
             {
                 let _ = crate::PAGE_ALLOCATOR.free(paddr);
             }
@@ -414,7 +397,7 @@ fn tear_down_vma(vma: Vma) {
             // Unmap and free physical pages.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
-                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr)) {
+                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
                     let _ = crate::PAGE_ALLOCATOR.free(paddr);
                 }
                 vaddr += PAGE_SIZE;
@@ -424,7 +407,7 @@ fn tear_down_vma(vma: Vma) {
             // Unmap all pages. Some may be original DAX, some replaced private copies.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
-                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(vaddr)) {
+                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
                     if !is_dax_page(paddr) {
                         // This page was replaced with a private copy — free it.
                         let _ = crate::PAGE_ALLOCATOR.free(paddr);
@@ -434,10 +417,9 @@ fn tear_down_vma(vma: Vma) {
                 vaddr += PAGE_SIZE;
             }
             // Ask the host to unmap from the DAX window.
-            if let Some(fs) = crate::VIRTIO_FS.get() {
-                let len = (aligned_end - aligned_start) as u64;
-                let _ = fs.remove_mapping(dax_offset, len);
-            }
+            let fs = crate::fs();
+            let len = (aligned_end - aligned_start) as u64;
+            let _ = fs.remove_mapping(dax_offset, len);
             // Return the DAX slots.
             let slot_count = (aligned_end - aligned_start) / PAGE_SIZE;
             crate::DAX_ALLOCATOR.lock().free(dax_offset, slot_count);
@@ -454,7 +436,7 @@ fn map_anonymous_pages(vaddr: VirtualAddr, pages: usize) -> Result<(), SyscallRe
             Ok(p) => p,
             Err(_) => {
                 for j in 0..i {
-                    if let Ok(p) = crate::KERNEL_PAGE_TABLE.unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
+                    if let Ok(p) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
                         let _ = crate::PAGE_ALLOCATOR.free(p);
                     }
                 }
@@ -462,10 +444,10 @@ fn map_anonymous_pages(vaddr: VirtualAddr, pages: usize) -> Result<(), SyscallRe
             }
         };
         zero_page(paddr);
-        if crate::KERNEL_PAGE_TABLE.map_2mb(page_vaddr, paddr).is_err() {
+        if crate::KERNEL_PAGE_TABLE.lock().map_2mb(page_vaddr, paddr).is_err() {
             let _ = crate::PAGE_ALLOCATOR.free(paddr);
             for j in 0..i {
-                if let Ok(p) = crate::KERNEL_PAGE_TABLE.unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
+                if let Ok(p) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
                     let _ = crate::PAGE_ALLOCATOR.free(p);
                 }
             }
@@ -495,7 +477,8 @@ fn private_copy_path(
     }
 
     // Read file content into the freshly mapped pages.
-    if let Some(fs) = crate::VIRTIO_FS.get() {
+    {
+        let fs = crate::fs();
         let read_len = file_len.min(aligned_len as u64).min(u32::MAX as u64) as u32;
         let _ = fs_transfer_chunked(
             |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
@@ -510,18 +493,7 @@ fn private_copy_path(
         end: VirtualAddr::new(vaddr.as_usize() + aligned_len),
         backing: MappingBacking::PrivateFile { fuse_fh, fuse_nodeid },
     };
-    if crate::VMA_TABLE.lock().insert(vma).is_err() {
-        // VMA table full: roll back pages and address reservation.
-        let mut v = vaddr;
-        for _ in 0..pages {
-            if let Ok(p) = crate::KERNEL_PAGE_TABLE.unmap_2mb(v) {
-                let _ = crate::PAGE_ALLOCATOR.free(p);
-            }
-            v = v.add(PAGE_SIZE);
-        }
-        restore_mmap_next(saved_next);
-        return ENOMEM;
-    }
+    crate::VMA_TABLE.lock().insert(vma);
 
     (vaddr.as_u64() + sub_page_offset as u64) as SyscallResult
 }
@@ -547,13 +519,7 @@ fn dax_path(
 
     let dax_offset = crate::DAX_ALLOCATOR.lock().alloc(pages).map_err(|_| ())?;
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => {
-            crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
-            return Err(());
-        }
-    };
+    let fs = crate::fs();
 
     if fs.setup_mapping(fuse_fh, file_offset, file_len, dax_offset, dax_flags).is_err() {
         crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
@@ -564,10 +530,10 @@ fn dax_path(
     for i in 0..pages {
         let page_vaddr = vaddr.add(i * PAGE_SIZE);
         let dax_phys = DAX_WINDOW_BASE.add(dax_offset + i * PAGE_SIZE);
-        if crate::KERNEL_PAGE_TABLE.map_2mb(page_vaddr, dax_phys).is_err() {
+        if crate::KERNEL_PAGE_TABLE.lock().map_2mb(page_vaddr, dax_phys).is_err() {
             // Rollback already-mapped DAX pages.
             for j in 0..i {
-                let _ = crate::KERNEL_PAGE_TABLE.unmap_2mb(vaddr.add(j * PAGE_SIZE));
+                let _ = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE));
             }
             let _ = fs.remove_mapping(dax_offset, aligned_len as u64);
             crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
@@ -585,15 +551,7 @@ fn dax_path(
             file_offset,
         },
     };
-    if crate::VMA_TABLE.lock().insert(vma).is_err() {
-        // VMA table full: roll back DAX page table mappings, host mapping, and slot allocation.
-        for j in 0..pages {
-            let _ = crate::KERNEL_PAGE_TABLE.unmap_2mb(vaddr.add(j * PAGE_SIZE));
-        }
-        let _ = fs.remove_mapping(dax_offset, aligned_len as u64);
-        crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
-        return Err(());
-    }
+    crate::VMA_TABLE.lock().insert(vma);
 
     Ok((vaddr.as_u64() + sub_page_offset as u64) as SyscallResult)
 }
@@ -609,7 +567,7 @@ fn restore_mmap_next(saved_next: Option<VirtualAddr>) {
 fn rollback_pages(from: u64, to: u64) {
     let mut v = from;
     while v < to {
-        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.unmap_2mb(VirtualAddr::new(v as usize)) {
+        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(v as usize)) {
             let _ = crate::PAGE_ALLOCATOR.free(paddr);
         }
         v += PAGE_SIZE as u64;

@@ -1,9 +1,9 @@
 use crate::fs::virtio_fs::VirtioFsClient;
-use crate::selftest::{fs, syscall, syscall6};
+use crate::selftest::{syscall, syscall6};
 use sumi_abi::fuse::FUSE_ROOT_ID;
 
 pub(super) fn test_lseek() -> bool {
-    let fs = fs();
+    let fs = crate::fs();
     let flags: u32 = 2 | 0o100 | 0o1000;
     let (entry, open) = match fs.create(FUSE_ROOT_ID, b"syscall_lseek.txt", flags, 0o644) {
         Ok(v) => v,

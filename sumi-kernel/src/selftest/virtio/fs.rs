@@ -1,13 +1,9 @@
 use crate::kprint;
 use crate::fs::virtio_fs::VirtioFsClient;
-use crate::selftest::{SelfTest, fs};
+use crate::selftest::SelfTest;
 use sumi_abi::fuse::FUSE_ROOT_ID;
 
-pub(crate) const TESTS: [SelfTest; 3] = [
-    SelfTest {
-        name: "init",
-        func: test_init,
-    },
+pub(crate) const TESTS: [SelfTest; 2] = [
     SelfTest {
         name: "create_write_read",
         func: test_create_write_read,
@@ -18,12 +14,8 @@ pub(crate) const TESTS: [SelfTest; 3] = [
     },
 ];
 
-fn test_init() -> bool {
-    crate::VIRTIO_FS.get().is_some()
-}
-
 fn test_create_write_read() -> bool {
-    let fs = fs();
+    let fs = crate::fs();
 
     let flags: u32 = 2 | 0o100 | 0o1000; // O_RDWR | O_CREAT | O_TRUNC
     let (entry, open) = match fs.create(FUSE_ROOT_ID, b"selftest_rw.txt", flags, 0o644) {
@@ -60,7 +52,7 @@ fn test_create_write_read() -> bool {
 }
 
 fn test_read_print() -> bool {
-    let fs = fs();
+    let fs = crate::fs();
 
     let flags: u32 = 2 | 0o100 | 0o1000;
     let (entry, open) = match fs.create(FUSE_ROOT_ID, b"selftest_print.txt", flags, 0o644) {

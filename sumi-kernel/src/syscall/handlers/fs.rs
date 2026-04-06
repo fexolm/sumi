@@ -70,10 +70,7 @@ fn forget_if_not_root(fs: &crate::fs::virtio_fs::VirtioFsClient, nodeid: u64) {
 
 /// Internal stat-by-path implementation shared by stat, lstat, newfstatat.
 fn do_stat_path(path: &[u8], buf_addr: u64) -> SyscallResult {
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     let nodeid = match fs.resolve_path(path) {
         Ok(id) => id,
@@ -144,10 +141,7 @@ pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
         }
     };
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     let attr_out = match fs.getattr(nodeid) {
         Ok(a) => a,
@@ -170,10 +164,7 @@ pub fn sys_access(args: &SyscallArgs) -> SyscallResult {
         Err(e) => return e,
     };
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     // Just check existence by resolving the path.
     let nodeid = match fs.resolve_path(path) {
@@ -211,10 +202,7 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
         }
     };
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     // Use a kernel-side buffer for the FUSE readdir response.
     // We read FUSE dirents and convert them to linux_dirent64 format.
@@ -346,10 +334,7 @@ pub fn sys_chdir(args: &SyscallArgs) -> SyscallResult {
         Err(e) => return e,
     };
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     let nodeid = match fs.resolve_path(path) {
         Ok(id) => id,
@@ -384,10 +369,7 @@ pub fn sys_creat(args: &SyscallArgs) -> SyscallResult {
     };
     let mode = args.arg1 as u32;
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     // Resolve parent directory and file name
     let (parent_path, filename) = match split_path(path) {
@@ -420,14 +402,7 @@ pub fn sys_creat(args: &SyscallArgs) -> SyscallResult {
     };
 
     let mut table = crate::FD_TABLE.lock();
-    match table.alloc(desc) {
-        Some(fd) => fd as SyscallResult,
-        None => {
-            fs.release(open.fh);
-            forget_if_not_root(fs, entry.nodeid);
-            EMFILE
-        }
-    }
+    table.alloc(desc) as SyscallResult
 }
 
 pub fn sys_link(_args: &SyscallArgs) -> SyscallResult {
@@ -461,10 +436,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
         return ENOSYS;
     }
 
-    let fs = match crate::VIRTIO_FS.get() {
-        Some(fs) => fs,
-        None => return EIO,
-    };
+    let fs = crate::fs();
 
     // Check if this is a directory open (O_DIRECTORY = 0o200000)
     let is_dir_open = flags & 0o200000 != 0;
@@ -499,14 +471,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
                 flags,
             };
             let mut table = crate::FD_TABLE.lock();
-            return match table.alloc(desc) {
-                Some(fd) => fd as SyscallResult,
-                None => {
-                    fs.release(open.fh);
-                    fs.forget(entry.nodeid, 1);
-                    EMFILE
-                }
-            };
+            return table.alloc(desc) as SyscallResult;
         }
         Err(e) => return e as SyscallResult,
     };
@@ -530,14 +495,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
         };
 
         let mut table = crate::FD_TABLE.lock();
-        match table.alloc(desc) {
-            Some(fd) => fd as SyscallResult,
-            None => {
-                fs.releasedir(open_out.fh);
-                forget_if_not_root(fs, nodeid);
-                EMFILE
-            }
-        }
+        table.alloc(desc) as SyscallResult
     } else {
         let open_out = match fs.open(nodeid, flags) {
             Ok(o) => o,
@@ -557,14 +515,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
         };
 
         let mut table = crate::FD_TABLE.lock();
-        match table.alloc(desc) {
-            Some(fd) => fd as SyscallResult,
-            None => {
-                fs.release(open_out.fh);
-                forget_if_not_root(fs, nodeid);
-                EMFILE
-            }
-        }
+        table.alloc(desc) as SyscallResult
     }
 }
 

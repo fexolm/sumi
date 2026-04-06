@@ -23,19 +23,13 @@ fn test_fd_alloc_free() -> bool {
         flags: 0,
     };
 
-    let fd = match table.alloc(desc) {
-        Some(fd) => fd,
-        None => return false,
-    };
+    let fd = table.alloc(desc);
     if fd != 3 {
         return false;
     }
     table.free(fd);
 
-    let fd2 = match table.alloc(desc) {
-        Some(fd) => fd,
-        None => return false,
-    };
+    let fd2 = table.alloc(desc);
     table.free(fd2);
     fd2 == 3
 }

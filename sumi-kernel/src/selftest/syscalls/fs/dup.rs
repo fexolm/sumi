@@ -1,9 +1,9 @@
 use crate::fs::virtio_fs::VirtioFsClient;
-use crate::selftest::{fs, syscall};
+use crate::selftest::syscall;
 use sumi_abi::fuse::FUSE_ROOT_ID;
 
 pub(super) fn test_dup2_read() -> bool {
-    let fs = fs();
+    let fs = crate::fs();
     let flags: u32 = 2 | 0o100 | 0o1000;
     let (entry, open) = match fs.create(FUSE_ROOT_ID, b"selftest_dup.txt", flags, 0o644) {
         Ok(v) => v,

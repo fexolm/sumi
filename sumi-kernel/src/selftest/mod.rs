@@ -2,7 +2,6 @@
 ///
 /// Each suite runs if its preconditions are met. Suites are independent.
 use crate::{kprint, kprintln};
-use crate::fs::virtio_fs::VirtioFsClient;
 use crate::syscall::{SyscallArgs, syscall_dispatch};
 
 mod fd_table;
@@ -30,21 +29,15 @@ fn run_suite(name: &str, tests: &[SelfTest]) -> bool {
     all_passed
 }
 
-/// Run all selftest suites. Each suite checks its own preconditions.
+/// Run all selftest suites.
 pub fn run_all() -> bool {
     kprintln!("\n=== kernel selftests ===");
     let mut all_passed = true;
 
     all_passed &= run_suite("fd_table", &fd_table::TESTS);
     all_passed &= run_suite("syscall_io", &syscalls::io::TESTS);
-
-    if crate::VIRTIO_FS.get().is_some() {
-        all_passed &= run_suite("virtio_fs", &virtio::fs::TESTS);
-        all_passed &= run_suite("syscall_fs", &syscalls::fs::TESTS);
-    } else {
-        kprintln!("[suite] virtio_fs ... skipped (no device)");
-        kprintln!("[suite] syscall_fs ... skipped (no device)");
-    }
+    all_passed &= run_suite("virtio_fs", &virtio::fs::TESTS);
+    all_passed &= run_suite("syscall_fs", &syscalls::fs::TESTS);
 
     if all_passed {
         kprintln!("=== all tests passed ===");
@@ -52,12 +45,6 @@ pub fn run_all() -> bool {
         kprintln!("=== SOME TESTS FAILED ===");
     }
     all_passed
-}
-
-// ── helpers used by submodules ──────────────────────────────────
-
-pub(crate) fn fs() -> &'static VirtioFsClient {
-    crate::VIRTIO_FS.get().unwrap()
 }
 
 pub(crate) fn syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {

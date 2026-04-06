@@ -1,10 +1,10 @@
 use crate::fs::virtio_fs::VirtioFsClient;
-use crate::selftest::{fs, syscall};
+use crate::selftest::syscall;
 use sumi_abi::fuse::FUSE_ROOT_ID;
 use sumi_abi::stat::Stat;
 
 pub(super) fn test_fstat_file_size() -> bool {
-    let fs = fs();
+    let fs = crate::fs();
     let flags: u32 = 2 | 0o100 | 0o1000; // O_RDWR | O_CREAT | O_TRUNC
     let (entry, open) = match fs.create(FUSE_ROOT_ID, b"selftest_fstat.txt", flags, 0o644) {
         Ok(v) => v,
