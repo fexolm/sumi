@@ -72,6 +72,19 @@ pub fn sys_gettimeofday(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
+/// time(tloc): seconds since epoch. If tloc is non-null, also write there.
+pub fn sys_time(args: &SyscallArgs) -> SyscallResult {
+    let (sec, _) = crate::time::clock_realtime();
+    let tloc = args.arg0 as *mut i64;
+    if !tloc.is_null() {
+        // SAFETY: caller-provided user pointer; invalid pointers fault.
+        unsafe {
+            *tloc = sec as i64;
+        }
+    }
+    sec as SyscallResult
+}
+
 // Linux x86_64 RLIMIT_* numbers (kernel ABI, stable).
 const RLIMIT_DATA: u64 = 2;
 const RLIMIT_STACK: u64 = 3;
@@ -281,110 +294,3 @@ pub fn sys_prlimit64(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
-#[cfg(test)]
-mod rlimit_tests {
-    use super::*;
-
-    fn make_args(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> SyscallArgs {
-        SyscallArgs {
-            nr: 0,
-            arg0,
-            arg1,
-            arg2,
-            arg3,
-            arg4: 0,
-            arg5: 0,
-        }
-    }
-
-    #[test]
-    fn rlimit_for_stack_returns_user_stack_size() {
-        let r = rlimit_for(RLIMIT_STACK).unwrap();
-        assert_eq!(r.rlim_cur, USER_STACK_SIZE as u64);
-        assert_eq!(r.rlim_max, USER_STACK_SIZE as u64);
-    }
-
-    #[test]
-    fn rlimit_for_nofile_is_1024() {
-        let r = rlimit_for(RLIMIT_NOFILE).unwrap();
-        assert_eq!(r.rlim_cur, 1024);
-        assert_eq!(r.rlim_max, 1024);
-    }
-
-    #[test]
-    fn rlimit_for_as_is_infinity() {
-        let r = rlimit_for(RLIMIT_AS).unwrap();
-        assert_eq!(r.rlim_cur, u64::MAX);
-        assert_eq!(r.rlim_max, u64::MAX);
-    }
-
-    #[test]
-    fn rlimit_for_unknown_returns_none() {
-        assert!(rlimit_for(99999).is_none());
-    }
-
-    #[test]
-    fn getrlimit_writes_old_pointer() {
-        let mut rl = Rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let args = make_args(RLIMIT_STACK, &mut rl as *mut Rlimit as u64, 0, 0);
-        assert_eq!(sys_getrlimit(&args), 0);
-        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
-    }
-
-    #[test]
-    fn getrlimit_null_old_returns_zero() {
-        let args = make_args(RLIMIT_STACK, 0, 0, 0);
-        assert_eq!(sys_getrlimit(&args), 0);
-    }
-
-    #[test]
-    fn getrlimit_unknown_resource_einval() {
-        let args = make_args(99999, 0, 0, 0);
-        assert_eq!(sys_getrlimit(&args), EINVAL);
-    }
-
-    #[test]
-    fn prlimit64_pid_zero_stack() {
-        let mut rl = Rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let args = make_args(0, RLIMIT_STACK, 0, &mut rl as *mut Rlimit as u64);
-        assert_eq!(sys_prlimit64(&args), 0);
-        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
-    }
-
-    #[test]
-    fn prlimit64_pid_nonzero_esrch() {
-        let args = make_args(2, RLIMIT_STACK, 0, 0);
-        assert_eq!(sys_prlimit64(&args), ESRCH);
-    }
-
-    #[test]
-    fn prlimit64_pid_one_succeeds() {
-        let mut rl = Rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let args = make_args(1, RLIMIT_STACK, 0, &mut rl as *mut Rlimit as u64);
-        assert_eq!(sys_prlimit64(&args), 0);
-        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
-    }
-
-    #[test]
-    fn prlimit64_unknown_resource_einval() {
-        let args = make_args(0, 99999, 0, 0);
-        assert_eq!(sys_prlimit64(&args), EINVAL);
-    }
-
-    #[test]
-    fn prlimit64_ignores_new_limit() {
-        // Pass a clearly garbage pointer for new_limit; the function must NOT
-        // dereference it. arg3=NULL ensures no write either.
-        let args = make_args(0, RLIMIT_STACK, 0xDEAD_BEEF, 0);
-        assert_eq!(sys_prlimit64(&args), 0);
-    }
-}

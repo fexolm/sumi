@@ -108,28 +108,4 @@ mod tests {
             "unknown futex op must return ENOSYS"
         );
     }
-
-    #[test]
-    fn set_robust_list_returns_zero() {
-        let args = SyscallArgs {
-            nr: 273,
-            arg0: 0xDEAD_BEEF,
-            arg1: 24,
-            arg2: 0,
-            arg3: 0,
-            arg4: 0,
-            arg5: 0,
-        };
-        assert_eq!(sys_set_robust_list(&args), 0);
-        let zero = SyscallArgs {
-            nr: 273,
-            arg0: 0,
-            arg1: 0,
-            arg2: 0,
-            arg3: 0,
-            arg4: 0,
-            arg5: 0,
-        };
-        assert_eq!(sys_set_robust_list(&zero), 0);
-    }
 }

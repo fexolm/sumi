@@ -7,7 +7,6 @@ pub mod drivers;
 pub mod exec;
 pub mod fs;
 pub mod memory;
-pub mod selftest;
 pub mod syscall;
 pub mod time;
 

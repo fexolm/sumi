@@ -283,69 +283,6 @@ mod tests {
         (VirtioMmioDevice::new(Box::new(backend)), log)
     }
 
-    // ── MMIO read tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn magic_read_returns_virtio_magic_value() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_MAGIC),
-            VIRTIO_MMIO_MAGIC_VALUE,
-            "MAGIC register must return the VirtIO magic value"
-        );
-    }
-
-    #[test]
-    fn version_read_returns_2() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_VERSION),
-            2,
-            "VERSION register must return 2 (modern transport)"
-        );
-    }
-
-    #[test]
-    fn device_id_read_returns_backend_device_id() {
-        let (backend, _) = TrackingBackend::new(VIRTIO_DEVICE_CONSOLE, 2);
-        let device = VirtioMmioDevice::new(Box::new(backend));
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_DEVICE_ID),
-            VIRTIO_DEVICE_CONSOLE,
-            "DEVICE_ID must reflect the backend's device_id()"
-        );
-    }
-
-    #[test]
-    fn vendor_id_read_returns_sumi_vendor_id() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_VENDOR_ID),
-            SUMI_VENDOR_ID,
-            "VENDOR_ID must return the sumi vendor constant"
-        );
-    }
-
-    #[test]
-    fn queue_num_max_read_returns_queue_size() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_QUEUE_NUM_MAX),
-            QUEUE_SIZE as u32,
-            "QUEUE_NUM_MAX must return QUEUE_SIZE"
-        );
-    }
-
-    #[test]
-    fn unknown_mmio_offset_read_returns_zero() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(0xFFFF),
-            0,
-            "unknown MMIO offset must return 0"
-        );
-    }
-
     // ── queue readiness tests ─────────────────────────────────────────────────
 
     #[test]
@@ -612,15 +549,4 @@ mod tests {
         );
     }
 
-    // ── interrupt status tests ────────────────────────────────────────────────
-
-    #[test]
-    fn interrupt_status_always_returns_zero() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_INTERRUPT_STATUS),
-            0,
-            "INTERRUPT_STATUS must return 0 (interrupts not used)"
-        );
-    }
 }

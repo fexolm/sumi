@@ -84,6 +84,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         234 => handlers::signal::sys_tgkill(args),
         35 => handlers::time::sys_nanosleep(args),
         96 => handlers::time::sys_gettimeofday(args),
+        201 => handlers::time::sys_time(args),
         97 => handlers::time::sys_getrlimit(args),
         228 => handlers::time::sys_clock_gettime(args),
         229 => handlers::time::sys_clock_getres(args),
