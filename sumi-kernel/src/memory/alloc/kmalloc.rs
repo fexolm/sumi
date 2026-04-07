@@ -102,7 +102,8 @@ impl<'i, DM: DirectMap> KernelAllocator<'i, DM> {
             });
         }
 
-        let total_size = align_up(requested_size + HEADER_SIZE, MIN_ALIGNMENT).max(MIN_FREE_BLOCK_SIZE);
+        let total_size =
+            align_up(requested_size + HEADER_SIZE, MIN_ALIGNMENT).max(MIN_FREE_BLOCK_SIZE);
         let user_align = allocation_alignment(requested_size).max(min_align);
         let mut inner = self.inner.lock();
 
@@ -343,8 +344,8 @@ fn place_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, sync::Arc};
     use crate::memory::test_utils::{TestDirectMap, make_alloc};
+    use std::{collections::HashSet, sync::Arc};
 
     #[test]
     fn small_alloc_and_free_reuses_address() {

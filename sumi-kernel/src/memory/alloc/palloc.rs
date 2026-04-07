@@ -185,7 +185,10 @@ mod tests {
     fn alloc_zero_pages_returns_error() {
         let allocator = Box::new(PageAllocator::new());
         let result = allocator.alloc(0);
-        assert!(matches!(result, Err(MemoryError::InvalidPageCount { pages: 0 })));
+        assert!(matches!(
+            result,
+            Err(MemoryError::InvalidPageCount { pages: 0 })
+        ));
     }
 
     #[test]

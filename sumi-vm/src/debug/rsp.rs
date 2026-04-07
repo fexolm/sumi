@@ -109,7 +109,7 @@ pub fn encode_hex(data: &[u8]) -> Vec<u8> {
 
 /// Decode hex string to bytes.
 pub fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

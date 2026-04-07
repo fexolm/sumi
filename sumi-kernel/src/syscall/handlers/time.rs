@@ -1,5 +1,6 @@
 use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
+use sumi_abi::arch::layout::USER_STACK_SIZE;
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -32,7 +33,7 @@ pub fn sys_nanosleep(args: &SyscallArgs) -> SyscallResult {
     // passing valid, aligned pointers. Invalid pointers will cause a fault.
     let (sec, nsec) = unsafe { ((*req).tv_sec, (*req).tv_nsec) };
 
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return EINVAL;
     }
 
@@ -71,8 +72,81 @@ pub fn sys_gettimeofday(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
-pub fn sys_getrlimit(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+/// time(tloc): seconds since epoch. If tloc is non-null, also write there.
+pub fn sys_time(args: &SyscallArgs) -> SyscallResult {
+    let (sec, _) = crate::time::clock_realtime();
+    let tloc = args.arg0 as *mut i64;
+    if !tloc.is_null() {
+        // SAFETY: caller-provided user pointer; invalid pointers fault.
+        unsafe {
+            *tloc = sec as i64;
+        }
+    }
+    sec as SyscallResult
+}
+
+// Linux x86_64 RLIMIT_* numbers (kernel ABI, stable).
+const RLIMIT_DATA: u64 = 2;
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_CORE: u64 = 4;
+const RLIMIT_NOFILE: u64 = 7;
+const RLIMIT_AS: u64 = 9;
+const RLIM_INFINITY: u64 = u64::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+/// Single source of truth for both prlimit64 and getrlimit. Returns None for
+/// resources we don't model. glibc uses RLIMIT_STACK during startup to compute
+/// guard pages — see docs/glibc-support-design.md §4.2.
+fn rlimit_for(resource: u64) -> Option<Rlimit> {
+    match resource {
+        RLIMIT_STACK => Some(Rlimit {
+            rlim_cur: USER_STACK_SIZE as u64,
+            rlim_max: USER_STACK_SIZE as u64,
+        }),
+        RLIMIT_NOFILE => Some(Rlimit {
+            rlim_cur: 1024,
+            rlim_max: 1024,
+        }),
+        RLIMIT_AS => Some(Rlimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        }),
+        RLIMIT_DATA => Some(Rlimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        }),
+        RLIMIT_CORE => Some(Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        }),
+        _ => None,
+    }
+}
+
+pub fn sys_getrlimit(args: &SyscallArgs) -> SyscallResult {
+    let resource = args.arg0;
+    let old_limit = args.arg1 as *mut Rlimit;
+
+    let val = match rlimit_for(resource) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    if !old_limit.is_null() {
+        // SAFETY: single-process unikernel — user pointer lives in the same
+        // address space as the kernel. Caller is responsible for the buffer
+        // being writable Rlimit-sized memory.
+        unsafe {
+            *old_limit = val;
+        }
+    }
+    0
 }
 
 pub fn sys_clock_gettime(args: &SyscallArgs) -> SyscallResult {
@@ -150,14 +224,13 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
     // passing valid, aligned pointers. Invalid pointers will cause a fault.
     let (sec, nsec) = unsafe { ((*req).tv_sec, (*req).tv_nsec) };
 
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return EINVAL;
     }
 
     if flags & TIMER_ABSTIME != 0 {
         // Absolute sleep: wait until the clock reaches the target time.
-        let target_ns =
-            ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+        let target_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
         let now_ns = match clock_id {
             CLOCK_REALTIME => {
                 let (s, n) = crate::time::clock_realtime();
@@ -170,8 +243,7 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
         }
     } else {
         // Relative sleep.
-        let total_ns =
-            ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+        let total_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
         crate::time::busy_wait_ns(total_ns);
 
         // Write zero remainder — we never get interrupted.
@@ -189,40 +261,36 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
 }
 
 pub fn sys_prlimit64(args: &SyscallArgs) -> SyscallResult {
-    #[repr(C)]
-    struct Rlimit {
-        rlim_cur: u64,
-        rlim_max: u64,
-    }
-
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NOFILE: u64 = 7;
-
-    let _pid = args.arg0;
+    // pid_t is a 32-bit signed int per Linux ABI; high bits in the register
+    // are not meaningful.
+    let pid = args.arg0 as i32;
     let resource = args.arg1;
-    let _new_limit = args.arg2 as *const Rlimit;
+    // arg2 is `const struct rlimit64 *new_limit`. We deliberately never
+    // dereference it — see test `prlimit64_ignores_new_limit`.
+    let _ = args.arg2;
     let old_limit = args.arg3 as *mut Rlimit;
 
+    // Linux checks resource validity before task lookup, so EINVAL takes
+    // precedence over ESRCH.
+    let val = match rlimit_for(resource) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    // Linux's do_prlimit accepts pid == 0 (current) OR pid == current->pid.
+    // We are pid 1 — accept both. Anything else is ESRCH.
+    if pid != 0 && pid != 1 {
+        return ESRCH;
+    }
+
     if !old_limit.is_null() {
-        let val = match resource {
-            RLIMIT_STACK => Rlimit {
-                rlim_cur: 8 * 1024 * 1024,
-                rlim_max: u64::MAX,
-            },
-            RLIMIT_NOFILE => Rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            },
-            _ => Rlimit {
-                rlim_cur: u64::MAX,
-                rlim_max: u64::MAX,
-            },
-        };
-        // SAFETY: The caller (user program running in ring-0) is responsible for
-        // passing valid, aligned pointers. Invalid pointers will cause a fault.
+        // SAFETY: single-process unikernel — user pointer lives in the same
+        // address space as the kernel; caller is responsible for the buffer
+        // being a writable, properly-aligned 16-byte Rlimit.
         unsafe {
             *old_limit = val;
         }
     }
     0
 }
+

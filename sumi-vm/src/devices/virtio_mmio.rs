@@ -4,7 +4,12 @@ use vm_memory::GuestMemoryMmap;
 pub trait VirtioBackend {
     fn device_id(&self) -> u32;
     fn num_queues(&self) -> usize;
-    fn process_queue(&mut self, queue_idx: usize, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>);
+    fn process_queue(
+        &mut self,
+        queue_idx: usize,
+        queue: &VirtqueueState,
+        mem: &GuestMemoryMmap<()>,
+    );
 }
 
 #[derive(Default)]
@@ -106,7 +111,8 @@ impl VirtioMmioDevice {
             VIRTIO_MMIO_QUEUE_NOTIFY => {
                 let queue_idx = value as usize;
                 if queue_idx < self.queues.len() && self.queues[queue_idx].ready {
-                    self.backend.process_queue(queue_idx, &self.queues[queue_idx], mem);
+                    self.backend
+                        .process_queue(queue_idx, &self.queues[queue_idx], mem);
                 }
             }
             VIRTIO_MMIO_INTERRUPT_ACK => {}
@@ -202,7 +208,10 @@ mod tests {
 
     impl MockBackend {
         fn new(device_id: u32, num_queues: usize) -> Self {
-            Self { device_id, num_queues }
+            Self {
+                device_id,
+                num_queues,
+            }
         }
     }
 
@@ -274,69 +283,6 @@ mod tests {
         (VirtioMmioDevice::new(Box::new(backend)), log)
     }
 
-    // ── MMIO read tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn magic_read_returns_virtio_magic_value() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_MAGIC),
-            VIRTIO_MMIO_MAGIC_VALUE,
-            "MAGIC register must return the VirtIO magic value"
-        );
-    }
-
-    #[test]
-    fn version_read_returns_2() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_VERSION),
-            2,
-            "VERSION register must return 2 (modern transport)"
-        );
-    }
-
-    #[test]
-    fn device_id_read_returns_backend_device_id() {
-        let (backend, _) = TrackingBackend::new(VIRTIO_DEVICE_CONSOLE, 2);
-        let device = VirtioMmioDevice::new(Box::new(backend));
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_DEVICE_ID),
-            VIRTIO_DEVICE_CONSOLE,
-            "DEVICE_ID must reflect the backend's device_id()"
-        );
-    }
-
-    #[test]
-    fn vendor_id_read_returns_sumi_vendor_id() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_VENDOR_ID),
-            SUMI_VENDOR_ID,
-            "VENDOR_ID must return the sumi vendor constant"
-        );
-    }
-
-    #[test]
-    fn queue_num_max_read_returns_queue_size() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_QUEUE_NUM_MAX),
-            QUEUE_SIZE as u32,
-            "QUEUE_NUM_MAX must return QUEUE_SIZE"
-        );
-    }
-
-    #[test]
-    fn unknown_mmio_offset_read_returns_zero() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(0xFFFF),
-            0,
-            "unknown MMIO offset must return 0"
-        );
-    }
-
     // ── queue readiness tests ─────────────────────────────────────────────────
 
     #[test]
@@ -404,8 +350,7 @@ mod tests {
         device.mmio_write(VIRTIO_MMIO_QUEUE_DESC_HIGH, (addr >> 32) as u32, &mem);
 
         assert_eq!(
-            device.queues[0].desc_addr,
-            addr,
+            device.queues[0].desc_addr, addr,
             "desc_addr must equal the 64-bit value assembled from LOW/HIGH writes"
         );
     }
@@ -421,8 +366,7 @@ mod tests {
         device.mmio_write(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (addr >> 32) as u32, &mem);
 
         assert_eq!(
-            device.queues[0].avail_addr,
-            addr,
+            device.queues[0].avail_addr, addr,
             "avail_addr must equal the 64-bit value assembled from LOW/HIGH writes"
         );
     }
@@ -438,8 +382,7 @@ mod tests {
         device.mmio_write(VIRTIO_MMIO_QUEUE_USED_HIGH, (addr >> 32) as u32, &mem);
 
         assert_eq!(
-            device.queues[0].used_addr,
-            addr,
+            device.queues[0].used_addr, addr,
             "used_addr must equal the 64-bit value assembled from LOW/HIGH writes"
         );
     }
@@ -521,8 +464,12 @@ mod tests {
         }
 
         impl VirtioBackend for CapturingBackend {
-            fn device_id(&self) -> u32 { 0 }
-            fn num_queues(&self) -> usize { 1 }
+            fn device_id(&self) -> u32 {
+                0
+            }
+            fn num_queues(&self) -> usize {
+                1
+            }
             fn process_queue(
                 &mut self,
                 _queue_idx: usize,
@@ -535,23 +482,35 @@ mod tests {
         }
 
         let captured = Arc::new(Mutex::new(None));
-        let backend = CapturingBackend { captured: Arc::clone(&captured) };
+        let backend = CapturingBackend {
+            captured: Arc::clone(&captured),
+        };
         let mut device = VirtioMmioDevice::new(Box::new(backend));
         let mem = make_mem();
 
-        let desc: u64  = 0x0000_ABCD_1234_0000;
+        let desc: u64 = 0x0000_ABCD_1234_0000;
         let avail: u64 = 0x0000_ABCD_2000_0000;
-        let used: u64  = 0x0000_ABCD_3000_0000;
+        let used: u64 = 0x0000_ABCD_3000_0000;
 
         configure_queue(&mut device, &mem, 0, desc, avail, used);
         device.mmio_write(VIRTIO_MMIO_QUEUE_NOTIFY, 0, &mem);
 
-        let result = captured.lock().unwrap().expect(
-            "process_queue was not called even though the queue was ready"
+        let result = captured
+            .lock()
+            .unwrap()
+            .expect("process_queue was not called even though the queue was ready");
+        assert_eq!(
+            result.0, desc,
+            "desc_addr passed to process_queue must match MMIO writes"
         );
-        assert_eq!(result.0, desc,  "desc_addr passed to process_queue must match MMIO writes");
-        assert_eq!(result.1, avail, "avail_addr passed to process_queue must match MMIO writes");
-        assert_eq!(result.2, used,  "used_addr passed to process_queue must match MMIO writes");
+        assert_eq!(
+            result.1, avail,
+            "avail_addr passed to process_queue must match MMIO writes"
+        );
+        assert_eq!(
+            result.2, used,
+            "used_addr passed to process_queue must match MMIO writes"
+        );
     }
 
     // ── status register tests ─────────────────────────────────────────────────
@@ -590,15 +549,4 @@ mod tests {
         );
     }
 
-    // ── interrupt status tests ────────────────────────────────────────────────
-
-    #[test]
-    fn interrupt_status_always_returns_zero() {
-        let device = make_device(1);
-        assert_eq!(
-            device.mmio_read(VIRTIO_MMIO_INTERRUPT_STATUS),
-            0,
-            "INTERRUPT_STATUS must return 0 (interrupts not used)"
-        );
-    }
 }

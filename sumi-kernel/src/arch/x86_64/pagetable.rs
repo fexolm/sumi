@@ -339,9 +339,7 @@ mod tests {
 
     /// Allocates a "data page" through kalloc so that the page-table Drop can
     /// free the PD entry.
-    fn alloc_data_page<'a>(
-        kalloc: &'a KernelAllocator<'a, TestDirectMap>,
-    ) -> PhysicalAddr {
+    fn alloc_data_page<'a>(kalloc: &'a KernelAllocator<'a, TestDirectMap>) -> PhysicalAddr {
         kalloc.calloc(PAGE_TABLE_SIZE).expect("alloc data page")
     }
 
@@ -373,7 +371,8 @@ mod tests {
         let pt = make_page_table(&kalloc);
         let pdata = alloc_data_page(&kalloc);
 
-        pt.map_2mb(VADDR_A, pdata).expect("first map should succeed");
+        pt.map_2mb(VADDR_A, pdata)
+            .expect("first map should succeed");
         let result = pt.map_2mb(VADDR_A, pdata);
         assert!(
             matches!(result, Err(MemoryError::AlreadyMapped { addr }) if addr == VADDR_A.as_usize()),
@@ -468,7 +467,8 @@ mod tests {
         assert_eq!(returned, pdata1);
         kalloc.free(returned);
 
-        pt.map_2mb(VADDR_A, pdata2).expect("remap after unmap should succeed");
+        pt.map_2mb(VADDR_A, pdata2)
+            .expect("remap after unmap should succeed");
         assert_eq!(
             pt.get_if_present(VADDR_A).unwrap().unwrap().addr(),
             pdata2,

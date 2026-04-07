@@ -129,7 +129,10 @@ mod tests {
         // The buffer must be filled with non-zero bytes (seed is 0x42, not zero).
         let mut buf = [0u8; 64];
         let result = fill_random(buf.as_mut_ptr(), 64);
-        assert_eq!(result, 64, "fill_random must return the number of bytes filled");
+        assert_eq!(
+            result, 64,
+            "fill_random must return the number of bytes filled"
+        );
         assert!(
             buf.iter().any(|&b| b != 0),
             "fill_random must modify the buffer — all-zero output suggests fallback did not run"

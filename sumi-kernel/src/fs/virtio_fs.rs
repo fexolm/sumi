@@ -137,7 +137,7 @@ impl VirtioFsClient {
     /// Handles kernel code/data addresses, direct-map addresses, and user-space
     /// addresses (the latter via page-table walk).
     pub fn v2p(virt: *const u8) -> PhysicalAddr {
-        use sumi_abi::layout::{KERNEL_CODE_VIRT, KERNEL_CODE_PHYS};
+        use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 
         let addr = virt as usize;
         if addr >= KERNEL_CODE_VIRT.as_usize() {
@@ -150,7 +150,8 @@ impl VirtioFsClient {
             // User-space address — walk the page table.
             use sumi_abi::arch::layout::PAGE_SIZE;
             let va = VirtualAddr::new(addr);
-            let entry = crate::KERNEL_PAGE_TABLE.lock()
+            let entry = crate::KERNEL_PAGE_TABLE
+                .lock()
                 .get_if_present(va)
                 .expect("v2p: page table walk failed")
                 .expect("v2p: address not mapped");
@@ -242,8 +243,16 @@ impl VirtioFsClient {
     /// Submit a 2-descriptor chain (req readable, resp writable), check the FUSE error.
     fn submit_request_response(&self, req: &[u8], req_len: u32, resp: &[u8]) -> Result<(), i32> {
         let specs = [
-            DescSpec { addr: Self::v2p(req.as_ptr()), len: req_len, writable: false },
-            DescSpec { addr: Self::v2p(resp.as_ptr()), len: resp.len() as u32, writable: true },
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req_len,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
         ];
         self.submit_chain(&specs)?;
         // SAFETY: VM wrote FuseOutHeader into resp buffer.
@@ -270,7 +279,7 @@ impl VirtioFsClient {
     /// FUSE_INIT handshake.
     fn fuse_init(&mut self) -> bool {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseInitIn>()];
-        self.write_fuse_header(&mut req,FUSE_INIT, 0);
+        self.write_fuse_header(&mut req, FUSE_INIT, 0);
         // SAFETY: Writing repr(C) struct after the header.
         unsafe {
             core::ptr::write_volatile(
@@ -285,7 +294,10 @@ impl VirtioFsClient {
         }
         let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseInitOut>()];
         match self.submit_and_read::<FuseInitOut>(&req, req.len() as u32, &resp) {
-            Ok(init_out) => { self.max_write = init_out.max_write; true }
+            Ok(init_out) => {
+                self.max_write = init_out.max_write;
+                true
+            }
             Err(_) => false,
         }
     }
@@ -313,12 +325,16 @@ impl VirtioFsClient {
     /// FUSE_GETATTR: get file attributes by nodeid.
     pub fn getattr(&self, nodeid: u64) -> Result<FuseAttrOut, i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseGetattrIn>()];
-        self.write_fuse_header(&mut req,FUSE_GETATTR, nodeid);
+        self.write_fuse_header(&mut req, FUSE_GETATTR, nodeid);
         // SAFETY: Writing repr(C) struct after the header.
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseGetattrIn,
-                FuseGetattrIn { getattr_flags: 0, dummy: 0, fh: 0 },
+                FuseGetattrIn {
+                    getattr_flags: 0,
+                    dummy: 0,
+                    fh: 0,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseAttrOut>()];
@@ -328,11 +344,14 @@ impl VirtioFsClient {
     /// FUSE_OPEN: open a file by nodeid.
     pub fn open(&self, nodeid: u64, flags: u32) -> Result<FuseOpenOut, i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseOpenIn>()];
-        self.write_fuse_header(&mut req,FUSE_OPEN, nodeid);
+        self.write_fuse_header(&mut req, FUSE_OPEN, nodeid);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseOpenIn,
-                FuseOpenIn { flags, open_flags: 0 },
+                FuseOpenIn {
+                    flags,
+                    open_flags: 0,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseOpenOut>()];
@@ -357,21 +376,28 @@ impl VirtioFsClient {
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseCreateIn,
-                FuseCreateIn { flags, mode, umask: 0o022, open_flags: 0 },
+                FuseCreateIn {
+                    flags,
+                    mode,
+                    umask: 0o022,
+                    open_flags: 0,
+                },
             );
             core::ptr::copy_nonoverlapping(
                 name.as_ptr(),
-                req.as_mut_ptr().add(size_of::<FuseInHeader>() + create_in_size),
+                req.as_mut_ptr()
+                    .add(size_of::<FuseInHeader>() + create_in_size),
                 name.len(),
             );
         }
 
-        let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseEntryOut>()
+        let resp = [0u8; size_of::<FuseOutHeader>()
+            + size_of::<FuseEntryOut>()
             + size_of::<FuseOpenOut>()];
         self.submit_request_response(&req, req_len as u32, &resp)?;
         unsafe {
             let entry = core::ptr::read_volatile(
-                resp.as_ptr().add(size_of::<FuseOutHeader>()) as *const FuseEntryOut,
+                resp.as_ptr().add(size_of::<FuseOutHeader>()) as *const FuseEntryOut
             );
             let open = core::ptr::read_volatile(
                 resp.as_ptr()
@@ -391,26 +417,52 @@ impl VirtioFsClient {
         count: u32,
     ) -> Result<u32, i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseReadIn>()];
-        self.write_fuse_header(&mut req,FUSE_READ, 0);
+        self.write_fuse_header(&mut req, FUSE_READ, 0);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseReadIn,
-                FuseReadIn { fh, offset, size: count, read_flags: 0, lock_owner: 0, flags: 0, padding: 0 },
+                FuseReadIn {
+                    fh,
+                    offset,
+                    size: count,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                },
             );
         }
 
-        let resp_hdr = FuseOutHeader { len: 0, error: 0, unique: 0 };
+        let resp_hdr = FuseOutHeader {
+            len: 0,
+            error: 0,
+            unique: 0,
+        };
         let specs = [
-            DescSpec { addr: Self::v2p(req.as_ptr()), len: req.len() as u32, writable: false },
-            DescSpec { addr: Self::v2p(&resp_hdr as *const _ as *const u8), len: size_of::<FuseOutHeader>() as u32, writable: true },
-            DescSpec { addr: buf_phys, len: count, writable: true },
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(&resp_hdr as *const _ as *const u8),
+                len: size_of::<FuseOutHeader>() as u32,
+                writable: true,
+            },
+            DescSpec {
+                addr: buf_phys,
+                len: count,
+                writable: true,
+            },
         ];
         self.submit_chain(&specs)?;
 
         // SAFETY: VM wrote FuseOutHeader into resp_hdr.
         unsafe {
             let hdr = core::ptr::read_volatile(&resp_hdr);
-            if hdr.error != 0 { return Err(hdr.error); }
+            if hdr.error != 0 {
+                return Err(hdr.error);
+            }
             Ok(hdr.len.saturating_sub(size_of::<FuseOutHeader>() as u32))
         }
     }
@@ -429,22 +481,46 @@ impl VirtioFsClient {
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseWriteIn,
-                FuseWriteIn { fh, offset, size: count, write_flags: 0, lock_owner: 0, flags: 0, padding: 0 },
+                FuseWriteIn {
+                    fh,
+                    offset,
+                    size: count,
+                    write_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                },
             );
         }
 
         let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseWriteOut>()];
         let specs = [
-            DescSpec { addr: Self::v2p(req.as_ptr()), len: req.len() as u32, writable: false },
-            DescSpec { addr: buf_phys, len: count, writable: false },
-            DescSpec { addr: Self::v2p(resp.as_ptr()), len: resp.len() as u32, writable: true },
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: buf_phys,
+                len: count,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(resp.as_ptr()),
+                len: resp.len() as u32,
+                writable: true,
+            },
         ];
         self.submit_chain(&specs)?;
 
         let write_out: FuseWriteOut = unsafe {
             let out_header = core::ptr::read_volatile(resp.as_ptr() as *const FuseOutHeader);
-            if out_header.error != 0 { return Err(out_header.error); }
-            core::ptr::read_volatile(resp.as_ptr().add(size_of::<FuseOutHeader>()) as *const FuseWriteOut)
+            if out_header.error != 0 {
+                return Err(out_header.error);
+            }
+            core::ptr::read_volatile(
+                resp.as_ptr().add(size_of::<FuseOutHeader>()) as *const FuseWriteOut
+            )
         };
         Ok(write_out.size)
     }
@@ -457,7 +533,7 @@ impl VirtioFsClient {
     /// FUSE_FORGET: drop a lookup reference. No response expected.
     pub fn forget(&self, nodeid: u64, nlookup: u64) {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseForgetIn>()];
-        self.write_fuse_header(&mut req,FUSE_FORGET, nodeid);
+        self.write_fuse_header(&mut req, FUSE_FORGET, nodeid);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseForgetIn,
@@ -465,18 +541,25 @@ impl VirtioFsClient {
             );
         }
         // FORGET has no response, but virtio requires a used ring entry
-        let specs = [DescSpec { addr: Self::v2p(req.as_ptr()), len: req.len() as u32, writable: false }];
+        let specs = [DescSpec {
+            addr: Self::v2p(req.as_ptr()),
+            len: req.len() as u32,
+            writable: false,
+        }];
         let _ = self.submit_chain(&specs);
     }
 
     /// FUSE_OPENDIR: open a directory by nodeid.
     pub fn opendir(&self, nodeid: u64) -> Result<FuseOpenOut, i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseOpenIn>()];
-        self.write_fuse_header(&mut req,FUSE_OPENDIR, nodeid);
+        self.write_fuse_header(&mut req, FUSE_OPENDIR, nodeid);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseOpenIn,
-                FuseOpenIn { flags: 0, open_flags: 0 },
+                FuseOpenIn {
+                    flags: 0,
+                    open_flags: 0,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseOpenOut>()];
@@ -491,11 +574,16 @@ impl VirtioFsClient {
     /// Shared implementation for FUSE_RELEASE and FUSE_RELEASEDIR.
     fn release_common(&self, fh: u64, opcode: u32) {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseReleaseIn>()];
-        self.write_fuse_header(&mut req,opcode, 0);
+        self.write_fuse_header(&mut req, opcode, 0);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseReleaseIn,
-                FuseReleaseIn { fh, flags: 0, release_flags: 0, lock_owner: 0 },
+                FuseReleaseIn {
+                    fh,
+                    flags: 0,
+                    release_flags: 0,
+                    lock_owner: 0,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>()];
@@ -512,26 +600,52 @@ impl VirtioFsClient {
         count: u32,
     ) -> Result<u32, i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseReadIn>()];
-        self.write_fuse_header(&mut req,FUSE_READDIR, nodeid);
+        self.write_fuse_header(&mut req, FUSE_READDIR, nodeid);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseReadIn,
-                FuseReadIn { fh, offset, size: count, read_flags: 0, lock_owner: 0, flags: 0, padding: 0 },
+                FuseReadIn {
+                    fh,
+                    offset,
+                    size: count,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                },
             );
         }
 
-        let resp_hdr = FuseOutHeader { len: 0, error: 0, unique: 0 };
+        let resp_hdr = FuseOutHeader {
+            len: 0,
+            error: 0,
+            unique: 0,
+        };
         let specs = [
-            DescSpec { addr: Self::v2p(req.as_ptr()), len: req.len() as u32, writable: false },
-            DescSpec { addr: Self::v2p(&resp_hdr as *const _ as *const u8), len: size_of::<FuseOutHeader>() as u32, writable: true },
-            DescSpec { addr: buf_phys, len: count, writable: true },
+            DescSpec {
+                addr: Self::v2p(req.as_ptr()),
+                len: req.len() as u32,
+                writable: false,
+            },
+            DescSpec {
+                addr: Self::v2p(&resp_hdr as *const _ as *const u8),
+                len: size_of::<FuseOutHeader>() as u32,
+                writable: true,
+            },
+            DescSpec {
+                addr: buf_phys,
+                len: count,
+                writable: true,
+            },
         ];
         self.submit_chain(&specs)?;
 
         // SAFETY: VM wrote FuseOutHeader into resp_hdr.
         unsafe {
             let hdr = core::ptr::read_volatile(&resp_hdr);
-            if hdr.error != 0 { return Err(hdr.error); }
+            if hdr.error != 0 {
+                return Err(hdr.error);
+            }
             Ok(hdr.len.saturating_sub(size_of::<FuseOutHeader>() as u32))
         }
     }
@@ -546,11 +660,17 @@ impl VirtioFsClient {
         flags: u64,
     ) -> Result<(), i32> {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseSetupMappingIn>()];
-        self.write_fuse_header(&mut req,FUSE_SETUPMAPPING, 0);
+        self.write_fuse_header(&mut req, FUSE_SETUPMAPPING, 0);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseSetupMappingIn,
-                FuseSetupMappingIn { fh, foffset: file_offset, len, flags, moffset: dax_offset as u64 },
+                FuseSetupMappingIn {
+                    fh,
+                    foffset: file_offset,
+                    len,
+                    flags,
+                    moffset: dax_offset as u64,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>()];
@@ -562,7 +682,7 @@ impl VirtioFsClient {
         let mut req = [0u8; size_of::<FuseInHeader>()
             + size_of::<FuseRemoveMappingIn>()
             + size_of::<FuseRemoveMappingOne>()];
-        self.write_fuse_header(&mut req,FUSE_REMOVEMAPPING, 0);
+        self.write_fuse_header(&mut req, FUSE_REMOVEMAPPING, 0);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseRemoveMappingIn,
@@ -573,7 +693,10 @@ impl VirtioFsClient {
                 req.as_mut_ptr()
                     .add(size_of::<FuseInHeader>() + size_of::<FuseRemoveMappingIn>())
                     as *mut FuseRemoveMappingOne,
-                FuseRemoveMappingOne { moffset: dax_offset as u64, len },
+                FuseRemoveMappingOne {
+                    moffset: dax_offset as u64,
+                    len,
+                },
             );
         }
         let resp = [0u8; size_of::<FuseOutHeader>()];

@@ -12,6 +12,12 @@ pub enum FdKind {
         fuse_fh: u64,
         fuse_nodeid: u64,
         offset: u64,
+        /// Best-effort cached file length. Used by `mmap` to bound the host's
+        /// `setup_mapping` length so DAX never extends past EOF (which would
+        /// SIGBUS the host on access). Updated on every successful write,
+        /// pwrite, and writev so a freshly grown file can be mapped through
+        /// the same fd without re-opening it.
+        size: u64,
     },
     /// Host directory accessed via virtio-fs FUSE.
     Directory {
@@ -29,6 +35,12 @@ pub struct FileDescriptor {
 
 pub struct FdTable {
     fds: Vec<Option<FileDescriptor>>,
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FdTable {
@@ -125,7 +137,12 @@ mod tests {
     fn alloc_returns_lowest_free() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         // First alloc should return fd 3 (0-2 are console)
@@ -137,7 +154,12 @@ mod tests {
     fn free_and_realloc_reuses_slot() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         let fd = table.alloc(desc);
@@ -178,14 +200,19 @@ mod tests {
     fn get_mut_updates_offset() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         let fd = table.alloc(desc);
-        if let Some(d) = table.get_mut(fd) {
-            if let FdKind::File { ref mut offset, .. } = d.kind {
-                *offset = 42;
-            }
+        if let Some(d) = table.get_mut(fd)
+            && let FdKind::File { ref mut offset, .. } = d.kind
+        {
+            *offset = 42;
         }
         let d = table.get(fd).unwrap();
         if let FdKind::File { offset, .. } = d.kind {

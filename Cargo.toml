@@ -1,4 +1,6 @@
 [workspace]
+# Keep default-members minimal so `cargo build` (no flags) only builds the
+# host VM. The bare-metal kernel must be built with an explicit target.
 default-members = ["sumi-vm"]
 members = ["sumi-vm", "sumi-abi", "sumi-kernel", "sumi-integration-tests"]
 resolver = "3"
@@ -8,4 +10,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.lints.clippy]
-all = "warn"
+# Clippy warnings are hard errors for every crate that inherits via
+# `[lints] workspace = true`. New warnings will block both `cargo build`
+# (when run through clippy via `make clippy`) and `cargo clippy` directly.
+all = { level = "deny", priority = -1 }

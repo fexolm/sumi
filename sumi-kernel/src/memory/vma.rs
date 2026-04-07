@@ -28,6 +28,12 @@ pub struct VmaTable {
     vmas: Vec<Vma>,
 }
 
+impl Default for VmaTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VmaTable {
     pub const fn new() -> Self {
         Self { vmas: Vec::new() }
@@ -52,18 +58,12 @@ impl VmaTable {
     }
 
     /// Remove all VMAs that overlap with [start, end).
-    pub fn remove_overlapping(
-        &mut self,
-        start: VirtualAddr,
-        end: VirtualAddr,
-    ) -> Vec<Vma> {
+    pub fn remove_overlapping(&mut self, start: VirtualAddr, end: VirtualAddr) -> Vec<Vma> {
         let mut removed = Vec::new();
         let mut i = 0;
         while i < self.vmas.len() {
             let vma = &self.vmas[i];
-            if vma.start.as_usize() < end.as_usize()
-                && vma.end.as_usize() > start.as_usize()
-            {
+            if vma.start.as_usize() < end.as_usize() && vma.end.as_usize() > start.as_usize() {
                 removed.push(self.vmas.swap_remove(i));
                 // Don't increment i — swap_remove moved the last element here.
             } else {
@@ -99,7 +99,10 @@ mod tests {
         assert_eq!(found.unwrap().start.as_usize(), start);
 
         let mid = table.find(VirtualAddr::new(start + PAGE_SIZE / 2));
-        assert!(mid.is_some(), "find in the middle of the VMA should return it");
+        assert!(
+            mid.is_some(),
+            "find in the middle of the VMA should return it"
+        );
     }
 
     #[test]
@@ -140,7 +143,10 @@ mod tests {
         table.insert(make_vma(start, end));
 
         let removed = table.remove(VirtualAddr::new(start));
-        assert!(removed.is_some(), "remove by start address should return the VMA");
+        assert!(
+            removed.is_some(),
+            "remove by start address should return the VMA"
+        );
         assert_eq!(removed.unwrap().start.as_usize(), start);
 
         assert!(
@@ -153,7 +159,10 @@ mod tests {
     fn vma_remove_nonexistent() {
         let mut table = VmaTable::new();
         let result = table.remove(VirtualAddr::new(0xDEAD_0000));
-        assert!(result.is_none(), "removing non-existent VMA must return None");
+        assert!(
+            result.is_none(),
+            "removing non-existent VMA must return None"
+        );
     }
 
     #[test]
@@ -163,11 +172,12 @@ mod tests {
         let end = start + PAGE_SIZE;
         table.insert(make_vma(start, end));
 
-        let removed = table.remove_overlapping(
-            VirtualAddr::new(start),
-            VirtualAddr::new(end),
+        let removed = table.remove_overlapping(VirtualAddr::new(start), VirtualAddr::new(end));
+        assert_eq!(
+            removed.len(),
+            1,
+            "exactly one overlapping VMA must be removed"
         );
-        assert_eq!(removed.len(), 1, "exactly one overlapping VMA must be removed");
 
         assert!(
             table.find(VirtualAddr::new(start)).is_none(),
@@ -182,10 +192,8 @@ mod tests {
         let end = start + PAGE_SIZE;
         table.insert(make_vma(start, end));
 
-        let removed = table.remove_overlapping(
-            VirtualAddr::new(end),
-            VirtualAddr::new(end + PAGE_SIZE),
-        );
+        let removed =
+            table.remove_overlapping(VirtualAddr::new(end), VirtualAddr::new(end + PAGE_SIZE));
         assert!(
             removed.is_empty(),
             "remove_overlapping with non-overlapping range must return nothing"
@@ -207,10 +215,7 @@ mod tests {
         table.insert(make_vma(a_start, a_end));
         table.insert(make_vma(b_start, b_end));
 
-        let removed = table.remove_overlapping(
-            VirtualAddr::new(a_start),
-            VirtualAddr::new(b_end),
-        );
+        let removed = table.remove_overlapping(VirtualAddr::new(a_start), VirtualAddr::new(b_end));
         assert_eq!(removed.len(), 2, "both overlapping VMAs must be removed");
     }
 
@@ -225,7 +230,11 @@ mod tests {
             VirtualAddr::new(start + PAGE_SIZE),
             VirtualAddr::new(end + PAGE_SIZE),
         );
-        assert_eq!(removed.len(), 1, "partially overlapping VMA must be removed");
+        assert_eq!(
+            removed.len(),
+            1,
+            "partially overlapping VMA must be removed"
+        );
 
         assert!(
             table.find(VirtualAddr::new(start)).is_none(),

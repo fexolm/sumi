@@ -73,26 +73,32 @@ pub fn sys_exit_group(args: &SyscallArgs) -> SyscallResult {
     exit_with_code(args.arg0 as i32)
 }
 
-pub fn sys_uname(args: &SyscallArgs) -> SyscallResult {
-    #[repr(C)]
-    struct UtsName {
-        sysname: [u8; 65],
-        nodename: [u8; 65],
-        release: [u8; 65],
-        version: [u8; 65],
-        machine: [u8; 65],
-        domainname: [u8; 65],
-    }
+#[repr(C)]
+struct UtsName {
+    sysname: [u8; 65],
+    nodename: [u8; 65],
+    release: [u8; 65],
+    version: [u8; 65],
+    machine: [u8; 65],
+    domainname: [u8; 65],
+}
 
+pub fn sys_uname(args: &SyscallArgs) -> SyscallResult {
     let buf = args.arg0 as *mut UtsName;
-    // SAFETY: User program passed a valid pointer to UtsName-sized buffer.
+    if buf.is_null() {
+        return EFAULT;
+    }
+    // SAFETY: Single-process unikernel; the user pointer lives in the same
+    // address space as the kernel. Caller is responsible for the buffer being
+    // a writable UtsName-sized region.
     unsafe {
         core::ptr::write_bytes(buf, 0, 1);
-        write_field(&mut (*buf).sysname, b"sumi");
+        write_field(&mut (*buf).sysname, b"Linux");
         write_field(&mut (*buf).nodename, b"sumi");
-        write_field(&mut (*buf).release, b"0.1.0");
-        write_field(&mut (*buf).version, b"0.1.0");
+        write_field(&mut (*buf).release, b"6.6.0-sumi");
+        write_field(&mut (*buf).version, b"#1 SMP sumi");
         write_field(&mut (*buf).machine, b"x86_64");
+        write_field(&mut (*buf).domainname, b"(none)");
     }
     0
 }
@@ -108,7 +114,23 @@ pub fn sys_set_tid_address(_args: &SyscallArgs) -> SyscallResult {
     1
 }
 
+// PR_SET_VMA: glibc 2.34+ calls prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)
+// to label anonymous VMAs. We don't track VMA names — accept it as a
+// successful no-op so glibc startup stays quiet. Every other prctl op is
+// rejected with EINVAL: returning 0 from getter-style ops (PR_GET_NAME etc.)
+// would silently leave the caller's output buffer untouched and they would
+// then read uninitialised data.
+const PR_SET_VMA: u64 = 0x53564D41;
+
+pub fn sys_prctl(args: &SyscallArgs) -> SyscallResult {
+    match args.arg0 {
+        PR_SET_VMA => 0,
+        _ => EINVAL,
+    }
+}
+
 fn exit_with_code(code: i32) -> SyscallResult {
     kprintln!("[exit] code={}", code);
     crate::arch::halt_forever()
 }
+

@@ -3,5 +3,6 @@
 
 #[cfg(not(test))]
 mod kernel_main;
+
 #[cfg(test)]
-mod test_main;
+fn main() {}

@@ -28,6 +28,13 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
+// Single-threaded unikernel: pretend the robust list is registered. We never
+// walk it because we never exit a thread other than the main one. Returning 0
+// (instead of ENOSYS via the dispatch fall-through) silences glibc startup spam.
+pub fn sys_set_robust_list(_args: &SyscallArgs) -> SyscallResult {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,11 +80,7 @@ mod tests {
         // FUTEX_WAKE has no waiters in a single-threaded kernel; must return 0.
         let word: u32 = 0;
         let args = make_args(&word as *const u32 as u64, FUTEX_WAKE as u64, 1);
-        assert_eq!(
-            sys_futex(&args),
-            0,
-            "FUTEX_WAKE must return 0 (no waiters)"
-        );
+        assert_eq!(sys_futex(&args), 0, "FUTEX_WAKE must return 0 (no waiters)");
     }
 
     #[test]

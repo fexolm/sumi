@@ -2,9 +2,16 @@
 name = "sumi-integration-tests"
 version.workspace = true
 edition.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
 
 [[test]]
-name = "user_programs"
+name = "test_launcher"
+path = "tests/test_launcher.rs"
 harness = true
 
-[dev-dependencies]
+[lints]
+workspace = true

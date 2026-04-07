@@ -28,6 +28,7 @@ const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
 const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 
@@ -118,7 +119,11 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     let base: u64 = match elf.header.e_type {
         goblin::elf::header::ET_EXEC => 0,
         goblin::elf::header::ET_DYN => PIE_LOAD_BASE,
-        _ => return Err(ExecError::InvalidElf("unsupported ELF type (need ET_EXEC or ET_DYN)")),
+        _ => {
+            return Err(ExecError::InvalidElf(
+                "unsupported ELF type (need ET_EXEC or ET_DYN)",
+            ));
+        }
     };
 
     // 3. Load main binary PT_LOAD segments
@@ -142,7 +147,8 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
             .min_by_key(|ph| ph.p_vaddr);
         match first_load {
             Some(ph) => {
-                let mapped_base = base.checked_add(ph.p_vaddr)
+                let mapped_base = base
+                    .checked_add(ph.p_vaddr)
                     .ok_or(ExecError::InvalidElf("LOAD vaddr overflow"))?;
                 // e_phoff is relative to file start; subtract p_offset of the LOAD segment
                 // that contains offset 0, then add to mapped_base.
@@ -153,7 +159,8 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
         }
     };
 
-    let main_entry = base.checked_add(elf.entry)
+    let main_entry = base
+        .checked_add(elf.entry)
         .ok_or(ExecError::InvalidElf("entry point overflow"))?;
 
     let elf_info = ElfInfo {
@@ -167,9 +174,18 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     let interp_info = if let Some(interp_path) = elf.interpreter {
         kprintln!("[exec] interpreter: {}", interp_path);
 
-        let interp_data = read_file(interp_path)?;
-        let interp_elf =
-            Elf::parse(&interp_data).map_err(|_| ExecError::InvalidElf("interpreter parse failed"))?;
+        let interp_data = read_file(interp_path).map_err(|e| match e {
+            ExecError::Fs(-2) => {
+                kprintln!(
+                    "[exec] interpreter {} not found in share dir; pass `--share /` to expose the host filesystem",
+                    interp_path
+                );
+                ExecError::Fs(-2)
+            }
+            other => other,
+        })?;
+        let interp_elf = Elf::parse(&interp_data)
+            .map_err(|_| ExecError::InvalidElf("interpreter parse failed"))?;
 
         if interp_elf.header.e_type != goblin::elf::header::ET_DYN {
             return Err(ExecError::InvalidElf("interpreter must be ET_DYN"));
@@ -178,7 +194,8 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
         // Load interpreter segments at INTERP_LOAD_BASE
         load_segments_at_base(&interp_data, &interp_elf, INTERP_LOAD_BASE)?;
 
-        let interp_entry = INTERP_LOAD_BASE.checked_add(interp_elf.entry)
+        let interp_entry = INTERP_LOAD_BASE
+            .checked_add(interp_elf.entry)
             .ok_or(ExecError::InvalidElf("interpreter entry overflow"))?;
 
         let info = InterpInfo {
@@ -242,7 +259,9 @@ fn read_file(path: &str) -> Result<Vec<u8>, ExecError> {
         let buf_paddr = buf_vaddr
             .to_physical(&crate::KERNEL_DIRECT_MAP)
             .ok_or(ExecError::Fs(-14))?; // EFAULT
-        let bytes_read = fs.read(fh, offset, buf_paddr, chunk_size).map_err(ExecError::Fs)?;
+        let bytes_read = fs
+            .read(fh, offset, buf_paddr, chunk_size)
+            .map_err(ExecError::Fs)?;
         if bytes_read == 0 {
             break;
         }
@@ -256,11 +275,7 @@ fn read_file(path: &str) -> Result<Vec<u8>, ExecError> {
     Ok(buf)
 }
 
-fn load_segments_at_base(
-    file_data: &[u8],
-    elf: &Elf,
-    base: u64,
-) -> Result<VirtualAddr, ExecError> {
+fn load_segments_at_base(file_data: &[u8], elf: &Elf, base: u64) -> Result<VirtualAddr, ExecError> {
     let mut brk_end: u64 = 0;
 
     for ph in elf.program_headers.iter().filter(|p| p.p_type == PT_LOAD) {
@@ -298,14 +313,16 @@ fn load_segments_at_base(
         while page_addr < end {
             let va = VirtualAddr::new(page_addr as usize);
             // Check if already mapped (two segments might share a 2 MB page)
-            if crate::KERNEL_PAGE_TABLE.lock()
+            if crate::KERNEL_PAGE_TABLE
+                .lock()
                 .get_if_present(va)
                 .map_err(ExecError::Memory)?
                 .is_none()
             {
                 let paddr = crate::PAGE_ALLOCATOR.alloc(1).map_err(ExecError::Memory)?;
                 zero_page(paddr);
-                crate::KERNEL_PAGE_TABLE.lock()
+                crate::KERNEL_PAGE_TABLE
+                    .lock()
                     .map_2mb(va, paddr)
                     .map_err(ExecError::Memory)?;
             }
@@ -350,7 +367,8 @@ fn setup_stack(
         let vaddr = VirtualAddr::new(stack_bottom + i * PAGE_SIZE);
         let paddr = crate::PAGE_ALLOCATOR.alloc(1).map_err(ExecError::Memory)?;
         zero_page(paddr);
-        crate::KERNEL_PAGE_TABLE.lock()
+        crate::KERNEL_PAGE_TABLE
+            .lock()
             .map_2mb(vaddr, paddr)
             .map_err(ExecError::Memory)?;
     }
@@ -392,8 +410,8 @@ fn prepare_initial_stack(
                 r
             }
             None => [
-                0x73, 0x75, 0x6D, 0x69, 0x72, 0x61, 0x6E, 0x64, 0x01, 0x02, 0x03, 0x04, 0x05,
-                0x06, 0x07, 0x08,
+                0x73, 0x75, 0x6D, 0x69, 0x72, 0x61, 0x6E, 0x64, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                0x07, 0x08,
             ],
         };
         core::ptr::copy_nonoverlapping(random.as_ptr(), sp as *mut u8, 16);
@@ -411,6 +429,10 @@ fn prepare_initial_stack(
     sp = push_auxv(sp, AT_UID, 0);
     sp = push_auxv(sp, AT_RANDOM, random_addr);
     sp = push_auxv(sp, AT_PAGESZ, 4096);
+    // glibc on x86_64 probes CPU features via CPUID in init-arch.c, so AT_HWCAP
+    // is cosmetic on this architecture. Advertise 0 to avoid claiming hardware
+    // features we have not validated. See docs/glibc-support-design.md §4.7.
+    sp = push_auxv(sp, AT_HWCAP, 0);
 
     // AT_BASE: interpreter load base, or 0 if no interpreter
     let at_base = interp_info.map_or(0, |i| i.base);

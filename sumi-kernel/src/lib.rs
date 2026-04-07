@@ -7,7 +7,6 @@ pub mod drivers;
 pub mod exec;
 pub mod fs;
 pub mod memory;
-pub mod selftest;
 pub mod syscall;
 pub mod time;
 
@@ -43,7 +42,9 @@ pub fn fs() -> &'static fs::virtio_fs::VirtioFsClient {
 
 /// Returns the global VirtioConsole. Panics if not yet initialized.
 pub fn console() -> &'static drivers::virtio::console::VirtioConsole {
-    VIRTIO_CONSOLE.get().expect("virtio-console not initialized")
+    VIRTIO_CONSOLE
+        .get()
+        .expect("virtio-console not initialized")
 }
 
 pub static DAX_ALLOCATOR: spin::Mutex<fs::dax::DaxAllocator> =

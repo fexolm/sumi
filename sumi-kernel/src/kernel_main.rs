@@ -54,10 +54,7 @@ pub extern "C" fn _start() -> ! {
         exec::exec_user_program(path);
     }
 
-    // No program specified — run selftests
-    sumi_kernel::selftest::run_all();
-
-    kprintln!("A");
+    kprintln!("[kernel] no user program specified, halting");
     halt_forever()
 }
 

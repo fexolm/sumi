@@ -54,7 +54,10 @@ impl DaxAllocator {
     /// Out-of-bounds offsets are silently ignored.
     pub fn free(&mut self, offset: usize, count: usize) {
         let start_slot = offset / PAGE_SIZE;
-        if start_slot.checked_add(count).is_none_or(|sum| sum > DAX_SLOT_COUNT) {
+        if start_slot
+            .checked_add(count)
+            .is_none_or(|sum| sum > DAX_SLOT_COUNT)
+        {
             return;
         }
         self.mark(start_slot, count, false);
@@ -91,7 +94,10 @@ mod tests {
         assert_eq!(offset0, 0, "first slot should be at offset 0");
 
         let offset1 = dax.alloc(1).expect("second alloc should succeed");
-        assert_eq!(offset1, PAGE_SIZE, "second slot should be at offset PAGE_SIZE");
+        assert_eq!(
+            offset1, PAGE_SIZE,
+            "second slot should be at offset PAGE_SIZE"
+        );
     }
 
     #[test]
@@ -129,7 +135,8 @@ mod tests {
     fn dax_alloc_exhaustion() {
         let mut dax = DaxAllocator::new();
         // Fill every slot.
-        dax.alloc(DAX_SLOT_COUNT).expect("filling all slots should succeed");
+        dax.alloc(DAX_SLOT_COUNT)
+            .expect("filling all slots should succeed");
         let result = dax.alloc(1);
         assert!(
             matches!(result, Err(DaxError::WindowExhausted)),
@@ -149,7 +156,9 @@ mod tests {
         dax.free(b, 1);
 
         // A single-slot alloc should reuse slot 1 (the lowest free slot).
-        let reused = dax.alloc(1).expect("alloc after middle free should succeed");
+        let reused = dax
+            .alloc(1)
+            .expect("alloc after middle free should succeed");
         assert_eq!(reused, b, "middle slot must be reused");
 
         // Cleanup to satisfy the borrow checker; freeing a and c is fine.
@@ -185,7 +194,9 @@ mod tests {
         dax.alloc(63).expect("filling 63 slots should succeed");
 
         // Allocate 2 slots that straddle the word boundary.
-        let offset = dax.alloc(2).expect("cross-word-boundary alloc should succeed");
+        let offset = dax
+            .alloc(2)
+            .expect("cross-word-boundary alloc should succeed");
         assert_eq!(
             offset,
             63 * PAGE_SIZE,

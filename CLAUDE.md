@@ -9,26 +9,31 @@ Unikernel that runs Linux ELF binaries. No context switching, no process isolati
 | `sumi-vm` | KVM hypervisor / loader | `x86_64-unknown-linux-gnu` |
 | `sumi-kernel` | The unikernel itself | `x86_64-unknown-none` (bare-metal) |
 | `sumi-abi` | Shared types between loader and kernel | `no_std`, both targets |
+| `sumi-integration-tests` | End-to-end test runner; one test program per file in `data/` | host (build.rs cross-compiles each test) |
 
 ### Build & Test
 
 ```bash
-# Build the loader (host)
-cargo build -p sumi-vm
+# Build kernel + VM
+make build
 
-# Build the kernel (bare-metal)
-cargo build -p sumi-kernel --target x86_64-unknown-none
+# Host-side unit tests for every crate
+make test
 
-# Run all tests (kernel tests run on host via #[cfg(test)])
-cargo test
-
-# Run tests for a specific crate
-cargo test -p sumi-kernel
-cargo test -p sumi-vm
-
-# Run kernel selftests under KVM (requires /dev/kvm)
-make self-test
+# End-to-end tests: each binary in sumi-integration-tests/data/{syscalls,glibc}/
+# is built and executed inside sumi under KVM (requires /dev/kvm and gcc).
+make integration-test
 ```
+
+The integration test framework lives in `sumi-integration-tests/`. Each
+`data/syscalls/<name>.rs` is a single-file `no_std` Rust program that uses
+raw syscalls (via `include!("../common.rs")`) to exercise one kernel feature.
+Each `data/glibc/<name>.c` is a glibc-linked C program that exercises the
+dynamic linker / libc surface. `build.rs` compiles each file into a binary
+and emits one `#[test]` per binary; the harness in `tests/test_launcher.rs`
+runs each binary inside `sumi-vm` and asserts that the kernel printed
+`[exit] code=0`. To add a new test, drop a new file into `data/syscalls/`
+or `data/glibc/`.
 
 ## Coding Standards
 
