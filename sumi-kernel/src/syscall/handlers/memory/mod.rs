@@ -34,7 +34,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     // at 2MB granularity internally, but the requested 4KB-aligned address is
     // returned to the caller for sub-page data placement.
     if flags & MAP_FIXED != 0 && flags & MAP_ANONYMOUS == 0 && fd >= 0 {
-        if addr_hint % 4096 != 0 {
+        if !addr_hint.is_multiple_of(4096) {
             return EINVAL;
         }
         let (fuse_fh, _fuse_nodeid) = {
@@ -58,7 +58,7 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     // (or newly allocated) 2 MB pages. Accepts 4 KB-aligned addresses because
     // glibc's ld.so issues these to zero BSS tails at sub-2MB-page granularity.
     if flags & MAP_FIXED != 0 && flags & MAP_ANONYMOUS != 0 {
-        if (addr_hint as usize) % 4096 != 0 {
+        if !(addr_hint as usize).is_multiple_of(4096) {
             return EINVAL;
         }
         return map_fixed_anon(addr_hint, len);
@@ -234,10 +234,10 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
                 // replaced any past-EOF tail in this page is gone (the
                 // reservation already validated the page is fully within EOF).
                 let paddr = entry.addr();
-                if is_dax_page(paddr) {
-                    if let Err(e) = replace_dax_with_private(va, paddr) {
-                        return e;
-                    }
+                if is_dax_page(paddr)
+                    && let Err(e) = replace_dax_with_private(va, paddr)
+                {
+                    return e;
                 }
             }
             Ok(None) => {
@@ -295,11 +295,7 @@ pub(super) fn replace_dax_with_private(
     let src = dax_paddr.to_virtual(&crate::KERNEL_DIRECT_MAP);
     let dst = new_paddr.to_virtual(&crate::KERNEL_DIRECT_MAP);
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            src.as_ptr::<u8>(),
-            dst.as_ptr::<u8>() as *mut u8,
-            PAGE_SIZE,
-        );
+        core::ptr::copy_nonoverlapping(src.as_ptr::<u8>(), dst.as_ptr::<u8>(), PAGE_SIZE);
     }
 
     // Replace mapping: unmap old, map new.
@@ -307,7 +303,11 @@ pub(super) fn replace_dax_with_private(
         .lock()
         .unmap_2mb(va)
         .map_err(|_| ENOMEM)?;
-    if let Err(_) = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, new_paddr) {
+    if crate::KERNEL_PAGE_TABLE
+        .lock()
+        .map_2mb(va, new_paddr)
+        .is_err()
+    {
         // Try to restore the old DAX mapping to avoid leaving the page unmapped.
         let _ = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, dax_paddr);
         let _ = crate::PAGE_ALLOCATOR.free(new_paddr);
@@ -371,17 +371,17 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
 }
 
 /// Unmap and free 2MB pages in [start, end), handling mixed DAX/private pages.
+/// DAX pages are intentionally not freed here — they are released by VMA teardown
+/// which knows the slot range to return to the DAX allocator.
 fn unmap_pages_in_range(start: usize, end: usize) {
     let mut vaddr = start;
     while vaddr < end {
         if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
             .lock()
             .unmap_2mb(VirtualAddr::new(vaddr))
+            && !is_dax_page(paddr)
         {
-            if !is_dax_page(paddr) {
-                let _ = crate::PAGE_ALLOCATOR.free(paddr);
-            }
-            // DAX pages: left for VMA teardown to free the slot range.
+            let _ = crate::PAGE_ALLOCATOR.free(paddr);
         }
         vaddr += PAGE_SIZE;
     }
@@ -478,17 +478,16 @@ fn tear_down_vma(vma: Vma) {
         }
         MappingBacking::Dax { dax_offset, .. } => {
             // Unmap all pages. Some may be original DAX, some replaced private copies.
+            // DAX pages: don't free individually — the slot range is freed below.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
                 if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
                     .lock()
                     .unmap_2mb(VirtualAddr::new(vaddr))
+                    && !is_dax_page(paddr)
                 {
-                    if !is_dax_page(paddr) {
-                        // This page was replaced with a private copy — free it.
-                        let _ = crate::PAGE_ALLOCATOR.free(paddr);
-                    }
-                    // DAX pages: don't free individually — the slot range is freed below.
+                    // This page was replaced with a private copy — free it.
+                    let _ = crate::PAGE_ALLOCATOR.free(paddr);
                 }
                 vaddr += PAGE_SIZE;
             }

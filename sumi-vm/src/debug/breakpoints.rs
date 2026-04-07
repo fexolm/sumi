@@ -58,11 +58,6 @@ impl BreakpointManager {
         self.sw_breakpoints.contains_key(&vaddr)
     }
 
-    /// Get the original byte at a breakpoint address (for resume-past-breakpoint).
-    pub fn original_byte(&self, vaddr: u64) -> Option<u8> {
-        self.sw_breakpoints.get(&vaddr).copied()
-    }
-
     /// Temporarily restore the original byte so we can single-step past the breakpoint.
     pub fn suspend_sw(
         &self,

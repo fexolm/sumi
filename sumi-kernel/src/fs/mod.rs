@@ -35,6 +35,12 @@ pub struct FdTable {
     fds: Vec<Option<FileDescriptor>>,
 }
 
+impl Default for FdTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FdTable {
     pub const fn new() -> Self {
         Self { fds: Vec::new() }
@@ -201,10 +207,10 @@ mod tests {
             flags: 0,
         };
         let fd = table.alloc(desc);
-        if let Some(d) = table.get_mut(fd) {
-            if let FdKind::File { ref mut offset, .. } = d.kind {
-                *offset = 42;
-            }
+        if let Some(d) = table.get_mut(fd)
+            && let FdKind::File { ref mut offset, .. } = d.kind
+        {
+            *offset = 42;
         }
         let d = table.get(fd).unwrap();
         if let FdKind::File { offset, .. } = d.kind {

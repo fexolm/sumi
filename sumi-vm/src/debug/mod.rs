@@ -1,7 +1,6 @@
 pub(crate) mod breakpoints;
 mod rsp;
 
-use breakpoints::BreakpointManager;
 use rsp::{decode_hex, encode_hex, parse_hex_num};
 
 use std::net::{TcpListener, TcpStream};
@@ -148,22 +147,15 @@ pub fn create_debug_channels() -> (
 pub struct GdbServer {
     cmd_tx: Sender<DebugCommand>,
     event_rx: Receiver<DebugEvent>,
-    mem: Arc<GuestMemoryMmap<()>>,
-    breakpoints: BreakpointManager,
 }
 
 impl GdbServer {
     pub fn new(
         cmd_tx: Sender<DebugCommand>,
         event_rx: Receiver<DebugEvent>,
-        mem: Arc<GuestMemoryMmap<()>>,
+        _mem: Arc<GuestMemoryMmap<()>>,
     ) -> Self {
-        Self {
-            cmd_tx,
-            event_rx,
-            mem,
-            breakpoints: BreakpointManager::new(),
-        }
+        Self { cmd_tx, event_rx }
     }
 
     /// Listen on the given port, accept one connection, and run the GDB protocol loop.
@@ -345,17 +337,17 @@ impl GdbServer {
                     _ => {
                         // FP/SSE register — return zeros
                         // Registers 24-31 are st0-st7 (10 bytes each)
-                        if reg_num >= 24 && reg_num <= 31 {
+                        if (24..=31).contains(&reg_num) {
                             let zeros = vec![0u8; 10];
                             return rsp::send_packet(stream, &encode_hex(&zeros));
                         }
                         // 32-39 are fctrl..fop (4 bytes each)
-                        if reg_num >= 32 && reg_num <= 39 {
+                        if (32..=39).contains(&reg_num) {
                             let zeros = vec![0u8; 4];
                             return rsp::send_packet(stream, &encode_hex(&zeros));
                         }
                         // 40-55 are xmm0-xmm15 (16 bytes each)
-                        if reg_num >= 40 && reg_num <= 55 {
+                        if (40..=55).contains(&reg_num) {
                             let zeros = vec![0u8; 16];
                             return rsp::send_packet(stream, &encode_hex(&zeros));
                         }
@@ -540,9 +532,8 @@ impl GdbServer {
         } else if data.starts_with(b"Cont;t") {
             // Stop/pause — we're already stopped
             rsp::send_stop_trap(stream)
-        } else if data.starts_with(b"MustReplyEmpty") {
-            rsp::send_empty(stream)
         } else {
+            // Includes "MustReplyEmpty" and any unknown vCommand.
             rsp::send_empty(stream)
         }
     }

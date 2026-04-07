@@ -28,6 +28,12 @@ pub struct VmaTable {
     vmas: Vec<Vma>,
 }
 
+impl Default for VmaTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VmaTable {
     pub const fn new() -> Self {
         Self { vmas: Vec::new() }

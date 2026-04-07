@@ -101,10 +101,11 @@ mod cpuid_mask_tests {
     use kvm_bindings::kvm_cpuid_entry2;
 
     fn entry(function: u32, index: u32) -> kvm_cpuid_entry2 {
-        let mut e = kvm_cpuid_entry2::default();
-        e.function = function;
-        e.index = index;
-        e
+        kvm_cpuid_entry2 {
+            function,
+            index,
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -530,10 +530,10 @@ impl VCpu for KvmVCpu {
                     paused = true;
                 }
                 VcpuExit::Intr => {
-                    // Signal interrupted KVM_RUN — check for pending commands
-                    match dbg.cmd_rx.try_recv() {
-                        Ok(DebugCommand::Kill) => return Ok(()),
-                        _ => {} // re-enter KVM_RUN
+                    // Signal interrupted KVM_RUN — check for pending commands.
+                    // Anything other than Kill: re-enter KVM_RUN.
+                    if let Ok(DebugCommand::Kill) = dbg.cmd_rx.try_recv() {
+                        return Ok(());
                     }
                 }
                 other => return Err(Error::UnexpectedExit(format!("{:?}", other))),

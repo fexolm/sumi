@@ -11,7 +11,7 @@ use std::{
     fmt::{self, Display},
     fs::File,
     io::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     thread,
@@ -190,18 +190,18 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
     }
 
     /// Parse user ELF to find .text load address and interpreter info.
-    fn resolve_user_debug(share_dir: &PathBuf, host_path: &PathBuf) -> Result<UserDebugInfo> {
+    fn resolve_user_debug(share_dir: &Path, host_path: &Path) -> Result<UserDebugInfo> {
         let data = std::fs::read(host_path)?;
         let elf = Elf::parse(&data)?;
 
         let base: u64 = match elf.header.e_type {
             goblin::elf::header::ET_EXEC => 0,
-            goblin::elf::header::ET_DYN => PIE_LOAD_BASE as u64,
+            goblin::elf::header::ET_DYN => PIE_LOAD_BASE,
             _ => 0,
         };
 
         let binary = SymbolFile {
-            host_path: host_path.clone(),
+            host_path: host_path.to_path_buf(),
             text_load_addr: base + Self::find_text_vaddr(&elf),
         };
 
@@ -240,20 +240,18 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         // Collect from both .symtab and .dynsym
         let all_syms = elf.syms.iter().chain(elf.dynsyms.iter());
         for sym in all_syms {
-            if sym.st_type() == STT_FUNC && sym.st_value != 0 {
-                if let Some(name) = elf
+            if sym.st_type() == STT_FUNC
+                && sym.st_value != 0
+                && let Some(name) = elf
                     .strtab
                     .get_at(sym.st_name)
                     .or_else(|| elf.dynstrtab.get_at(sym.st_name))
-                {
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let addr = base + sym.st_value;
-                    // Use st_size if known, otherwise default to 1
-                    let size = if sym.st_size > 0 { sym.st_size } else { 1 };
-                    writeln!(f, "{:x} {:x} {}", addr, size, name).map_err(Error::Io)?;
-                }
+                && !name.is_empty()
+            {
+                let addr = base + sym.st_value;
+                // Use st_size if known, otherwise default to 1
+                let size = if sym.st_size > 0 { sym.st_size } else { 1 };
+                writeln!(f, "{:x} {:x} {}", addr, size, name).map_err(Error::Io)?;
             }
         }
         Ok(())
@@ -261,7 +259,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 
     /// Write /tmp/perf-<pid>.map with symbols from kernel + user binaries.
     fn write_perf_map(
-        kernel_path: &PathBuf,
+        kernel_path: &Path,
         share_dir: &Option<PathBuf>,
         run_path: &Option<String>,
     ) -> Result<()> {
@@ -281,7 +279,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                 let elf = Elf::parse(&user_data)?;
                 let base: u64 = match elf.header.e_type {
                     goblin::elf::header::ET_EXEC => 0,
-                    goblin::elf::header::ET_DYN => PIE_LOAD_BASE as u64,
+                    goblin::elf::header::ET_DYN => PIE_LOAD_BASE,
                     _ => 0,
                 };
                 Self::append_elf_symbols(&mut f, &user_data, base)?;
@@ -302,7 +300,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
     }
 
     /// Build GDB command-line args and spawn GDB interactively.
-    fn launch_gdb(kernel_path: &PathBuf, user_debug: Option<&UserDebugInfo>, port: u16) {
+    fn launch_gdb(kernel_path: &Path, user_debug: Option<&UserDebugInfo>, port: u16) {
         let kernel_path_str = kernel_path.display().to_string();
 
         let mut args: Vec<String> = vec![

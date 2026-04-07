@@ -37,10 +37,10 @@ pub(super) fn map_fixed_anon(addr: u64, len: usize) -> SyscallResult {
         match crate::KERNEL_PAGE_TABLE.lock().get_if_present(va) {
             Ok(Some(entry)) => {
                 let paddr = entry.addr();
-                if is_dax_page(paddr) {
-                    if let Err(e) = replace_dax_with_private(va, paddr) {
-                        return e;
-                    }
+                if is_dax_page(paddr)
+                    && let Err(e) = replace_dax_with_private(va, paddr)
+                {
+                    return e;
                 }
                 // Otherwise: reuse existing page (file-backed or anonymous).
             }

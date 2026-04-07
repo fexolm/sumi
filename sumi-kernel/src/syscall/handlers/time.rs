@@ -33,7 +33,7 @@ pub fn sys_nanosleep(args: &SyscallArgs) -> SyscallResult {
     // passing valid, aligned pointers. Invalid pointers will cause a fault.
     let (sec, nsec) = unsafe { ((*req).tv_sec, (*req).tv_nsec) };
 
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return EINVAL;
     }
 
@@ -224,7 +224,7 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
     // passing valid, aligned pointers. Invalid pointers will cause a fault.
     let (sec, nsec) = unsafe { ((*req).tv_sec, (*req).tv_nsec) };
 
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return EINVAL;
     }
 
