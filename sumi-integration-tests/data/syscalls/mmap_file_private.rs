@@ -6,18 +6,14 @@ include!("../common.rs");
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sumi_main() -> i32 {
-    // Create a file and write known content.
+    // Create a file and write known content. The kernel must keep the
+    // fd's cached size in sync with writes so the mmap below can find
+    // the bytes we just wrote without us having to close and re-open.
     let path = b"/tmp/sumi_int_mmap_priv.txt\0";
     let fd = sys_open(path, O_RDWR | O_CREAT | O_TRUNC, 0o644);
     check!(fd >= 0);
     let payload = [b'M'; 4096];
     check_eq!(sys_write(fd, &payload), 4096);
-    check_eq!(sys_close(fd), 0);
-
-    // Re-open so the kernel captures the post-write file size for this fd.
-    // (sumi snapshots the size at open() time and uses it for mmap bounds.)
-    let fd = sys_open(path, O_RDWR, 0);
-    check!(fd >= 0);
 
     // MAP_PRIVATE | PROT_READ|PROT_WRITE → private copy backed by physical pages.
     let len = 4096u64;

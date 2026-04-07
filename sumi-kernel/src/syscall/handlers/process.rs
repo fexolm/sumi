@@ -114,11 +114,19 @@ pub fn sys_set_tid_address(_args: &SyscallArgs) -> SyscallResult {
     1
 }
 
-// glibc 2.34+ calls prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...) to label
-// anonymous VMAs. We don't track VMA names; return success silently to keep
-// startup log output clean. glibc tolerates failure here.
-pub fn sys_prctl(_args: &SyscallArgs) -> SyscallResult {
-    0
+// PR_SET_VMA: glibc 2.34+ calls prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)
+// to label anonymous VMAs. We don't track VMA names — accept it as a
+// successful no-op so glibc startup stays quiet. Every other prctl op is
+// rejected with EINVAL: returning 0 from getter-style ops (PR_GET_NAME etc.)
+// would silently leave the caller's output buffer untouched and they would
+// then read uninitialised data.
+const PR_SET_VMA: u64 = 0x53564D41;
+
+pub fn sys_prctl(args: &SyscallArgs) -> SyscallResult {
+    match args.arg0 {
+        PR_SET_VMA => 0,
+        _ => EINVAL,
+    }
 }
 
 fn exit_with_code(code: i32) -> SyscallResult {

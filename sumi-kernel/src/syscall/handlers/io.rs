@@ -188,9 +188,16 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num)
-                        && let FdKind::File { ref mut offset, .. } = desc.kind
+                        && let FdKind::File {
+                            ref mut offset,
+                            ref mut size,
+                            ..
+                        } = desc.kind
                     {
                         *offset += n as u64;
+                        if *offset > *size {
+                            *size = *offset;
+                        }
                     }
                     n as SyscallResult
                 }
@@ -420,7 +427,19 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
                 buf_vaddr,
                 count,
             ) {
-                Ok(n) => n as SyscallResult,
+                Ok(n) => {
+                    // pwrite does not advance the fd offset, but it can extend
+                    // the file. Refresh the cached size if so.
+                    let new_end = offset + n as u64;
+                    let mut table = crate::FD_TABLE.lock();
+                    if let Some(desc) = table.get_mut(fd_num)
+                        && let FdKind::File { ref mut size, .. } = desc.kind
+                        && new_end > *size
+                    {
+                        *size = new_end;
+                    }
+                    n as SyscallResult
+                }
                 Err(e) => e as SyscallResult,
             }
         }
@@ -561,12 +580,19 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
                 }
             }
 
-            // Update offset
+            // Update offset and grow cached size if we extended the file.
             let mut table = crate::FD_TABLE.lock();
             if let Some(desc) = table.get_mut(fd_num)
-                && let FdKind::File { ref mut offset, .. } = desc.kind
+                && let FdKind::File {
+                    ref mut offset,
+                    ref mut size,
+                    ..
+                } = desc.kind
             {
                 *offset = cur_offset;
+                if cur_offset > *size {
+                    *size = cur_offset;
+                }
             }
             total as SyscallResult
         }

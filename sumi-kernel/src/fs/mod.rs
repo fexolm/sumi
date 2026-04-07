@@ -12,9 +12,11 @@ pub enum FdKind {
         fuse_fh: u64,
         fuse_nodeid: u64,
         offset: u64,
-        /// File size at open time. Used by `mmap` to bound the host's
+        /// Best-effort cached file length. Used by `mmap` to bound the host's
         /// `setup_mapping` length so DAX never extends past EOF (which would
-        /// SIGBUS the host on access). Refreshed by `fstat`.
+        /// SIGBUS the host on access). Updated on every successful write,
+        /// pwrite, and writev so a freshly grown file can be mapped through
+        /// the same fd without re-opening it.
         size: u64,
     },
     /// Host directory accessed via virtio-fs FUSE.
