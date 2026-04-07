@@ -85,9 +85,10 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
     pub fn new(info: &VmCreateInfo) -> Result<Self> {
         let backend = Backend::new(info)?;
 
-        let mem = Arc::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), info.mem_size + KERNEL_CODE_SIZE)])?,
-        );
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(0),
+            info.mem_size + KERNEL_CODE_SIZE,
+        )])?);
 
         backend.initialize_memory(&mem)?;
 
@@ -240,7 +241,9 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         let all_syms = elf.syms.iter().chain(elf.dynsyms.iter());
         for sym in all_syms {
             if sym.st_type() == STT_FUNC && sym.st_value != 0 {
-                if let Some(name) = elf.strtab.get_at(sym.st_name)
+                if let Some(name) = elf
+                    .strtab
+                    .get_at(sym.st_name)
                     .or_else(|| elf.dynstrtab.get_at(sym.st_name))
                 {
                     if name.is_empty() {
@@ -249,8 +252,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                     let addr = base + sym.st_value;
                     // Use st_size if known, otherwise default to 1
                     let size = if sym.st_size > 0 { sym.st_size } else { 1 };
-                    writeln!(f, "{:x} {:x} {}", addr, size, name)
-                        .map_err(Error::Io)?;
+                    writeln!(f, "{:x} {:x} {}", addr, size, name).map_err(Error::Io)?;
                 }
             }
         }
@@ -305,9 +307,12 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 
         let mut args: Vec<String> = vec![
             "-q".into(),
-            "-ex".into(), "set confirm off".into(),
-            "-ex".into(), format!("file {}", kernel_path_str),
-            "-ex".into(), format!("target remote :{}", port),
+            "-ex".into(),
+            "set confirm off".into(),
+            "-ex".into(),
+            format!("file {}", kernel_path_str),
+            "-ex".into(),
+            format!("target remote :{}", port),
         ];
 
         // If there's a user binary, set up automatic symbol loading
@@ -315,9 +320,12 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             // Break at jump_to_user_asm — at this point the kernel has loaded
             // and mapped the user ELF, so we can safely add symbols.
             args.extend([
-                "-ex".into(), "break jump_to_user_asm".into(),
-                "-ex".into(), "continue".into(),
-                "-ex".into(), "delete breakpoints".into(),
+                "-ex".into(),
+                "break jump_to_user_asm".into(),
+                "-ex".into(),
+                "continue".into(),
+                "-ex".into(),
+                "delete breakpoints".into(),
                 "-ex".into(),
                 format!(
                     "add-symbol-file {} {:#x}",
@@ -354,9 +362,9 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
     }
 
     fn write_boot_info(mem: &GuestMemoryMmap<()>, info: &VmCreateInfo, tsc_khz: u32) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
         use sumi_abi::arch::layout::{BOOT_INFO_ADDR, BOOT_INFO_MAX_SIZE};
         use sumi_abi::boot_info::*;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut flags = 0u32;
         let mut path_bytes: &[u8] = &[];
@@ -384,13 +392,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         // SAFETY: rng_seed is a valid 32-byte buffer. getrandom may return fewer
         // than 32 bytes (or -1 on error); the remainder stays zeroed, which is
         // non-fatal — the kernel fallback RNG can tolerate a partially-seeded buffer.
-        let ret = unsafe {
-            libc::getrandom(
-                rng_seed.as_mut_ptr() as *mut libc::c_void,
-                32,
-                0,
-            )
-        };
+        let ret = unsafe { libc::getrandom(rng_seed.as_mut_ptr() as *mut libc::c_void, 32, 0) };
         if ret != 32 {
             // Non-fatal: leave whatever bytes getrandom wrote (possibly none).
         }
@@ -411,10 +413,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 
         // SAFETY: BootInfo is repr(C) with no padding holes that matter.
         let struct_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                &boot_info as *const _ as *const u8,
-                header_size,
-            )
+            core::slice::from_raw_parts(&boot_info as *const _ as *const u8, header_size)
         };
         mem.write_slice(struct_bytes, GuestAddress(BOOT_INFO_ADDR.as_u64()))?;
 
@@ -500,10 +499,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             }
 
             // copy the initialized data from the file
-            mem.write_slice(
-                &data[file_offset..file_end],
-                GuestAddress(ph.p_paddr),
-            )?;
+            mem.write_slice(&data[file_offset..file_end], GuestAddress(ph.p_paddr))?;
 
             // zero the remainder of the segment if any
             if memsz > filesz {

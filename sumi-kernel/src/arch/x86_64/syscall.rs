@@ -1,7 +1,7 @@
 use core::arch::asm;
 
-const MSR_STAR:   u32 = 0xC000_0081;
-const MSR_LSTAR:  u32 = 0xC000_0082;
+const MSR_STAR: u32 = 0xC000_0081;
+const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 
 // STAR[47:32] = 0x0008 => CS=0x0008, SS=0x0010 on syscall entry
@@ -68,8 +68,7 @@ pub fn init() {
     // SAFETY: Single-threaded boot, setting up the syscall stack pointer.
     // We use raw pointer arithmetic to avoid creating a shared reference to the mutable static.
     unsafe {
-        SYSCALL_STACK_TOP =
-            core::ptr::addr_of!(SYSCALL_STACK) as u64 + SYSCALL_STACK_SIZE as u64;
+        SYSCALL_STACK_TOP = core::ptr::addr_of!(SYSCALL_STACK) as u64 + SYSCALL_STACK_SIZE as u64;
     }
 
     // SAFETY: We are in ring 0 during kernel boot. All MSR addresses and values
@@ -110,8 +109,8 @@ core::arch::global_asm!(
     "push rbp",
     "push rbx",
     // Save syscall-clobbered return state
-    "push rcx",    // return RIP (saved by syscall instruction into rcx)
-    "push r11",    // saved RFLAGS (saved by syscall instruction into r11)
+    "push rcx", // return RIP (saved by syscall instruction into rcx)
+    "push r11", // saved RFLAGS (saved by syscall instruction into r11)
     // Alignment: 17 pushes = 136 bytes from SYSCALL_STACK_TOP (16-aligned).
     // RSP = TOP - 136. 136 mod 16 = 8. So RSP mod 16 = 8.
     // After `call` pushes 8 more → RSP mod 16 = 0. SysV wants RSP+8 ≡ 0 (mod 16)
@@ -125,9 +124,9 @@ core::arch::global_asm!(
     "lea rdi, [rsp + 72]",
     "call syscall_dispatch",
     // rax = SyscallResult (preserve it — don't pop into rax below)
-    "add rsp, 8",   // remove padding
-    "pop r11",      // restore RFLAGS
-    "pop rcx",      // restore return RIP
+    "add rsp, 8", // remove padding
+    "pop r11",    // restore RFLAGS
+    "pop rcx",    // restore return RIP
     "pop rbx",
     "pop rbp",
     "pop r12",
@@ -138,17 +137,17 @@ core::arch::global_asm!(
     // musl's inline asm does NOT list these as clobbers, so the compiler
     // assumes they are preserved across the syscall instruction.
     // Skip rax (nr) — we return the result in rax instead.
-    "add rsp, 8",   // skip saved rax (nr)
-    "pop rdi",      // restore arg0
-    "pop rsi",      // restore arg1
-    "pop rdx",      // restore arg2
-    "pop r10",      // restore arg3
-    "pop r8",       // restore arg4
-    "pop r9",       // restore arg5
+    "add rsp, 8", // skip saved rax (nr)
+    "pop rdi",    // restore arg0
+    "pop rsi",    // restore arg1
+    "pop rdx",    // restore arg2
+    "pop r10",    // restore arg3
+    "pop r8",     // restore arg4
+    "pop r9",     // restore arg5
     // Restore RFLAGS while still on the kernel stack (preserves user red zone)
     "push r11",
     "popfq",
     // Switch back to user stack and return
-    "pop rsp",      // restore user RSP (from kernel stack)
+    "pop rsp", // restore user RSP (from kernel stack)
     "jmp rcx",
 );

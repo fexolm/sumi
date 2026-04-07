@@ -76,11 +76,13 @@ impl VirtioConsoleBackend {
                 let len = desc.len as usize;
                 let mut stack_buf = [0u8; 4096];
                 if len <= 4096 {
-                    mem.read_slice(&mut stack_buf[..len], GuestAddress(desc.addr)).unwrap();
+                    mem.read_slice(&mut stack_buf[..len], GuestAddress(desc.addr))
+                        .unwrap();
                     std::io::stdout().write_all(&stack_buf[..len]).ok();
                 } else {
                     let mut heap_buf = vec![0u8; len];
-                    mem.read_slice(&mut heap_buf, GuestAddress(desc.addr)).unwrap();
+                    mem.read_slice(&mut heap_buf, GuestAddress(desc.addr))
+                        .unwrap();
                     std::io::stdout().write_all(&heap_buf).ok();
                 }
                 total_len += desc.len;
@@ -119,14 +121,16 @@ impl VirtioConsoleBackend {
             let bytes_read = if len <= 4096 {
                 let n = std::io::stdin().read(&mut stack_buf[..len]).unwrap_or(0);
                 if n > 0 {
-                    mem.write_slice(&stack_buf[..n], GuestAddress(desc.addr)).unwrap();
+                    mem.write_slice(&stack_buf[..n], GuestAddress(desc.addr))
+                        .unwrap();
                 }
                 n
             } else {
                 let mut heap_buf = vec![0u8; len];
                 let n = std::io::stdin().read(&mut heap_buf).unwrap_or(0);
                 if n > 0 {
-                    mem.write_slice(&heap_buf[..n], GuestAddress(desc.addr)).unwrap();
+                    mem.write_slice(&heap_buf[..n], GuestAddress(desc.addr))
+                        .unwrap();
                 }
                 n
             };
@@ -146,7 +150,12 @@ impl VirtioBackend for VirtioConsoleBackend {
         2
     }
 
-    fn process_queue(&mut self, queue_idx: usize, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
+    fn process_queue(
+        &mut self,
+        queue_idx: usize,
+        queue: &VirtqueueState,
+        mem: &GuestMemoryMmap<()>,
+    ) {
         match queue_idx {
             0 => self.process_receive(queue, mem),
             1 => self.process_transmit(queue, mem),
@@ -190,24 +199,31 @@ mod tests {
     /// Write a descriptor into the descriptor table at slot `idx`.
     fn write_desc(mem: &GuestMemoryMmap<()>, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
         let base = DESC_BASE + idx as u64 * 16;
-        mem.write_slice(&addr.to_le_bytes(), GuestAddress(base)).unwrap();
-        mem.write_slice(&len.to_le_bytes(), GuestAddress(base + 8)).unwrap();
-        mem.write_slice(&flags.to_le_bytes(), GuestAddress(base + 12)).unwrap();
-        mem.write_slice(&next.to_le_bytes(), GuestAddress(base + 14)).unwrap();
+        mem.write_slice(&addr.to_le_bytes(), GuestAddress(base))
+            .unwrap();
+        mem.write_slice(&len.to_le_bytes(), GuestAddress(base + 8))
+            .unwrap();
+        mem.write_slice(&flags.to_le_bytes(), GuestAddress(base + 12))
+            .unwrap();
+        mem.write_slice(&next.to_le_bytes(), GuestAddress(base + 14))
+            .unwrap();
     }
 
     /// Append `head` to the available ring and bump the available index.
     fn avail_push(mem: &GuestMemoryMmap<()>, head: u16, avail_idx: u16) {
         let ring_slot = AVAIL_BASE + 4 + (avail_idx % QUEUE_SIZE) as u64 * 2;
-        mem.write_slice(&head.to_le_bytes(), GuestAddress(ring_slot)).unwrap();
+        mem.write_slice(&head.to_le_bytes(), GuestAddress(ring_slot))
+            .unwrap();
         let new_idx = avail_idx.wrapping_add(1);
-        mem.write_slice(&new_idx.to_le_bytes(), GuestAddress(AVAIL_BASE + 2)).unwrap();
+        mem.write_slice(&new_idx.to_le_bytes(), GuestAddress(AVAIL_BASE + 2))
+            .unwrap();
     }
 
     /// Read the used ring's `idx` field (little-endian u16 at used_addr + 2).
     fn used_idx(mem: &GuestMemoryMmap<()>) -> u16 {
         let mut buf = [0u8; 2];
-        mem.read_slice(&mut buf, GuestAddress(USED_BASE + 2)).unwrap();
+        mem.read_slice(&mut buf, GuestAddress(USED_BASE + 2))
+            .unwrap();
         u16::from_le_bytes(buf)
     }
 
@@ -217,7 +233,8 @@ mod tests {
         let mut id_buf = [0u8; 4];
         let mut len_buf = [0u8; 4];
         mem.read_slice(&mut id_buf, GuestAddress(base)).unwrap();
-        mem.read_slice(&mut len_buf, GuestAddress(base + 4)).unwrap();
+        mem.read_slice(&mut len_buf, GuestAddress(base + 4))
+            .unwrap();
         (u32::from_le_bytes(id_buf), u32::from_le_bytes(len_buf))
     }
 
@@ -233,7 +250,8 @@ mod tests {
         backend.process_queue(1, &queue, &mem);
 
         assert_eq!(
-            used_idx(&mem), 0,
+            used_idx(&mem),
+            0,
             "used ring idx must not advance when no descriptors are available"
         );
     }
@@ -255,7 +273,11 @@ mod tests {
         let mut backend = VirtioConsoleBackend::new();
         backend.process_queue(1, &queue, &mem);
 
-        assert_eq!(used_idx(&mem), 1, "used ring idx must advance by 1 after one descriptor");
+        assert_eq!(
+            used_idx(&mem),
+            1,
+            "used ring idx must advance by 1 after one descriptor"
+        );
         let (id, len) = used_entry(&mem, 0);
         assert_eq!(id, 0, "used entry id must be the head descriptor index (0)");
         assert_eq!(len, 5, "used entry len must equal the descriptor length");
@@ -266,7 +288,7 @@ mod tests {
         let mem = make_mem();
         let queue = make_queue();
 
-        write_desc(&mem, 0, DATA_BASE,      4, 0, 0);
+        write_desc(&mem, 0, DATA_BASE, 4, 0, 0);
         write_desc(&mem, 1, DATA_BASE + 16, 8, 0, 0);
         avail_push(&mem, 0, 0);
         avail_push(&mem, 1, 1);
@@ -274,11 +296,23 @@ mod tests {
         let mut backend = VirtioConsoleBackend::new();
         backend.process_queue(1, &queue, &mem);
 
-        assert_eq!(used_idx(&mem), 2, "used ring idx must advance by 2 after two descriptors");
+        assert_eq!(
+            used_idx(&mem),
+            2,
+            "used ring idx must advance by 2 after two descriptors"
+        );
         let (id0, len0) = used_entry(&mem, 0);
         let (id1, len1) = used_entry(&mem, 1);
-        assert_eq!((id0, len0), (0, 4), "first used entry must record head=0, len=4");
-        assert_eq!((id1, len1), (1, 8), "second used entry must record head=1, len=8");
+        assert_eq!(
+            (id0, len0),
+            (0, 4),
+            "first used entry must record head=0, len=4"
+        );
+        assert_eq!(
+            (id1, len1),
+            (1, 8),
+            "second used entry must record head=1, len=8"
+        );
     }
 
     #[test]
@@ -287,17 +321,24 @@ mod tests {
         let mem = make_mem();
         let queue = make_queue();
 
-        write_desc(&mem, 0, DATA_BASE,      3, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(&mem, 0, DATA_BASE, 3, VIRTQ_DESC_F_NEXT, 1);
         write_desc(&mem, 1, DATA_BASE + 16, 5, 0, 0);
         avail_push(&mem, 0, 0); // submit head=0
 
         let mut backend = VirtioConsoleBackend::new();
         backend.process_queue(1, &queue, &mem);
 
-        assert_eq!(used_idx(&mem), 1, "used ring idx must advance once for a 2-desc chain");
+        assert_eq!(
+            used_idx(&mem),
+            1,
+            "used ring idx must advance once for a 2-desc chain"
+        );
         let (id, len) = used_entry(&mem, 0);
         assert_eq!(id, 0, "used entry id must be the chain head");
-        assert_eq!(len, 8, "used entry len must be sum of all descriptors in chain (3 + 5)");
+        assert_eq!(
+            len, 8,
+            "used entry len must be sum of all descriptors in chain (3 + 5)"
+        );
     }
 
     #[test]
@@ -308,7 +349,7 @@ mod tests {
         let queue = make_queue();
 
         // desc 0 -> desc 1 with NEXT, desc 1 -> desc 0 with NEXT (cycle).
-        write_desc(&mem, 0, DATA_BASE,      1, VIRTQ_DESC_F_NEXT, 1);
+        write_desc(&mem, 0, DATA_BASE, 1, VIRTQ_DESC_F_NEXT, 1);
         write_desc(&mem, 1, DATA_BASE + 16, 1, VIRTQ_DESC_F_NEXT, 0);
         avail_push(&mem, 0, 0);
 
@@ -318,7 +359,11 @@ mod tests {
 
         // The entry should have been posted to used (we don't care about total_len
         // for a cyclic chain — just that it terminated).
-        assert_eq!(used_idx(&mem), 1, "used ring must be advanced even with a cyclic chain");
+        assert_eq!(
+            used_idx(&mem),
+            1,
+            "used ring must be advanced even with a cyclic chain"
+        );
     }
 
     #[test]
@@ -333,10 +378,17 @@ mod tests {
         let mut backend = VirtioConsoleBackend::new();
         backend.process_queue(1, &queue, &mem);
 
-        assert_eq!(used_idx(&mem), 1, "zero-length descriptor must still advance the used ring");
+        assert_eq!(
+            used_idx(&mem),
+            1,
+            "zero-length descriptor must still advance the used ring"
+        );
         let (id, len) = used_entry(&mem, 0);
         assert_eq!(id, 0, "used entry id must be 0");
-        assert_eq!(len, 0, "used entry len must be 0 for a zero-length descriptor");
+        assert_eq!(
+            len, 0,
+            "used entry len must be 0 for a zero-length descriptor"
+        );
     }
 
     #[test]
@@ -353,9 +405,16 @@ mod tests {
         let mut backend = VirtioConsoleBackend::new();
         backend.process_queue(1, &queue, &mem);
 
-        assert_eq!(used_idx(&mem), 1, "large descriptor must still advance the used ring");
+        assert_eq!(
+            used_idx(&mem),
+            1,
+            "large descriptor must still advance the used ring"
+        );
         let (_, len) = used_entry(&mem, 0);
-        assert_eq!(len, data_len, "used entry len must equal the large descriptor length");
+        assert_eq!(
+            len, data_len,
+            "used entry len must equal the large descriptor length"
+        );
     }
 
     // ── backend VirtioBackend trait tests ─────────────────────────────────────

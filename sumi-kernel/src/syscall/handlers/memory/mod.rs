@@ -5,8 +5,11 @@ use crate::exec::{align_up_2mb, zero_page};
 use crate::fs::FdKind;
 use crate::memory::vma::{MappingBacking, Vma};
 use crate::syscall::errno::*;
-use crate::syscall::{SyscallArgs, SyscallResult};
 use crate::syscall::handlers::io::fs_transfer_chunked;
+use crate::syscall::{SyscallArgs, SyscallResult};
+
+mod memory_fixed_anon;
+use memory_fixed_anon::map_fixed_anon;
 
 const MAP_PRIVATE: i32 = 0x02;
 const MAP_SHARED: i32 = 0x01;
@@ -38,7 +41,11 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
             let table = crate::FD_TABLE.lock();
             match table.get(fd as usize) {
                 Some(d) => match d.kind {
-                    FdKind::File { fuse_fh, fuse_nodeid, .. } => (fuse_fh, fuse_nodeid),
+                    FdKind::File {
+                        fuse_fh,
+                        fuse_nodeid,
+                        ..
+                    } => (fuse_fh, fuse_nodeid),
                     _ => return EBADF,
                 },
                 None => return EBADF,
@@ -47,14 +54,28 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         return map_fixed_file(addr_hint, len, fuse_fh, offset);
     }
 
-    // For non-file-backed MAP_FIXED (anonymous or fallthrough), require 2MB alignment.
+    // Anonymous MAP_FIXED: fast path that zeros [addr, addr+len) inside existing
+    // (or newly allocated) 2 MB pages. Accepts 4 KB-aligned addresses because
+    // glibc's ld.so issues these to zero BSS tails at sub-2MB-page granularity.
+    if flags & MAP_FIXED != 0 && flags & MAP_ANONYMOUS != 0 {
+        if (addr_hint as usize) % 4096 != 0 {
+            return EINVAL;
+        }
+        return map_fixed_anon(addr_hint, len);
+    }
+
+    // For non-file-backed MAP_FIXED (non-anonymous fallthrough), require 2MB alignment.
     if flags & MAP_FIXED != 0 && !(addr_hint as usize).is_multiple_of(PAGE_SIZE) {
         return EINVAL;
     }
 
     // Sub-page file offset: how far into the first 2MB page the file data starts.
     // Must be computed before aligned_len so the extra partial-page is included.
-    let sub_page_offset = if flags & MAP_ANONYMOUS == 0 { offset % PAGE_SIZE } else { 0 };
+    let sub_page_offset = if flags & MAP_ANONYMOUS == 0 {
+        offset % PAGE_SIZE
+    } else {
+        0
+    };
     let total_len = match len.checked_add(sub_page_offset) {
         Some(v) => v,
         None => return EINVAL,
@@ -105,22 +126,40 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     }
 
     // File-backed mapping.
-    let (fuse_fh, fuse_nodeid) = {
+    let (fuse_fh, fuse_nodeid, file_size) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd as usize) {
             Some(d) => match d.kind {
-                FdKind::File { fuse_fh, fuse_nodeid, .. } => (fuse_fh, fuse_nodeid),
+                FdKind::File {
+                    fuse_fh,
+                    fuse_nodeid,
+                    size,
+                    ..
+                } => (fuse_fh, fuse_nodeid, size),
                 _ => return EBADF,
             },
             None => return EBADF,
         }
     };
 
+    // Bytes of file content actually available from `file_page_offset`.
+    // Used to (a) bound how many bytes private_copy_path reads via FUSE_READ,
+    // and (b) decide whether DAX is safe — DAX must not extend past EOF or
+    // the host's underlying mmap will SIGBUS on access.
+    let file_content_len =
+        (file_size.saturating_sub(file_page_offset as u64)).min(aligned_len as u64);
+
     // MAP_PRIVATE + PROT_WRITE: private copy (always alloc pages, FUSE_READ content).
     if flags & MAP_PRIVATE != 0 && prot & PROT_WRITE != 0 {
         return private_copy_path(
-            vaddr, pages, saved_next, fuse_fh, fuse_nodeid,
-            file_page_offset as u64, aligned_len as u64, sub_page_offset,
+            vaddr,
+            pages,
+            saved_next,
+            fuse_fh,
+            fuse_nodeid,
+            file_page_offset as u64,
+            file_content_len,
+            sub_page_offset,
         );
     }
 
@@ -131,20 +170,40 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         sumi_abi::fuse::FUSE_SETUPMAPPING_FLAG_READ
     };
 
-    // Try DAX path.
-    match dax_path(
-        vaddr, pages, fuse_fh, fuse_nodeid,
-        file_page_offset as u64, aligned_len as u64, dax_flags, sub_page_offset,
-    ) {
-        Ok(result) => result,
-        Err(_) => {
-            // DAX window exhausted — fall back to private copy (read-only content).
-            private_copy_path(
-                vaddr, pages, saved_next, fuse_fh, fuse_nodeid,
-                file_page_offset as u64, aligned_len as u64, sub_page_offset,
-            )
+    // DAX is only safe if every page in the mapping is fully covered by file
+    // content. A partial-EOF page would let later accesses (including the
+    // kernel's own DAX→private replace path during MAP_FIXED) read past the
+    // host file and SIGBUS the host. Fall back to private_copy in that case.
+    let dax_eligible = file_content_len == aligned_len as u64;
+
+    if dax_eligible {
+        match dax_path(
+            vaddr,
+            pages,
+            fuse_fh,
+            fuse_nodeid,
+            file_page_offset as u64,
+            file_content_len,
+            dax_flags,
+            sub_page_offset,
+        ) {
+            Ok(result) => return result,
+            Err(_) => {
+                // DAX window exhausted — fall through to private copy.
+            }
         }
     }
+
+    private_copy_path(
+        vaddr,
+        pages,
+        saved_next,
+        fuse_fh,
+        fuse_nodeid,
+        file_page_offset as u64,
+        file_content_len,
+        sub_page_offset,
+    )
 }
 
 /// Handle file-backed MAP_FIXED: ensure pages are mapped, read file data.
@@ -166,16 +225,20 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
     let mut page_addr = aligned_start;
     while page_addr < aligned_end {
         let va = VirtualAddr::new(page_addr as usize);
-        match crate::KERNEL_PAGE_TABLE.lock().get_if_present(va) {
+        let lookup = crate::KERNEL_PAGE_TABLE.lock().get_if_present(va);
+        match lookup {
             Ok(Some(entry)) => {
-                // Page exists. Check if it's a DAX page that needs COW.
+                // Page exists. If it came from a prior DAX reservation, replace
+                // it with a private copy before we overwrite part of it via
+                // fs_transfer_chunked — DAX pages back the host file, and once
+                // replaced any past-EOF tail in this page is gone (the
+                // reservation already validated the page is fully within EOF).
                 let paddr = entry.addr();
                 if is_dax_page(paddr) {
                     if let Err(e) = replace_dax_with_private(va, paddr) {
                         return e;
                     }
                 }
-                // Otherwise: regular page, reuse it.
             }
             Ok(None) => {
                 // Page not mapped — allocate.
@@ -214,7 +277,7 @@ fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> Syscall
 }
 
 /// Check if a physical address falls within the DAX shared memory window.
-fn is_dax_page(paddr: sumi_abi::address::PhysicalAddr) -> bool {
+pub(super) fn is_dax_page(paddr: sumi_abi::address::PhysicalAddr) -> bool {
     let addr = paddr.as_usize();
     let base = DAX_WINDOW_BASE.as_usize();
     addr >= base && addr < base + DAX_WINDOW_SIZE
@@ -222,7 +285,7 @@ fn is_dax_page(paddr: sumi_abi::address::PhysicalAddr) -> bool {
 
 /// Replace a DAX-mapped page with a private physical copy.
 /// Allocates a new page, copies DAX content, remaps the virtual address.
-fn replace_dax_with_private(
+pub(super) fn replace_dax_with_private(
     va: VirtualAddr,
     dax_paddr: sumi_abi::address::PhysicalAddr,
 ) -> Result<(), SyscallResult> {
@@ -240,7 +303,10 @@ fn replace_dax_with_private(
     }
 
     // Replace mapping: unmap old, map new.
-    crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(va).map_err(|_| ENOMEM)?;
+    crate::KERNEL_PAGE_TABLE
+        .lock()
+        .unmap_2mb(va)
+        .map_err(|_| ENOMEM)?;
     if let Err(_) = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, new_paddr) {
         // Try to restore the old DAX mapping to avoid leaving the page unmapped.
         let _ = crate::KERNEL_PAGE_TABLE.lock().map_2mb(va, dax_paddr);
@@ -282,8 +348,7 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
         let req_start = VirtualAddr::new(aligned_start);
         let req_end = VirtualAddr::new(aligned_end);
 
-        if req_start.as_usize() <= vma_start.as_usize()
-            && req_end.as_usize() >= vma_end.as_usize()
+        if req_start.as_usize() <= vma_start.as_usize() && req_end.as_usize() >= vma_end.as_usize()
         {
             // Full VMA unmap — remove and tear down.
             if let Some(vma) = crate::VMA_TABLE.lock().remove(vma_start) {
@@ -309,7 +374,10 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
 fn unmap_pages_in_range(start: usize, end: usize) {
     let mut vaddr = start;
     while vaddr < end {
-        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
+        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
+            .lock()
+            .unmap_2mb(VirtualAddr::new(vaddr))
+        {
             if !is_dax_page(paddr) {
                 let _ = crate::PAGE_ALLOCATOR.free(paddr);
             }
@@ -342,7 +410,8 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
                 }
             };
             zero_page(paddr);
-            if crate::KERNEL_PAGE_TABLE.lock()
+            if crate::KERNEL_PAGE_TABLE
+                .lock()
                 .map_2mb(VirtualAddr::new(vaddr as usize), paddr)
                 .is_err()
             {
@@ -355,8 +424,9 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
     } else if new_end < old_end {
         let mut vaddr = new_end;
         while vaddr < old_end {
-            if let Ok(paddr) =
-                crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr as usize))
+            if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
+                .lock()
+                .unmap_2mb(VirtualAddr::new(vaddr as usize))
             {
                 let _ = crate::PAGE_ALLOCATOR.free(paddr);
             }
@@ -397,7 +467,10 @@ fn tear_down_vma(vma: Vma) {
             // Unmap and free physical pages.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
-                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
+                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
+                    .lock()
+                    .unmap_2mb(VirtualAddr::new(vaddr))
+                {
                     let _ = crate::PAGE_ALLOCATOR.free(paddr);
                 }
                 vaddr += PAGE_SIZE;
@@ -407,7 +480,10 @@ fn tear_down_vma(vma: Vma) {
             // Unmap all pages. Some may be original DAX, some replaced private copies.
             let mut vaddr = aligned_start;
             while vaddr < aligned_end {
-                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(vaddr)) {
+                if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
+                    .lock()
+                    .unmap_2mb(VirtualAddr::new(vaddr))
+                {
                     if !is_dax_page(paddr) {
                         // This page was replaced with a private copy — free it.
                         let _ = crate::PAGE_ALLOCATOR.free(paddr);
@@ -436,7 +512,10 @@ fn map_anonymous_pages(vaddr: VirtualAddr, pages: usize) -> Result<(), SyscallRe
             Ok(p) => p,
             Err(_) => {
                 for j in 0..i {
-                    if let Ok(p) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
+                    if let Ok(p) = crate::KERNEL_PAGE_TABLE
+                        .lock()
+                        .unmap_2mb(vaddr.add(j * PAGE_SIZE))
+                    {
                         let _ = crate::PAGE_ALLOCATOR.free(p);
                     }
                 }
@@ -444,10 +523,17 @@ fn map_anonymous_pages(vaddr: VirtualAddr, pages: usize) -> Result<(), SyscallRe
             }
         };
         zero_page(paddr);
-        if crate::KERNEL_PAGE_TABLE.lock().map_2mb(page_vaddr, paddr).is_err() {
+        if crate::KERNEL_PAGE_TABLE
+            .lock()
+            .map_2mb(page_vaddr, paddr)
+            .is_err()
+        {
             let _ = crate::PAGE_ALLOCATOR.free(paddr);
             for j in 0..i {
-                if let Ok(p) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE)) {
+                if let Ok(p) = crate::KERNEL_PAGE_TABLE
+                    .lock()
+                    .unmap_2mb(vaddr.add(j * PAGE_SIZE))
+                {
                     let _ = crate::PAGE_ALLOCATOR.free(p);
                 }
             }
@@ -491,7 +577,10 @@ fn private_copy_path(
     let vma = Vma {
         start: vaddr,
         end: VirtualAddr::new(vaddr.as_usize() + aligned_len),
-        backing: MappingBacking::PrivateFile { fuse_fh, fuse_nodeid },
+        backing: MappingBacking::PrivateFile {
+            fuse_fh,
+            fuse_nodeid,
+        },
     };
     crate::VMA_TABLE.lock().insert(vma);
 
@@ -521,7 +610,10 @@ fn dax_path(
 
     let fs = crate::fs();
 
-    if fs.setup_mapping(fuse_fh, file_offset, file_len, dax_offset, dax_flags).is_err() {
+    if fs
+        .setup_mapping(fuse_fh, file_offset, file_len, dax_offset, dax_flags)
+        .is_err()
+    {
         crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
         return Err(());
     }
@@ -530,10 +622,16 @@ fn dax_path(
     for i in 0..pages {
         let page_vaddr = vaddr.add(i * PAGE_SIZE);
         let dax_phys = DAX_WINDOW_BASE.add(dax_offset + i * PAGE_SIZE);
-        if crate::KERNEL_PAGE_TABLE.lock().map_2mb(page_vaddr, dax_phys).is_err() {
+        if crate::KERNEL_PAGE_TABLE
+            .lock()
+            .map_2mb(page_vaddr, dax_phys)
+            .is_err()
+        {
             // Rollback already-mapped DAX pages.
             for j in 0..i {
-                let _ = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(vaddr.add(j * PAGE_SIZE));
+                let _ = crate::KERNEL_PAGE_TABLE
+                    .lock()
+                    .unmap_2mb(vaddr.add(j * PAGE_SIZE));
             }
             let _ = fs.remove_mapping(dax_offset, aligned_len as u64);
             crate::DAX_ALLOCATOR.lock().free(dax_offset, pages);
@@ -567,7 +665,10 @@ fn restore_mmap_next(saved_next: Option<VirtualAddr>) {
 fn rollback_pages(from: u64, to: u64) {
     let mut v = from;
     while v < to {
-        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE.lock().unmap_2mb(VirtualAddr::new(v as usize)) {
+        if let Ok(paddr) = crate::KERNEL_PAGE_TABLE
+            .lock()
+            .unmap_2mb(VirtualAddr::new(v as usize))
+        {
             let _ = crate::PAGE_ALLOCATOR.free(paddr);
         }
         v += PAGE_SIZE as u64;

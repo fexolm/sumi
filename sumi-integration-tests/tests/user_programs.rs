@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn project_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn kernel_bin() -> PathBuf {
@@ -18,7 +21,13 @@ fn ensure_built() {
     let root = project_root();
 
     let status = Command::new("cargo")
-        .args(["build", "-p", "sumi-kernel", "--target", "x86_64-unknown-none"])
+        .args([
+            "build",
+            "-p",
+            "sumi-kernel",
+            "--target",
+            "x86_64-unknown-none",
+        ])
         .current_dir(&root)
         .status()
         .expect("failed to run cargo build for kernel");
@@ -92,6 +101,14 @@ fn run_program(binary_name: &str, share_dir: &Path) -> String {
     }
 
     stdout
+}
+
+fn timeout_cmd_available() -> bool {
+    Command::new("timeout")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn kvm_available() -> bool {
@@ -200,6 +217,10 @@ fn musl_gcc_available() -> bool {
     Command::new("musl-gcc").arg("--version").output().is_ok()
 }
 
+fn gcc_available() -> bool {
+    Command::new("gcc").arg("--version").output().is_ok()
+}
+
 /// Compile a C fixture with musl-gcc, dynamically linked (the default for musl-gcc).
 fn compile_musl_dynamic(src: &str, out_dir: &Path) -> PathBuf {
     let stem = Path::new(src).file_stem().unwrap().to_str().unwrap();
@@ -208,14 +229,41 @@ fn compile_musl_dynamic(src: &str, out_dir: &Path) -> PathBuf {
     let fixture_path = project_root().join("tests/fixtures").join(src);
 
     let status = Command::new("musl-gcc")
+        .args(["-o", out.to_str().unwrap(), fixture_path.to_str().unwrap()])
+        .status()
+        .expect("failed to run musl-gcc");
+    assert!(status.success(), "compiling {src} with musl-gcc failed");
+
+    out
+}
+
+fn compile_glibc_dynamic(src: &str, out_dir: &Path) -> PathBuf {
+    let stem = Path::new(src).file_stem().unwrap().to_str().unwrap();
+    let out = out_dir.join("bin").join(stem);
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let fixture_path = project_root().join("tests/fixtures").join(src);
+
+    // Pin -march to the x86-64-v2 baseline. Anything higher (v3 / native) makes
+    // gcc emit unconditional VEX-encoded instructions in the user binary itself,
+    // which #UD inside sumi because we deliberately leave CR4.OSXSAVE clear (see
+    // sumi-vm/src/arch/x86_64/kvm/cpuid_mask.rs). The CPUID mask only redirects
+    // glibc's IFUNC resolvers; precompiled user code is on its own.
+    let proc = Command::new("gcc")
         .args([
+            "-O2",
+            "-march=x86-64-v2",
             "-o",
             out.to_str().unwrap(),
             fixture_path.to_str().unwrap(),
         ])
-        .status()
-        .expect("failed to run musl-gcc");
-    assert!(status.success(), "compiling {src} with musl-gcc failed");
+        .output()
+        .expect("failed to run gcc");
+    assert!(
+        proc.status.success(),
+        "compiling {src} with gcc failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&proc.stdout),
+        String::from_utf8_lossy(&proc.stderr),
+    );
 
     out
 }
@@ -252,6 +300,43 @@ fn setup_musl_libs(share_dir: &Path) {
     }
 }
 
+/// Run a user binary located on the host filesystem under sumi-vm using
+/// `--share /`. The binary's PT_INTERP and DT_NEEDED libraries resolve
+/// natively against the host (no staging dir, no library copies). This is
+/// the canonical way to run a glibc-linked binary.
+fn run_host_program_with_timeout(host_path: &Path, timeout_secs: u32) -> String {
+    ensure_built();
+    let kernel = kernel_bin();
+    let vm = vm_bin();
+    let proc = Command::new("timeout")
+        .arg(format!("{timeout_secs}"))
+        .arg(&vm)
+        .args([
+            "run",
+            kernel.to_str().unwrap(),
+            "--share",
+            "/",
+            "--run",
+            host_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sumi-vm under timeout");
+    if proc.status.code() == Some(124) {
+        let stdout = String::from_utf8_lossy(&proc.stdout);
+        let stderr = String::from_utf8_lossy(&proc.stderr);
+        panic!(
+            "sumi-vm hit {timeout_secs}s timeout running {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            host_path.display()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&proc.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&proc.stderr).to_string();
+    if !stderr.is_empty() {
+        eprintln!("--- stderr ---\n{stderr}");
+    }
+    stdout
+}
+
 #[test]
 fn dynamic_hello_musl() {
     if !kvm_available() {
@@ -279,17 +364,46 @@ fn dynamic_hello_musl() {
     );
 }
 
+#[test]
+fn dynamic_hello_glibc() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not available");
+        return;
+    }
+    if !gcc_available() {
+        eprintln!("skipping: gcc not available");
+        return;
+    }
+    if !timeout_cmd_available() {
+        eprintln!("skipping: timeout(1) not available");
+        return;
+    }
+
+    ensure_built();
+    let tmp = TempDir::new();
+    let host_bin = compile_glibc_dynamic("dynamic_hello_glibc.c", tmp.path());
+    // Run via `--share /`: the binary lives in tmp on the host filesystem,
+    // its PT_INTERP and DT_NEEDED libraries resolve natively against the host
+    // root. No staging of /lib64 or /lib/x86_64-linux-gnu required.
+    let output = run_host_program_with_timeout(&host_bin, 30);
+
+    assert!(
+        output.contains("Hello from glibc!"),
+        "expected 'Hello from glibc!' in output, got:\n{output}"
+    );
+    assert!(
+        output.contains("[exit] code=0"),
+        "expected clean exit in output, got:\n{output}"
+    );
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "sumi-inttest-{}-{}",
-            std::process::id(),
-            id
-        ));
+        let dir = std::env::temp_dir().join(format!("sumi-inttest-{}-{}", std::process::id(), id));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }

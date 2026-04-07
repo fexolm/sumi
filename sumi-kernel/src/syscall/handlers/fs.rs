@@ -209,7 +209,13 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
     let fuse_buf = [0u8; 4096];
     let fuse_buf_phys = crate::fs::virtio_fs::VirtioFsClient::v2p(fuse_buf.as_ptr());
 
-    let fuse_bytes = match fs.readdir(fuse_nodeid, fuse_fh, dir_offset, fuse_buf_phys, fuse_buf.len() as u32) {
+    let fuse_bytes = match fs.readdir(
+        fuse_nodeid,
+        fuse_fh,
+        dir_offset,
+        fuse_buf_phys,
+        fuse_buf.len() as u32,
+    ) {
         Ok(n) => n as usize,
         Err(e) => return e as SyscallResult,
     };
@@ -245,8 +251,8 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
 
         // Determine file type from FUSE dirent type field
         let d_type = match dirent.typ {
-            4 => DT_DIR,  // DT_DIR
-            8 => DT_REG,  // DT_REG
+            4 => DT_DIR, // DT_DIR
+            8 => DT_REG, // DT_REG
             _ => DT_UNKNOWN,
         };
 
@@ -254,20 +260,10 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
         // SAFETY: Writing linux_dirent64 fields and name to user buffer.
         // The buffer is checked to have `reclen` bytes available above.
         unsafe {
-            write_linux_dirent64_header(
-                dest,
-                dirent.ino,
-                dirent.off as i64,
-                reclen as u16,
-                d_type,
-            );
+            write_linux_dirent64_header(dest, dirent.ino, dirent.off as i64, reclen as u16, d_type);
             // Copy name after the 19-byte header
             let name_src = fuse_buf.as_ptr().add(fuse_pos + fuse_dirent_hdr_size);
-            core::ptr::copy_nonoverlapping(
-                name_src,
-                dest.add(LINUX_DIRENT64_HEADER_SIZE),
-                namelen,
-            );
+            core::ptr::copy_nonoverlapping(name_src, dest.add(LINUX_DIRENT64_HEADER_SIZE), namelen);
             // Null terminator + zero padding to alignment
             for i in (LINUX_DIRENT64_HEADER_SIZE + namelen)..reclen {
                 core::ptr::write(dest.add(i), 0u8);
@@ -294,9 +290,7 @@ pub fn sys_getdents64(args: &SyscallArgs) -> SyscallResult {
 
         let mut table = crate::FD_TABLE.lock();
         if let Some(desc) = table.get_mut(fd_num)
-            && let FdKind::Directory {
-                ref mut offset, ..
-            } = desc.kind
+            && let FdKind::Directory { ref mut offset, .. } = desc.kind
         {
             *offset = last_off;
         }
@@ -397,6 +391,7 @@ pub fn sys_creat(args: &SyscallArgs) -> SyscallResult {
             fuse_fh: open.fh,
             fuse_nodeid: entry.nodeid,
             offset: 0,
+            size: 0, // freshly created via creat() — will be updated on writes
         },
         flags,
     };
@@ -467,6 +462,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
                     fuse_fh: open.fh,
                     fuse_nodeid: entry.nodeid,
                     offset: 0,
+                    size: 0, // O_CREAT path — file is empty
                 },
                 flags,
             };
@@ -505,11 +501,19 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
             }
         };
 
+        // Capture file size at open time so mmap can bound DAX setup_mapping
+        // to the actual file extent (avoids SIGBUS on past-EOF DAX accesses).
+        let size = match fs.getattr(nodeid) {
+            Ok(attr) => attr.attr.size,
+            Err(_) => 0,
+        };
+
         let desc = FileDescriptor {
             kind: FdKind::File {
                 fuse_fh: open_out.fh,
                 fuse_nodeid: nodeid,
                 offset: 0,
+                size,
             },
             flags,
         };

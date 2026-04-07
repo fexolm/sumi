@@ -8,7 +8,11 @@ static WALL_CLOCK_NSEC: AtomicU32 = AtomicU32::new(0);
 pub fn init(tsc_freq_khz: u32, wall_clock_sec: u64, wall_clock_nsec: u32) {
     // Clamp nsec to valid range — the hypervisor should never send an invalid
     // value, but guard against it to avoid arithmetic issues in clock_realtime.
-    let nsec = if wall_clock_nsec >= 1_000_000_000 { 0 } else { wall_clock_nsec };
+    let nsec = if wall_clock_nsec >= 1_000_000_000 {
+        0
+    } else {
+        wall_clock_nsec
+    };
     // Single-threaded init — Relaxed ordering is sufficient.
     // If multi-vCPU support is added, use Release here and Acquire on reads.
     TSC_FREQ_KHZ.store(tsc_freq_khz, Ordering::Relaxed);
@@ -56,8 +60,8 @@ pub fn monotonic_ns() -> u64 {
     let delta = rdtsc().wrapping_sub(BOOT_TSC.load(Ordering::Relaxed));
     let whole_ms = delta / freq;
     let remainder = delta % freq;
-    let ns = (whole_ms as u128 * 1_000_000u128)
-        + ((remainder as u128 * 1_000_000u128) / freq as u128);
+    let ns =
+        (whole_ms as u128 * 1_000_000u128) + ((remainder as u128 * 1_000_000u128) / freq as u128);
     ns as u64
 }
 

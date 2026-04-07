@@ -5,15 +5,21 @@ use sumi_vm::{Hypervisor, VmCreateInfo, run_sumi_vm};
 
 #[derive(Debug, Args)]
 pub struct RunCommand {
-    /// Path to the program binary that will be loaded into the VM.
-    #[arg(value_name = "PROGRAM")]
+    /// Path to the kernel ELF binary that will be loaded into the VM.
+    #[arg(value_name = "KERNEL")]
     program: PathBuf,
 
-    /// Host directory to share with the guest as its root filesystem.
-    #[arg(long = "share", value_name = "DIR")]
-    share_dir: Option<PathBuf>,
+    /// Host directory exposed to the guest as its root filesystem.
+    /// Defaults to "/" so the guest sees the host filesystem natively
+    /// (every absolute path resolves to the same file as on the host),
+    /// which means glibc-linked binaries can be run without staging
+    /// `ld-linux-x86-64.so.2` and `libc.so.6` into a separate share dir.
+    #[arg(long = "share", value_name = "DIR", default_value = "/")]
+    share_dir: PathBuf,
 
-    /// Path to the user program, relative to the share root.
+    /// Path to the user program, interpreted inside the guest's view of
+    /// the share root. With the default `--share /`, this is just the
+    /// host's absolute path to the binary (e.g. `/tmp/hello`).
     #[arg(long = "run", value_name = "PATH")]
     run_path: Option<String>,
 
@@ -29,7 +35,7 @@ impl RunCommand {
             hypervisor: Hypervisor::Kvm,
             mem_size: 2 << 30,
             kernel_path: self.program,
-            share_dir: self.share_dir,
+            share_dir: Some(self.share_dir),
             run_path: self.run_path,
             gdb_port: self.gdb_port,
         };

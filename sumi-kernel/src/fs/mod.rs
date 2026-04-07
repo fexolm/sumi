@@ -12,6 +12,10 @@ pub enum FdKind {
         fuse_fh: u64,
         fuse_nodeid: u64,
         offset: u64,
+        /// File size at open time. Used by `mmap` to bound the host's
+        /// `setup_mapping` length so DAX never extends past EOF (which would
+        /// SIGBUS the host on access). Refreshed by `fstat`.
+        size: u64,
     },
     /// Host directory accessed via virtio-fs FUSE.
     Directory {
@@ -125,7 +129,12 @@ mod tests {
     fn alloc_returns_lowest_free() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         // First alloc should return fd 3 (0-2 are console)
@@ -137,7 +146,12 @@ mod tests {
     fn free_and_realloc_reuses_slot() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         let fd = table.alloc(desc);
@@ -178,7 +192,12 @@ mod tests {
     fn get_mut_updates_offset() {
         let mut table = make_table();
         let desc = FileDescriptor {
-            kind: FdKind::File { fuse_fh: 1, fuse_nodeid: 1, offset: 0 },
+            kind: FdKind::File {
+                fuse_fh: 1,
+                fuse_nodeid: 1,
+                offset: 0,
+                size: 0,
+            },
             flags: 0,
         };
         let fd = table.alloc(desc);

@@ -5,8 +5,8 @@ use breakpoints::BreakpointManager;
 use rsp::{decode_hex, encode_hex, parse_hex_num};
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use vm_memory::GuestMemoryMmap;
 
 // --- Channel types between GDB stub thread and vCPU thread ---
@@ -134,7 +134,11 @@ pub struct VCpuDebugReceiver {
 }
 
 /// Create the channel pair for GDB stub <-> vCPU communication.
-pub fn create_debug_channels() -> (Sender<DebugCommand>, Receiver<DebugEvent>, VCpuDebugReceiver) {
+pub fn create_debug_channels() -> (
+    Sender<DebugCommand>,
+    Receiver<DebugEvent>,
+    VCpuDebugReceiver,
+) {
     let (cmd_tx, cmd_rx) = channel();
     let (event_tx, event_rx) = channel();
     (cmd_tx, event_rx, VCpuDebugReceiver { cmd_rx, event_tx })
@@ -171,7 +175,10 @@ impl GdbServer {
                 return;
             }
         };
-        eprintln!("[gdb] listening on port {}, waiting for GDB to connect...", port);
+        eprintln!(
+            "[gdb] listening on port {}, waiting for GDB to connect...",
+            port
+        );
 
         let (stream, addr) = match listener.accept() {
             Ok(s) => s,
@@ -393,9 +400,7 @@ impl GdbServer {
             .send(DebugCommand::ReadMemory { addr, len })
             .ok();
         match self.event_rx.recv() {
-            Ok(DebugEvent::Memory(bytes)) => {
-                rsp::send_packet(stream, &encode_hex(&bytes))
-            }
+            Ok(DebugEvent::Memory(bytes)) => rsp::send_packet(stream, &encode_hex(&bytes)),
             Ok(DebugEvent::Error(_)) => rsp::send_error(stream, 14),
             _ => rsp::send_error(stream, 1),
         }
@@ -498,10 +503,7 @@ impl GdbServer {
 
     fn handle_query(&self, data: &[u8], stream: &mut TcpStream) -> std::io::Result<()> {
         if data.starts_with(b"Supported") {
-            rsp::send_packet(
-                stream,
-                b"PacketSize=4096;swbreak+;hwbreak+;vContSupported+",
-            )
+            rsp::send_packet(stream, b"PacketSize=4096;swbreak+;hwbreak+;vContSupported+")
         } else if data.starts_with(b"Attached") {
             // We created the process (not attached to existing)
             rsp::send_packet(stream, b"1")

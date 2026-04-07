@@ -1,5 +1,5 @@
-use crate::kprint;
 use crate::fs::virtio_fs::VirtioFsClient;
+use crate::kprint;
 use crate::selftest::SelfTest;
 use sumi_abi::fuse::FUSE_ROOT_ID;
 

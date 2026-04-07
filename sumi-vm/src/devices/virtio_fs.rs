@@ -106,11 +106,8 @@ impl VirtioFs {
             let entry_addr = queue.used_addr + 4 + (used_idx % QUEUE_SIZE) as u64 * 8;
             mem.write_slice(&(head as u32).to_le_bytes(), GuestAddress(entry_addr))
                 .unwrap();
-            mem.write_slice(
-                &total_written.to_le_bytes(),
-                GuestAddress(entry_addr + 4),
-            )
-            .unwrap();
+            mem.write_slice(&total_written.to_le_bytes(), GuestAddress(entry_addr + 4))
+                .unwrap();
 
             let new_used_idx = used_idx.wrapping_add(1);
             // Write flags (unchanged) and new idx
@@ -167,12 +164,7 @@ impl VirtioFs {
         self.dispatch_fuse(header, &req_data, &readable_bufs, &writable_bufs, mem)
     }
 
-    fn read_desc(
-        &self,
-        queue: &VirtqueueState,
-        idx: u16,
-        mem: &GuestMemoryMmap<()>,
-    ) -> VirtqDesc {
+    fn read_desc(&self, queue: &VirtqueueState, idx: u16, mem: &GuestMemoryMmap<()>) -> VirtqDesc {
         let addr = queue.desc_addr + idx as u64 * 16;
         let mut buf = [0u8; 16];
         mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
@@ -229,9 +221,8 @@ impl VirtioFs {
             error: 0,
             unique,
         };
-        let hdr_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(&out_header as *const _ as *const u8, hdr_size)
-        };
+        let hdr_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(&out_header as *const _ as *const u8, hdr_size) };
 
         if writable_bufs.is_empty() {
             return 0;
@@ -284,9 +275,8 @@ impl VirtioFs {
             error: errno,
             unique,
         };
-        let hdr_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(&out_header as *const _ as *const u8, hdr_size)
-        };
+        let hdr_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(&out_header as *const _ as *const u8, hdr_size) };
 
         if writable_bufs.is_empty() {
             return 0;
@@ -337,7 +327,10 @@ impl VirtioFs {
     ) -> u32 {
         let hdr_size = core::mem::size_of::<FuseInHeader>();
         let name_bytes = &req_data[hdr_size..];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+        let name_end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
         let name = match std::str::from_utf8(&name_bytes[..name_end]) {
             Ok(s) => s,
             Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
@@ -683,10 +676,7 @@ impl VirtioFs {
             };
 
             let dirent_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    &dirent as *const _ as *const u8,
-                    dirent_hdr_size,
-                )
+                core::slice::from_raw_parts(&dirent as *const _ as *const u8, dirent_hdr_size)
             };
             buf.extend_from_slice(dirent_bytes);
             buf.extend_from_slice(name_bytes);
@@ -784,8 +774,7 @@ impl VirtioFs {
     ) -> u32 {
         let hdr_size = core::mem::size_of::<FuseInHeader>();
         if req_data.len() >= hdr_size + core::mem::size_of::<FuseReleaseIn>() {
-            let release_in =
-                unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseReleaseIn) };
+            let release_in = unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseReleaseIn) };
             let fh = release_in.fh as usize;
             if fh < self.file_handles.len() {
                 self.file_handles[fh] = None;
@@ -816,8 +805,7 @@ impl VirtioFs {
         }
 
         // SAFETY: req_data is large enough and aligned for FuseSetupMappingIn (repr(C)).
-        let setup_in =
-            unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseSetupMappingIn) };
+        let setup_in = unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseSetupMappingIn) };
 
         let dax_base = match self.dax_host_ptr {
             Some(ptr) => ptr,
@@ -826,7 +814,10 @@ impl VirtioFs {
 
         let moffset = setup_in.moffset as usize;
         let len = setup_in.len as usize;
-        if moffset.checked_add(len).is_none_or(|end| end > DAX_WINDOW_SIZE) {
+        if moffset
+            .checked_add(len)
+            .is_none_or(|end| end > DAX_WINDOW_SIZE)
+        {
             return self.write_error(header.unique, -22, writable_bufs, mem);
         }
 
@@ -860,9 +851,7 @@ impl VirtioFs {
         };
 
         if result == libc::MAP_FAILED {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(5);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
             return self.write_error(header.unique, -errno, writable_bufs, mem);
         }
 
@@ -894,13 +883,16 @@ impl VirtioFs {
         // 8-byte aligned.
         let remove_one = unsafe {
             core::ptr::read_unaligned(
-                req_data[hdr_size + in_size..].as_ptr() as *const FuseRemoveMappingOne,
+                req_data[hdr_size + in_size..].as_ptr() as *const FuseRemoveMappingOne
             )
         };
 
         let moffset = remove_one.moffset as usize;
         let len = remove_one.len as usize;
-        if moffset.checked_add(len).is_none_or(|end| end > DAX_WINDOW_SIZE) {
+        if moffset
+            .checked_add(len)
+            .is_none_or(|end| end > DAX_WINDOW_SIZE)
+        {
             return self.write_error(header.unique, -22, writable_bufs, mem);
         }
 
@@ -922,9 +914,7 @@ impl VirtioFs {
         };
 
         if result == libc::MAP_FAILED {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(5);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
             return self.write_error(header.unique, -errno, writable_bufs, mem);
         }
 
@@ -941,7 +931,12 @@ impl VirtioBackend for VirtioFs {
         2
     }
 
-    fn process_queue(&mut self, _queue_idx: usize, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
+    fn process_queue(
+        &mut self,
+        _queue_idx: usize,
+        queue: &VirtqueueState,
+        mem: &GuestMemoryMmap<()>,
+    ) {
         self.process_queue_inner(queue, mem);
     }
 }

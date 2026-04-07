@@ -51,9 +51,7 @@ impl DirectMap for TestDirectMap {
         if vaddr.as_usize() < base || vaddr.as_usize() >= base + self.len {
             return None;
         }
-        Some(PhysicalAddr::new(
-            vaddr.as_usize() - base + self.phys_base,
-        ))
+        Some(PhysicalAddr::new(vaddr.as_usize() - base + self.phys_base))
     }
 }
 

@@ -62,7 +62,10 @@ mod tests {
     #[test]
     fn boot_info_flag_has_run_path_is_bit_zero() {
         assert_eq!(BOOT_INFO_FLAG_HAS_RUN_PATH, 1);
-        assert_eq!(BOOT_INFO_FLAG_HAS_RUN_PATH & (BOOT_INFO_FLAG_HAS_RUN_PATH - 1), 0,
-            "flag must be a single bit");
+        assert_eq!(
+            BOOT_INFO_FLAG_HAS_RUN_PATH & (BOOT_INFO_FLAG_HAS_RUN_PATH - 1),
+            0,
+            "flag must be a single bit"
+        );
     }
 }

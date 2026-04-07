@@ -1,6 +1,6 @@
 use kvm_bindings::{
-    kvm_guest_debug, kvm_userspace_memory_region, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
-    KVM_GUESTDBG_USE_SW_BP,
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES,
+    kvm_guest_debug, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VcpuExit;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -16,9 +16,7 @@ use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::debug::breakpoints::{BreakpointManager, read_guest_memory, write_guest_memory};
-use crate::debug::{
-    DebugCommand, DebugEvent, RegisterFile, StopReason, VCpuDebugReceiver,
-};
+use crate::debug::{DebugCommand, DebugEvent, RegisterFile, StopReason, VCpuDebugReceiver};
 use crate::devices::DeviceRegistry;
 use crate::{
     error::Result,
@@ -46,6 +44,8 @@ const CR0_TS: u64 = 1 << 3;
 const CR0_NE: u64 = 1 << 5;
 const CR0_PG: u64 = 1 << 31;
 const RFLAGS_RESERVED: u64 = 2;
+
+mod cpuid_mask;
 
 // Segment selectors / descriptor types
 const CS_SELECTOR: u16 = 0x8;
@@ -260,6 +260,19 @@ impl VCpu for KvmVCpu {
     }
 
     fn init(&mut self, entry_point: u64) -> Result<()> {
+        // Mask AVX/AVX2/AVX-512/FMA from the guest CPUID before the first
+        // KVM_RUN. We do not enable CR4.OSXSAVE or set XCR0, so the guest
+        // cannot legally execute AVX instructions. Masking the CPUID bits
+        // keeps glibc IFUNC resolvers on the SSE2 baseline. See
+        // docs/glibc-support-design.md §5.
+        // TODO: Hoist CPUID setup into KvmVm::new and pass the masked CpuId through
+        // to each vCPU. Currently we re-open /dev/kvm here, which is a layering
+        // inversion. See round 2 review issue W1.
+        let kvm = kvm_ioctls::Kvm::new()?;
+        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        cpuid_mask::apply(cpuid.as_mut_slice());
+        self.fd.set_cpuid2(&cpuid)?;
+
         // General purpose registers:
         // - RIP: instruction pointer where the guest will start executing
         // - RSP: stack pointer inside guest memory
@@ -277,6 +290,12 @@ impl VCpu for KvmVCpu {
         let mut sregs = self.fd.get_sregs()?;
         sregs.cr3 = DIRECT_MAP_PML4.as_u64(); // CR3 = physical address of the PML4 (page-table root)
 
+        // CR4.OSXSAVE is intentionally NOT set. The CPUID mask in
+        // apply_cpuid_avx_mask removes all VEX/EVEX feature bits so glibc
+        // IFUNC resolvers stay on the SSE2 baseline. If you set OSXSAVE
+        // here, you also need to set XCR0 via xsetbv AND remove the CPUID
+        // mask, or you will create a half-broken vCPU. See
+        // docs/glibc-support-design.md §5.
         // CR4.PAE must be set to enable physical-address-extension paging required
         // by 64-bit mode page tables.
         sregs.cr4 |= CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
@@ -391,10 +410,7 @@ impl VCpu for KvmVCpu {
                         let cr3 = self.get_cr3()?;
                         match read_guest_memory(&self.mem, cr3, addr, len) {
                             Ok(data) => dbg.event_tx.send(DebugEvent::Memory(data)).ok(),
-                            Err(e) => dbg
-                                .event_tx
-                                .send(DebugEvent::Error(e.to_string()))
-                                .ok(),
+                            Err(e) => dbg.event_tx.send(DebugEvent::Error(e.to_string())).ok(),
                         };
                         continue;
                     }
@@ -402,10 +418,7 @@ impl VCpu for KvmVCpu {
                         let cr3 = self.get_cr3()?;
                         match write_guest_memory(&self.mem, cr3, addr, &data) {
                             Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
-                            Err(e) => dbg
-                                .event_tx
-                                .send(DebugEvent::Error(e.to_string()))
-                                .ok(),
+                            Err(e) => dbg.event_tx.send(DebugEvent::Error(e.to_string())).ok(),
                         };
                         continue;
                     }
@@ -413,10 +426,7 @@ impl VCpu for KvmVCpu {
                         let cr3 = self.get_cr3()?;
                         match breakpoints.insert_sw(addr, &self.mem, cr3) {
                             Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
-                            Err(e) => dbg
-                                .event_tx
-                                .send(DebugEvent::Error(e.to_string()))
-                                .ok(),
+                            Err(e) => dbg.event_tx.send(DebugEvent::Error(e.to_string())).ok(),
                         };
                         continue;
                     }
@@ -424,10 +434,7 @@ impl VCpu for KvmVCpu {
                         let cr3 = self.get_cr3()?;
                         match breakpoints.remove_sw(addr, &self.mem, cr3) {
                             Ok(()) => dbg.event_tx.send(DebugEvent::Ok).ok(),
-                            Err(e) => dbg
-                                .event_tx
-                                .send(DebugEvent::Error(e.to_string()))
-                                .ok(),
+                            Err(e) => dbg.event_tx.send(DebugEvent::Error(e.to_string())).ok(),
                         };
                         continue;
                     }

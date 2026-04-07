@@ -145,11 +145,7 @@ impl VirtioConsole {
             // to the kernel virtual address in the direct-map window.
             let tx_virt = VirtualAddr::new(DIRECT_MAP_OFFSET.as_usize() + self.tx_buf.as_usize());
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    chunk.as_ptr(),
-                    tx_virt.as_ptr::<u8>(),
-                    chunk_len,
-                );
+                core::ptr::copy_nonoverlapping(chunk.as_ptr(), tx_virt.as_ptr::<u8>(), chunk_len);
             }
 
             let head = match queue.alloc_desc() {
@@ -235,14 +231,9 @@ impl VirtioConsole {
         // to the kernel virtual address in the direct-map window.
         let copy_len = bytes_read.min(read_len);
         if copy_len > 0 {
-            let rx_virt =
-                VirtualAddr::new(DIRECT_MAP_OFFSET.as_usize() + self.rx_buf.as_usize());
+            let rx_virt = VirtualAddr::new(DIRECT_MAP_OFFSET.as_usize() + self.rx_buf.as_usize());
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    rx_virt.as_ptr::<u8>(),
-                    buf.as_mut_ptr(),
-                    copy_len,
-                );
+                core::ptr::copy_nonoverlapping(rx_virt.as_ptr::<u8>(), buf.as_mut_ptr(), copy_len);
             }
         }
         drop(queue);

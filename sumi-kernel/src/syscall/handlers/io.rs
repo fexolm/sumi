@@ -31,11 +31,19 @@ const SEEK_END: u64 = 2;
 fn release_fuse_resources(desc: &FileDescriptor) {
     let fs = crate::fs();
     match desc.kind {
-        FdKind::File { fuse_fh, fuse_nodeid, .. } => {
+        FdKind::File {
+            fuse_fh,
+            fuse_nodeid,
+            ..
+        } => {
             fs.release(fuse_fh);
             fs.forget(fuse_nodeid, 1);
         }
-        FdKind::Directory { fuse_fh, fuse_nodeid, .. } => {
+        FdKind::Directory {
+            fuse_fh,
+            fuse_nodeid,
+            ..
+        } => {
             fs.releasedir(fuse_fh);
             fs.forget(fuse_nodeid, 1);
         }
@@ -117,20 +125,24 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
         FdKind::Console => {
             // SAFETY: In sumi unikernel, all user virtual addresses are valid
             // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
-            let buf = unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, count as usize) };
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, count as usize) };
             console_read(buf) as SyscallResult
         }
         FdKind::File {
             fuse_fh, offset, ..
         } => {
             let fs = crate::fs();
-            match fs_transfer_chunked(|off, pa, cnt| fs.read(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
+            match fs_transfer_chunked(
+                |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
+                offset,
+                buf_vaddr,
+                count,
+            ) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num)
-                        && let FdKind::File {
-                            ref mut offset, ..
-                        } = desc.kind
+                        && let FdKind::File { ref mut offset, .. } = desc.kind
                     {
                         *offset += n as u64;
                     }
@@ -167,13 +179,16 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
             fuse_fh, offset, ..
         } => {
             let fs = crate::fs();
-            match fs_transfer_chunked(|off, pa, cnt| fs.write(fuse_fh, off, pa, cnt), offset, buf_vaddr, count as u32) {
+            match fs_transfer_chunked(
+                |off, pa, cnt| fs.write(fuse_fh, off, pa, cnt),
+                offset,
+                buf_vaddr,
+                count as u32,
+            ) {
                 Ok(n) => {
                     let mut table = crate::FD_TABLE.lock();
                     if let Some(desc) = table.get_mut(fd_num)
-                        && let FdKind::File {
-                            ref mut offset, ..
-                        } = desc.kind
+                        && let FdKind::File { ref mut offset, .. } = desc.kind
                     {
                         *offset += n as u64;
                     }
@@ -292,7 +307,11 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(d) => match d.kind {
-                FdKind::File { offset, fuse_nodeid, .. } => (offset, fuse_nodeid),
+                FdKind::File {
+                    offset,
+                    fuse_nodeid,
+                    ..
+                } => (offset, fuse_nodeid),
                 FdKind::Console => return -29, // ESPIPE
                 _ => return EBADF,
             },
@@ -341,7 +360,10 @@ pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
 }
 
 pub fn sys_ioctl(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+    // ENOTTY signals "not a terminal" so glibc's __isatty() correctly
+    // detects that stdout is not a TTY. ENOSYS would be treated differently
+    // and may cause glibc to alter stdout buffering mode.
+    ENOTTY
 }
 
 pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
@@ -361,7 +383,12 @@ pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
     match kind {
         FdKind::File { fuse_fh, .. } => {
             let fs = crate::fs();
-            match fs_transfer_chunked(|off, pa, cnt| fs.read(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
+            match fs_transfer_chunked(
+                |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
+                offset,
+                buf_vaddr,
+                count,
+            ) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }
@@ -387,7 +414,12 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
     match kind {
         FdKind::File { fuse_fh, .. } => {
             let fs = crate::fs();
-            match fs_transfer_chunked(|off, pa, cnt| fs.write(fuse_fh, off, pa, cnt), offset, buf_vaddr, count) {
+            match fs_transfer_chunked(
+                |off, pa, cnt| fs.write(fuse_fh, off, pa, cnt),
+                offset,
+                buf_vaddr,
+                count,
+            ) {
                 Ok(n) => n as SyscallResult,
                 Err(e) => e as SyscallResult,
             }
@@ -415,11 +447,15 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
             for i in 0..iovcnt {
                 let (iov_base, iov_len) = read_iovec(iov_ptr, i);
                 let iov_len = iov_len as usize;
-                if iov_len == 0 { continue; }
+                if iov_len == 0 {
+                    continue;
+                }
                 let buf = unsafe { core::slice::from_raw_parts_mut(iov_base as *mut u8, iov_len) };
                 let n = console_read(buf);
                 total += n;
-                if n < iov_len { break; }
+                if n < iov_len {
+                    break;
+                }
             }
             total as SyscallResult
         }
@@ -457,9 +493,7 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
             // Update offset
             let mut table = crate::FD_TABLE.lock();
             if let Some(desc) = table.get_mut(fd_num)
-                && let FdKind::File {
-                    ref mut offset, ..
-                } = desc.kind
+                && let FdKind::File { ref mut offset, .. } = desc.kind
             {
                 *offset = cur_offset;
             }
@@ -488,7 +522,9 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             for i in 0..iovcnt {
                 let (iov_base, iov_len) = read_iovec(iov_ptr, i);
                 let iov_len = iov_len as usize;
-                if iov_len == 0 { continue; }
+                if iov_len == 0 {
+                    continue;
+                }
                 let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
                 total += console_write(data);
             }
@@ -528,9 +564,7 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             // Update offset
             let mut table = crate::FD_TABLE.lock();
             if let Some(desc) = table.get_mut(fd_num)
-                && let FdKind::File {
-                    ref mut offset, ..
-                } = desc.kind
+                && let FdKind::File { ref mut offset, .. } = desc.kind
             {
                 *offset = cur_offset;
             }
@@ -555,10 +589,10 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     match table.get(fd_num) {
         None => EBADF,
         Some(desc) => match cmd {
-            F_GETFD => 0,                       // no close-on-exec in unikernel
-            F_SETFD => 0,                       // ignore
+            F_GETFD => 0, // no close-on-exec in unikernel
+            F_SETFD => 0, // ignore
             F_GETFL => desc.flags as SyscallResult,
-            F_SETFL => 0,                       // ignore
+            F_SETFL => 0, // ignore
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let new_desc = *desc;
                 drop(table);

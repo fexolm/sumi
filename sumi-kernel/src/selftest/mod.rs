@@ -1,8 +1,8 @@
+use crate::syscall::{SyscallArgs, syscall_dispatch};
 /// Kernel selftests — run inside the actual kernel under KVM.
 ///
 /// Each suite runs if its preconditions are met. Suites are independent.
 use crate::{kprint, kprintln};
-use crate::syscall::{SyscallArgs, syscall_dispatch};
 
 mod fd_table;
 mod syscalls;

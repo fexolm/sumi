@@ -1,5 +1,6 @@
 use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
+use sumi_abi::arch::layout::USER_STACK_SIZE;
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -71,8 +72,68 @@ pub fn sys_gettimeofday(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
-pub fn sys_getrlimit(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+// Linux x86_64 RLIMIT_* numbers (kernel ABI, stable).
+const RLIMIT_DATA: u64 = 2;
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_CORE: u64 = 4;
+const RLIMIT_NOFILE: u64 = 7;
+const RLIMIT_AS: u64 = 9;
+const RLIM_INFINITY: u64 = u64::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rlimit {
+    rlim_cur: u64,
+    rlim_max: u64,
+}
+
+/// Single source of truth for both prlimit64 and getrlimit. Returns None for
+/// resources we don't model. glibc uses RLIMIT_STACK during startup to compute
+/// guard pages — see docs/glibc-support-design.md §4.2.
+fn rlimit_for(resource: u64) -> Option<Rlimit> {
+    match resource {
+        RLIMIT_STACK => Some(Rlimit {
+            rlim_cur: USER_STACK_SIZE as u64,
+            rlim_max: USER_STACK_SIZE as u64,
+        }),
+        RLIMIT_NOFILE => Some(Rlimit {
+            rlim_cur: 1024,
+            rlim_max: 1024,
+        }),
+        RLIMIT_AS => Some(Rlimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        }),
+        RLIMIT_DATA => Some(Rlimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        }),
+        RLIMIT_CORE => Some(Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        }),
+        _ => None,
+    }
+}
+
+pub fn sys_getrlimit(args: &SyscallArgs) -> SyscallResult {
+    let resource = args.arg0;
+    let old_limit = args.arg1 as *mut Rlimit;
+
+    let val = match rlimit_for(resource) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    if !old_limit.is_null() {
+        // SAFETY: single-process unikernel — user pointer lives in the same
+        // address space as the kernel. Caller is responsible for the buffer
+        // being writable Rlimit-sized memory.
+        unsafe {
+            *old_limit = val;
+        }
+    }
+    0
 }
 
 pub fn sys_clock_gettime(args: &SyscallArgs) -> SyscallResult {
@@ -156,8 +217,7 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
 
     if flags & TIMER_ABSTIME != 0 {
         // Absolute sleep: wait until the clock reaches the target time.
-        let target_ns =
-            ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+        let target_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
         let now_ns = match clock_id {
             CLOCK_REALTIME => {
                 let (s, n) = crate::time::clock_realtime();
@@ -170,8 +230,7 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
         }
     } else {
         // Relative sleep.
-        let total_ns =
-            ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+        let total_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
         crate::time::busy_wait_ns(total_ns);
 
         // Write zero remainder — we never get interrupted.
@@ -189,40 +248,143 @@ pub fn sys_clock_nanosleep(args: &SyscallArgs) -> SyscallResult {
 }
 
 pub fn sys_prlimit64(args: &SyscallArgs) -> SyscallResult {
-    #[repr(C)]
-    struct Rlimit {
-        rlim_cur: u64,
-        rlim_max: u64,
-    }
-
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NOFILE: u64 = 7;
-
-    let _pid = args.arg0;
+    // pid_t is a 32-bit signed int per Linux ABI; high bits in the register
+    // are not meaningful.
+    let pid = args.arg0 as i32;
     let resource = args.arg1;
-    let _new_limit = args.arg2 as *const Rlimit;
+    // arg2 is `const struct rlimit64 *new_limit`. We deliberately never
+    // dereference it — see test `prlimit64_ignores_new_limit`.
+    let _ = args.arg2;
     let old_limit = args.arg3 as *mut Rlimit;
 
+    // Linux checks resource validity before task lookup, so EINVAL takes
+    // precedence over ESRCH.
+    let val = match rlimit_for(resource) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    // Linux's do_prlimit accepts pid == 0 (current) OR pid == current->pid.
+    // We are pid 1 — accept both. Anything else is ESRCH.
+    if pid != 0 && pid != 1 {
+        return ESRCH;
+    }
+
     if !old_limit.is_null() {
-        let val = match resource {
-            RLIMIT_STACK => Rlimit {
-                rlim_cur: 8 * 1024 * 1024,
-                rlim_max: u64::MAX,
-            },
-            RLIMIT_NOFILE => Rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            },
-            _ => Rlimit {
-                rlim_cur: u64::MAX,
-                rlim_max: u64::MAX,
-            },
-        };
-        // SAFETY: The caller (user program running in ring-0) is responsible for
-        // passing valid, aligned pointers. Invalid pointers will cause a fault.
+        // SAFETY: single-process unikernel — user pointer lives in the same
+        // address space as the kernel; caller is responsible for the buffer
+        // being a writable, properly-aligned 16-byte Rlimit.
         unsafe {
             *old_limit = val;
         }
     }
     0
+}
+
+#[cfg(test)]
+mod rlimit_tests {
+    use super::*;
+
+    fn make_args(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> SyscallArgs {
+        SyscallArgs {
+            nr: 0,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4: 0,
+            arg5: 0,
+        }
+    }
+
+    #[test]
+    fn rlimit_for_stack_returns_user_stack_size() {
+        let r = rlimit_for(RLIMIT_STACK).unwrap();
+        assert_eq!(r.rlim_cur, USER_STACK_SIZE as u64);
+        assert_eq!(r.rlim_max, USER_STACK_SIZE as u64);
+    }
+
+    #[test]
+    fn rlimit_for_nofile_is_1024() {
+        let r = rlimit_for(RLIMIT_NOFILE).unwrap();
+        assert_eq!(r.rlim_cur, 1024);
+        assert_eq!(r.rlim_max, 1024);
+    }
+
+    #[test]
+    fn rlimit_for_as_is_infinity() {
+        let r = rlimit_for(RLIMIT_AS).unwrap();
+        assert_eq!(r.rlim_cur, u64::MAX);
+        assert_eq!(r.rlim_max, u64::MAX);
+    }
+
+    #[test]
+    fn rlimit_for_unknown_returns_none() {
+        assert!(rlimit_for(99999).is_none());
+    }
+
+    #[test]
+    fn getrlimit_writes_old_pointer() {
+        let mut rl = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let args = make_args(RLIMIT_STACK, &mut rl as *mut Rlimit as u64, 0, 0);
+        assert_eq!(sys_getrlimit(&args), 0);
+        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
+    }
+
+    #[test]
+    fn getrlimit_null_old_returns_zero() {
+        let args = make_args(RLIMIT_STACK, 0, 0, 0);
+        assert_eq!(sys_getrlimit(&args), 0);
+    }
+
+    #[test]
+    fn getrlimit_unknown_resource_einval() {
+        let args = make_args(99999, 0, 0, 0);
+        assert_eq!(sys_getrlimit(&args), EINVAL);
+    }
+
+    #[test]
+    fn prlimit64_pid_zero_stack() {
+        let mut rl = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let args = make_args(0, RLIMIT_STACK, 0, &mut rl as *mut Rlimit as u64);
+        assert_eq!(sys_prlimit64(&args), 0);
+        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
+    }
+
+    #[test]
+    fn prlimit64_pid_nonzero_esrch() {
+        let args = make_args(2, RLIMIT_STACK, 0, 0);
+        assert_eq!(sys_prlimit64(&args), ESRCH);
+    }
+
+    #[test]
+    fn prlimit64_pid_one_succeeds() {
+        let mut rl = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let args = make_args(1, RLIMIT_STACK, 0, &mut rl as *mut Rlimit as u64);
+        assert_eq!(sys_prlimit64(&args), 0);
+        assert_eq!(rl.rlim_cur, USER_STACK_SIZE as u64);
+    }
+
+    #[test]
+    fn prlimit64_unknown_resource_einval() {
+        let args = make_args(0, 99999, 0, 0);
+        assert_eq!(sys_prlimit64(&args), EINVAL);
+    }
+
+    #[test]
+    fn prlimit64_ignores_new_limit() {
+        // Pass a clearly garbage pointer for new_limit; the function must NOT
+        // dereference it. arg3=NULL ensures no write either.
+        let args = make_args(0, RLIMIT_STACK, 0xDEAD_BEEF, 0);
+        assert_eq!(sys_prlimit64(&args), 0);
+    }
 }

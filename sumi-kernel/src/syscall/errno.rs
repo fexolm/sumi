@@ -1,5 +1,6 @@
 use super::SyscallResult;
 
+pub const ESRCH: SyscallResult = -3;
 pub const EIO: SyscallResult = -5;
 pub const EBADF: SyscallResult = -9;
 pub const EAGAIN: SyscallResult = -11;
@@ -8,4 +9,5 @@ pub const EFAULT: SyscallResult = -14;
 pub const ENOTDIR: SyscallResult = -20;
 pub const EINVAL: SyscallResult = -22;
 pub const EMFILE: SyscallResult = -24;
+pub const ENOTTY: SyscallResult = -25;
 pub const ENOSYS: SyscallResult = -38;
