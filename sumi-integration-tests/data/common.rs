@@ -25,7 +25,7 @@ global_asm!(
     "    and rsp, -16",
     "    call sumi_main",
     "    mov rdi, rax",
-    "    mov rax, 231",     // exit_group
+    "    mov rax, 231", // exit_group
     "    syscall",
     "    ud2",
 );
@@ -36,139 +36,52 @@ global_asm!(
 
 // ── raw syscall ────────────────────────────────────────────────────────────
 
-#[inline]
-unsafe fn syscall0(nr: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
+macro_rules! syscall_fn {
+    ($name:ident($($arg:ident),*) [$($operand:tt)*]) => {
+        #[inline]
+        unsafe fn $name(nr: u64, $($arg: u64),*) -> i64 {
+            let ret: i64;
+            unsafe {
+                asm!(
+                    "syscall",
+                    inlateout("rax") nr => ret,
+                    $($operand)*
+                    out("rcx") _,
+                    out("r11") _,
+                    options(nostack),
+                );
+            }
+            ret
+        }
+    };
 }
 
-#[inline]
-unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            in("r8")  a4,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall6(
-    nr: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    a4: u64,
-    a5: u64,
-) -> i64 {
-    let ret: i64;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            in("r8") a4,
-            in("r9") a5,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
+syscall_fn!(syscall0() []);
+syscall_fn!(syscall1(a0) [in("rdi") a0,]);
+syscall_fn!(syscall2(a0, a1) [in("rdi") a0, in("rsi") a1,]);
+syscall_fn!(syscall3(a0, a1, a2) [in("rdi") a0, in("rsi") a1, in("rdx") a2,]);
+syscall_fn!(
+    syscall4(a0, a1, a2, a3) [in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,]
+);
+syscall_fn!(
+    syscall5(a0, a1, a2, a3, a4) [
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        in("r8") a4,
+    ]
+);
+syscall_fn!(
+    syscall6(a0, a1, a2, a3, a4, a5) [
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        in("r8") a4,
+        in("r9") a5,
+    ]
+);
 
 // ── syscall numbers (Linux x86_64) ─────────────────────────────────────────
 
@@ -216,7 +129,7 @@ const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
-const SYS_CLONE:       u64 = 56;
+const SYS_CLONE: u64 = 56;
 const SYS_SCHED_YIELD: u64 = 24;
 
 // ── flag constants ─────────────────────────────────────────────────────────
@@ -244,13 +157,12 @@ const CLOCK_MONOTONIC: u64 = 1;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 
-const CLONE_VM:      u64 = 0x0000_0100;
-const CLONE_FS:      u64 = 0x0000_0200;
-const CLONE_FILES:   u64 = 0x0000_0400;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
-const CLONE_THREAD:  u64 = 0x0001_0000;
-const CLONE_REQUIRED: u64 =
-    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_REQUIRED: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -264,7 +176,14 @@ fn sys_write(fd: i64, buf: &[u8]) -> i64 {
 
 #[inline]
 fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
-    unsafe { syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+    unsafe {
+        syscall3(
+            SYS_READ,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
 }
 
 #[inline]
@@ -280,15 +199,7 @@ fn sys_open(path: &[u8], flags: u64, mode: u64) -> i64 {
 
 #[inline]
 fn sys_openat(dirfd: i64, path: &[u8], flags: u64, mode: u64) -> i64 {
-    unsafe {
-        syscall4(
-            SYS_OPENAT,
-            dirfd as u64,
-            path.as_ptr() as u64,
-            flags,
-            mode,
-        )
-    }
+    unsafe { syscall4(SYS_OPENAT, dirfd as u64, path.as_ptr() as u64, flags, mode) }
 }
 
 #[inline]
@@ -358,14 +269,7 @@ fn sys_brk(addr: u64) -> i64 {
 }
 
 #[inline]
-fn sys_mmap(
-    addr: u64,
-    len: u64,
-    prot: u64,
-    flags: u64,
-    fd: i64,
-    offset: u64,
-) -> i64 {
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> i64 {
     unsafe { syscall6(SYS_MMAP, addr, len, prot, flags, fd as u64, offset) }
 }
 
@@ -473,14 +377,7 @@ fn sys_fcntl(fd: i64, cmd: u64, arg: u64) -> i64 {
 
 #[inline]
 fn sys_futex(uaddr: *const u32, op: u64, val: u64) -> i64 {
-    unsafe {
-        syscall3(
-            SYS_FUTEX,
-            uaddr as u64,
-            op,
-            val,
-        )
-    }
+    unsafe { syscall3(SYS_FUTEX, uaddr as u64, op, val) }
 }
 
 #[inline]
@@ -534,12 +431,8 @@ fn sys_sched_yield() -> i64 {
 }
 
 #[inline]
-fn sys_clone(flags: u64, child_stack: u64, ptid: *mut i32,
-             ctid: *mut i32, tls: u64) -> i64 {
-    unsafe {
-        syscall5(SYS_CLONE, flags, child_stack,
-                 ptid as u64, ctid as u64, tls)
-    }
+fn sys_clone(flags: u64, child_stack: u64, ptid: *mut i32, ctid: *mut i32, tls: u64) -> i64 {
+    unsafe { syscall5(SYS_CLONE, flags, child_stack, ptid as u64, ctid as u64, tls) }
 }
 
 #[inline]

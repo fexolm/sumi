@@ -95,8 +95,7 @@ fn main() {
     emit_category(&mut generated, "glibc", &glibc_tests);
     emit_category(&mut generated, "rust_std", &rust_std_tests);
 
-    fs::write(out_dir.join("generated_tests.rs"), generated)
-        .expect("write generated_tests.rs");
+    fs::write(out_dir.join("generated_tests.rs"), generated).expect("write generated_tests.rs");
 }
 
 fn emit_category(out: &mut String, category: &str, sources: &[PathBuf]) {
@@ -180,12 +179,9 @@ fn sanitize_ident(name: &str) -> String {
 /// single self-contained file. The resulting binary is `#![no_std]`,
 /// defines its own `_start`, links statically, and never references libc.
 fn compile_rust_no_std(src: &Path, out_bin: &Path) {
-    if let Some(parent) = out_bin.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-
-    let status = Command::new("rustc")
-        .args([
+    compile_with(
+        "rustc",
+        &[
             "--edition=2024",
             "--target",
             RUST_NO_STD_TARGET,
@@ -204,13 +200,12 @@ fn compile_rust_no_std(src: &Path, out_bin: &Path) {
             "-A",
             "warnings",
             "-o",
-        ])
-        .arg(out_bin)
-        .arg(src)
-        .status()
-        .expect("failed to invoke rustc");
-
-    assert!(status.success(), "rustc failed for {}", src.display());
+        ],
+        src,
+        out_bin,
+        &[],
+        "failed to invoke rustc",
+    );
 }
 
 /// Compile a `data/rust_std/<name>.rs` into a statically-linked musl ELF
@@ -222,12 +217,9 @@ fn compile_rust_no_std(src: &Path, out_bin: &Path) {
 /// The host must have the `x86_64-unknown-linux-musl` target installed:
 /// `rustup target add x86_64-unknown-linux-musl`.
 fn compile_rust_std(src: &Path, out_bin: &Path) {
-    if let Some(parent) = out_bin.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-
-    let status = Command::new("rustc")
-        .args([
+    compile_with(
+        "rustc",
+        &[
             "--edition=2024",
             "--target",
             RUST_STD_TARGET,
@@ -244,13 +236,12 @@ fn compile_rust_std(src: &Path, out_bin: &Path) {
             "-A",
             "warnings",
             "-o",
-        ])
-        .arg(out_bin)
-        .arg(src)
-        .status()
-        .expect("failed to invoke rustc for rust_std test");
-
-    assert!(status.success(), "rustc failed for {}", src.display());
+        ],
+        src,
+        out_bin,
+        &[],
+        "failed to invoke rustc for rust_std test",
+    );
 }
 
 /// Compile a `data/glibc/<name>.c` into a dynamically-linked ELF binary.
@@ -260,25 +251,43 @@ fn compile_rust_std(src: &Path, out_bin: &Path) {
 /// `sumi-vm/src/arch/x86_64/kvm/cpuid_mask.rs`), so anything higher would
 /// `#UD` inside the guest before the program ever reaches `main`.
 fn compile_c(src: &Path, out_bin: &Path) {
-    if let Some(parent) = out_bin.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-
-    let status = Command::new("gcc")
-        .args([
+    compile_with(
+        "gcc",
+        &[
             "-O2",
             "-march=x86-64-v2",
             "-Wall",
             "-Wno-unused-result",
             "-o",
-        ])
-        .arg(out_bin)
-        .arg(src)
+        ],
+        src,
+        out_bin,
         // -lm so any libm symbol (sqrt/sin/...) is satisfied unconditionally;
         // -lpthread for code that touches pthread_*; both are no-ops if unused.
-        .args(["-lm", "-lpthread"])
-        .status()
-        .expect("failed to invoke gcc — is gcc installed?");
+        &["-lm", "-lpthread"],
+        "failed to invoke gcc — is gcc installed?",
+    );
+}
 
-    assert!(status.success(), "gcc failed for {}", src.display());
+fn compile_with(
+    program: &str,
+    args: &[&str],
+    src: &Path,
+    out_bin: &Path,
+    tail_args: &[&str],
+    expect_msg: &str,
+) {
+    if let Some(parent) = out_bin.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+
+    let status = Command::new(program)
+        .args(args)
+        .arg(out_bin)
+        .arg(src)
+        .args(tail_args)
+        .status()
+        .expect(expect_msg);
+
+    assert!(status.success(), "{program} failed for {}", src.display());
 }

@@ -142,198 +142,71 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (String, String, boo
 /// that every CPU 1..N printed `[ap] cpu <id> online`. Used by the
 /// SMP smoke test.
 pub fn run_test_smp(name: &str, vcpus: u32) {
-    if !kvm_available() {
-        eprintln!("skipping {name} (smp): /dev/kvm not available");
-        return;
-    }
-    ensure_built();
-
-    let host_bin = bin_dir().join(name);
-    assert!(host_bin.exists(), "test binary {name} not found");
-
-    let guest_path = host_bin.to_str().expect("non-UTF8 binary path");
-
-    let mut cmd = Command::new(vm_bin());
-    cmd.arg("run")
-        .arg(kernel_bin())
-        .arg("--share")
-        .arg("/")
-        .arg("--vcpus")
-        .arg(vcpus.to_string())
-        .arg("--run")
-        .arg(guest_path);
-
-    let (stdout, stderr, timed_out) = run_with_timeout(cmd, TEST_TIMEOUT);
-
-    let exit_code = find_last_exit_code(&stdout);
-    let passed = !timed_out && exit_code == Some(0);
-
-    // Every AP must have announced itself.
-    let mut missing = Vec::new();
-    for cpu_id in 1..vcpus {
-        let needle = format!("[ap] cpu {} online", cpu_id);
-        if !stdout.contains(&needle) {
-            missing.push(cpu_id);
-        }
-    }
-
-    if !passed || !missing.is_empty() {
-        eprintln!("--- {name} stdout ---\n{stdout}");
-        eprintln!("--- {name} stderr ---\n{stderr}");
-        if timed_out {
-            panic!("smp test {name} timed out after {TEST_TIMEOUT:?}");
-        }
-        if !missing.is_empty() {
-            panic!("smp test {name}: missing APs online: {:?}", missing);
-        }
-        match exit_code {
-            None => panic!("smp test {name} did not emit an [exit] code= line"),
-            Some(code) => panic!("smp test {name} exited with code={code} (expected 0)"),
-        }
-    }
+    run_guest(name, Some(vcpus), 0);
 }
 
 /// Like `run_test`, but asserts the kernel emitted `[exit] code=N`
 /// where `N == expected`. Used by tests that exercise non-zero exit
 /// codes (e.g. exit_seven for HC_SHUTDOWN code propagation).
 pub fn run_test_expect_exit(name: &str, expected: i32) {
-    if !kvm_available() {
-        eprintln!("skipping {name} (expect exit {expected}): /dev/kvm not available");
-        return;
-    }
-    ensure_built();
-
-    let host_bin = bin_dir().join(name);
-    assert!(host_bin.exists(), "test binary {name} not found");
-    let guest_path = host_bin.to_str().expect("non-UTF8 binary path");
-
-    let mut cmd = Command::new(vm_bin());
-    cmd.arg("run")
-        .arg(kernel_bin())
-        .arg("--share")
-        .arg("/")
-        .arg("--run")
-        .arg(guest_path);
-
-    let (stdout, stderr, timed_out) = run_with_timeout(cmd, TEST_TIMEOUT);
-    let exit_code = find_last_exit_code(&stdout);
-    let passed = !timed_out && exit_code == Some(expected);
-
-    if !passed {
-        eprintln!("--- {name} stdout ---\n{stdout}");
-        eprintln!("--- {name} stderr ---\n{stderr}");
-        if timed_out {
-            panic!("test {name} timed out after {TEST_TIMEOUT:?}");
-        }
-        match exit_code {
-            None => panic!("test {name} did not emit an [exit] code= line"),
-            Some(code) => panic!(
-                "test {name} exited with code={code} (expected {expected})",
-            ),
-        }
-    }
+    run_guest(name, None, expected);
 }
 
 /// Like `run_test_smp`, but asserts on a specific non-zero exit code
 /// in addition to the AP-online check.
 pub fn run_test_smp_expect_exit(name: &str, vcpus: u32, expected: i32) {
-    if !kvm_available() {
-        eprintln!("skipping {name} (smp, expect exit {expected}): /dev/kvm not available");
-        return;
-    }
-    ensure_built();
-
-    let host_bin = bin_dir().join(name);
-    assert!(host_bin.exists(), "test binary {name} not found");
-    let guest_path = host_bin.to_str().expect("non-UTF8 binary path");
-
-    let mut cmd = Command::new(vm_bin());
-    cmd.arg("run")
-        .arg(kernel_bin())
-        .arg("--share")
-        .arg("/")
-        .arg("--vcpus")
-        .arg(vcpus.to_string())
-        .arg("--run")
-        .arg(guest_path);
-
-    let (stdout, stderr, timed_out) = run_with_timeout(cmd, TEST_TIMEOUT);
-    let exit_code = find_last_exit_code(&stdout);
-    let passed = !timed_out && exit_code == Some(expected);
-
-    let mut missing = Vec::new();
-    for cpu_id in 1..vcpus {
-        let needle = format!("[ap] cpu {} online", cpu_id);
-        if !stdout.contains(&needle) {
-            missing.push(cpu_id);
-        }
-    }
-
-    if !passed || !missing.is_empty() {
-        eprintln!("--- {name} stdout ---\n{stdout}");
-        eprintln!("--- {name} stderr ---\n{stderr}");
-        if timed_out {
-            panic!("smp test {name} timed out after {TEST_TIMEOUT:?}");
-        }
-        if !missing.is_empty() {
-            panic!("smp test {name}: missing APs online: {:?}", missing);
-        }
-        match exit_code {
-            None => panic!("smp test {name} did not emit an [exit] code= line"),
-            Some(code) => panic!(
-                "smp test {name} exited with code={code} (expected {expected})",
-            ),
-        }
-    }
+    run_guest(name, Some(vcpus), expected);
 }
 
 /// Run a previously-compiled test binary inside sumi-vm and assert it
 /// exits cleanly. The binary's stdout is captured and printed on failure
 /// to aid debugging.
 pub fn run_test(name: &str) {
+    run_guest(name, None, 0);
+}
+
+fn run_guest(name: &str, vcpus: Option<u32>, expected_exit: i32) {
     if !kvm_available() {
         eprintln!("skipping {name}: /dev/kvm not available");
         return;
     }
-
     ensure_built();
 
     let host_bin = bin_dir().join(name);
-    assert!(
-        host_bin.exists(),
-        "test binary {} not found in {}",
-        name,
-        bin_dir().display()
-    );
-
-    // We use `--share /` so the binary's host path is also its guest path.
-    // No staging directory needed; everything resolves natively.
+    assert!(host_bin.exists(), "test binary {name} not found");
     let guest_path = host_bin.to_str().expect("non-UTF8 binary path");
-
     let mut cmd = Command::new(vm_bin());
-    cmd.arg("run")
-        .arg(kernel_bin())
-        .arg("--share")
-        .arg("/")
-        .arg("--run")
-        .arg(guest_path);
+    cmd.arg("run").arg(kernel_bin()).arg("--share").arg("/");
+    if let Some(vcpus) = vcpus {
+        cmd.arg("--vcpus").arg(vcpus.to_string());
+    }
+    cmd.arg("--run").arg(guest_path);
 
     let (stdout, stderr, timed_out) = run_with_timeout(cmd, TEST_TIMEOUT);
-
     let exit_code = find_last_exit_code(&stdout);
-    let passed = !timed_out && exit_code == Some(0);
+    let missing = vcpus
+        .map(|n| {
+            (1..n)
+                .filter(|cpu_id| !stdout.contains(&format!("[ap] cpu {cpu_id} online")))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    if !passed {
-        eprintln!("--- {name} stdout ---");
-        eprintln!("{stdout}");
-        eprintln!("--- {name} stderr ---");
-        eprintln!("{stderr}");
+    if timed_out || exit_code != Some(expected_exit) || !missing.is_empty() {
+        eprintln!("--- {name} stdout ---\n{stdout}");
+        eprintln!("--- {name} stderr ---\n{stderr}");
+        let kind = if vcpus.is_some() { "smp test" } else { "test" };
         if timed_out {
-            panic!("test {name} timed out after {TEST_TIMEOUT:?}");
+            panic!("{kind} {name} timed out after {TEST_TIMEOUT:?}");
+        }
+        if !missing.is_empty() {
+            panic!("smp test {name}: missing APs online: {missing:?}");
         }
         match exit_code {
-            None => panic!("test {name} did not emit an [exit] code= line"),
-            Some(code) => panic!("test {name} exited with code={code} (expected 0)"),
+            None => panic!("{kind} {name} did not emit an [exit] code= line"),
+            Some(code) => {
+                panic!("{kind} {name} exited with code={code} (expected {expected_exit})")
+            }
         }
     }
 }
@@ -343,25 +216,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn last_exit_code_picks_trailing_line() {
-        // A user program that prints "[exit] code=0" before the kernel's
-        // real exit line must NOT fool the harness.
-        let stdout = "hello\n[exit] code=0 (printed by user)\nmore output\n[exit] code=42\n";
-        assert_eq!(find_last_exit_code(stdout), Some(42));
-    }
-
-    #[test]
-    fn last_exit_code_picks_only_line_when_single() {
-        assert_eq!(find_last_exit_code("[exit] code=0\n"), Some(0));
-    }
-
-    #[test]
-    fn last_exit_code_missing_returns_none() {
-        assert_eq!(find_last_exit_code("no exit marker\n"), None);
-    }
-
-    #[test]
-    fn last_exit_code_without_trailing_newline() {
-        assert_eq!(find_last_exit_code("[exit] code=7"), Some(7));
+    fn last_exit_code_parses_kernel_marker() {
+        for (stdout, expected) in [
+            (
+                "hello\n[exit] code=0 (printed by user)\nmore output\n[exit] code=42\n",
+                Some(42),
+            ),
+            ("[exit] code=0\n", Some(0)),
+            ("no exit marker\n", None),
+            ("[exit] code=7", Some(7)),
+        ] {
+            assert_eq!(find_last_exit_code(stdout), expected);
+        }
     }
 }
