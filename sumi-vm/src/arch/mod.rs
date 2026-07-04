@@ -10,7 +10,7 @@ use crate::{
 mod x86_64;
 
 #[allow(unreachable_patterns)]
-pub fn run_sumi_vm(info: &VmCreateInfo) -> Result<()> {
+pub fn run_sumi_vm(info: &VmCreateInfo) -> Result<i32> {
     match info.hypervisor {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         Hypervisor::Kvm => SumiVm::<KvmVm>::new(info)?.run(),

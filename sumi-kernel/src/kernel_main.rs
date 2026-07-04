@@ -6,6 +6,7 @@ use sumi_kernel::{
     exec,
     fs::virtio_fs::VirtioFsClient,
     kprintln,
+    sched,
 };
 
 struct GlobalKernelAlloc;
@@ -34,7 +35,21 @@ static GLOBAL_ALLOC: GlobalKernelAlloc = GlobalKernelAlloc;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // Populate PER_CPU[0] and load IA32_GS_BASE so `syscall_entry` can
+    // reach its per-CPU syscall stack via `gs:[8]`/`gs:[16]`. MUST precede
+    // `syscall::init()` — the asm is live the moment `MSR_LSTAR` is
+    // programmed inside `syscall::init()`.
+    sched::init_for_cpu(0);
     syscall::init();
+
+    // Load TSS (for IST1 interrupt stack), IDT (exception and timer/IPI
+    // vectors), and start the LAPIC periodic timer (~1 ms).
+    // These must run BEFORE `sched::init_phase3_bsp()` so user-mode code
+    // is always entered with a valid IDT and LAPIC timer running.
+    sumi_kernel::arch::x86_64::tss::init_and_load(0);
+    sumi_kernel::arch::x86_64::idt::init_and_load();
+    sumi_kernel::arch::x86_64::lapic::init();
+
     sumi_kernel::FD_TABLE.lock().init_defaults();
 
     // Initialize virtio-fs if the device is present
@@ -49,8 +64,24 @@ pub extern "C" fn _start() -> ! {
         sumi_kernel::VIRTIO_CONSOLE.call_once(|| console);
     }
 
-    // Check for user program to execute
-    if let Some(path) = exec::read_boot_info() {
+    // Read boot info FIRST: this initializes time and RNG_SEED — both
+    // of which are globals that APs may eventually observe. KERNEL_READY
+    // must be set only after all such state is published.
+    let user_program_path = exec::read_boot_info();
+
+    // Register the BSP main thread and idle thread before APs start. Runs
+    // after PAGE_ALLOCATOR is usable (which it is from boot). Must run
+    // BEFORE KERNEL_READY so APs see valid PER_CPU[0].idle_thread.
+    sched::init_phase3_bsp();
+
+    // Last step of BSP init: release any AP currently spinning in
+    // `ap_main_rust`. MUST come after every global the APs could touch
+    // is published (virtio FS, virtio console, FD defaults, allocators,
+    // time, RNG seed, scheduler state).
+    use core::sync::atomic::Ordering;
+    sched::KERNEL_READY.store(true, Ordering::Release);
+
+    if let Some(path) = user_program_path {
         exec::exec_user_program(path);
     }
 
@@ -60,6 +91,13 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // SAFETY: panic handler runs with the kernel in a known-broken state.
+    // If the lock was held by some thread that panicked mid-print, force
+    // release it so this panic message and any subsequent debugcon writes
+    // from any CPU can proceed. spin::Mutex::force_unlock() is the
+    // approved API for exactly this case.
+    unsafe { sumi_kernel::arch::debugcon::force_unlock_debugcon() };
+
     // Write panic info to debugcon. Try fmt first for full message,
     // fall back to raw bytes if formatting fails.
     use core::fmt::Write;

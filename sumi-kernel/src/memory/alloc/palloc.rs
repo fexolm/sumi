@@ -1,7 +1,7 @@
 use crate::memory::errors::{MemoryError, Result};
 use sumi_abi::{
     address::PhysicalAddr,
-    arch::layout::{KERNEL_STACK, PAGE_SIZE},
+    arch::layout::{KERNEL_STACK, LAPIC_BASE_PHYS, PAGE_SIZE},
     layout::MAX_GUEST_MEMORY,
 };
 
@@ -9,6 +9,19 @@ const PALLOC_FIRST_PAGE: PhysicalAddr = KERNEL_STACK;
 
 const PAGE_COUNT: usize = MAX_GUEST_MEMORY.div_ceil(PAGE_SIZE);
 const BITMAP_SIZE: usize = PAGE_COUNT.div_ceil(64);
+
+/// Page index of the 2 MiB frame backing the LAPIC MMIO page. Permanently
+/// reserved: `sumi-vm` never registers a KVM memslot over this
+/// guest-physical range, so handing it out as ordinary RAM would let a
+/// guest write silently corrupt whatever the kernel put there instead of
+/// trapping to the emulated LAPIC register.
+const LAPIC_HOLE_PAGE: usize = LAPIC_BASE_PHYS.as_usize() / PAGE_SIZE;
+
+/// Number of pages reserved outside the contiguous `[0, reserved_pages())`
+/// range. Kept in sync with the number of individual `bitmap` bits set by
+/// `PageAllocatorImpl::new()` beyond `reserved_pages()`, so `used_pages()`
+/// and `stats()` don't count the LAPIC hole as allocator-visible usage.
+const RESERVED_EXTRA_PAGES: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -42,6 +55,18 @@ impl PageAllocatorImpl {
             bitmap[word] |= 1 << bit;
             page += 1;
         }
+
+        // Reserve the LAPIC hole. Assert (compile-time, since this is a
+        // const fn) that it doesn't fall inside the already-reserved range
+        // computed above — the OR below would silently be a no-op in that
+        // case, masking a future layout-constant regression.
+        assert!(
+            LAPIC_HOLE_PAGE >= reserved_pages,
+            "LAPIC hole overlaps the initial reserved page range",
+        );
+        let word = LAPIC_HOLE_PAGE / 64;
+        let bit = LAPIC_HOLE_PAGE % 64;
+        bitmap[word] |= 1 << bit;
 
         Self {
             bitmap,
@@ -87,6 +112,10 @@ impl PageAllocatorImpl {
 
     fn free(&mut self, addr: PhysicalAddr) -> Result<()> {
         let page_index = addr.as_usize() / PAGE_SIZE;
+        debug_assert_ne!(
+            page_index, LAPIC_HOLE_PAGE,
+            "attempted to free the reserved LAPIC hole frame",
+        );
         self.mark_pages(page_index, 1, false);
         Ok(())
     }
@@ -115,12 +144,13 @@ impl PageAllocatorImpl {
             used += word.count_ones() as usize;
         }
 
-        used.saturating_sub(Self::reserved_pages())
+        used.saturating_sub(Self::reserved_pages() + RESERVED_EXTRA_PAGES)
     }
 
     fn stats(&self) -> Stats {
         let used_pages = self.used_pages();
-        let alloc_limit_pages = PAGE_COUNT.saturating_sub(Self::reserved_pages());
+        let alloc_limit_pages =
+            PAGE_COUNT.saturating_sub(Self::reserved_pages() + RESERVED_EXTRA_PAGES);
         Stats {
             used_pages,
             used_bytes: used_pages * PAGE_SIZE,

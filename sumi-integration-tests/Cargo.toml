@@ -13,5 +13,9 @@ name = "test_launcher"
 path = "tests/test_launcher.rs"
 harness = true
 
+[dependencies]
+# For libc::kill(SIGKILL) when a child test hits the wall-clock timeout.
+libc = "0.2"
+
 [lints]
 workspace = true

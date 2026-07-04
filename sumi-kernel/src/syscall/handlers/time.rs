@@ -38,7 +38,9 @@ pub fn sys_nanosleep(args: &SyscallArgs) -> SyscallResult {
     }
 
     let total_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+    crate::kprintln!("[nanosleep] start {}ms", total_ns / 1_000_000);
     crate::time::busy_wait_ns(total_ns);
+    crate::kprintln!("[nanosleep] done");
 
     // Write zero remainder — we never get interrupted in a single-threaded unikernel.
     if !rem.is_null() {
@@ -102,7 +104,7 @@ struct Rlimit {
 
 /// Single source of truth for both prlimit64 and getrlimit. Returns None for
 /// resources we don't model. glibc uses RLIMIT_STACK during startup to compute
-/// guard pages — see docs/glibc-support-design.md §4.2.
+/// guard pages; see docs/glibc-support-design.md.
 fn rlimit_for(resource: u64) -> Option<Rlimit> {
     match resource {
         RLIMIT_STACK => Some(Rlimit {
@@ -293,4 +295,3 @@ pub fn sys_prlimit64(args: &SyscallArgs) -> SyscallResult {
     }
     0
 }
-

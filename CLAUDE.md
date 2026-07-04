@@ -1,6 +1,7 @@
 # sumi
 
-Unikernel that runs Linux ELF binaries. No context switching, no process isolation — everything runs in kernel space as a single process.
+Unikernel that runs Linux ELF binaries in one shared address space. There is no
+process isolation, but there is M:N threading over a fixed set of KVM vCPUs.
 
 ## Architecture
 
@@ -20,20 +21,17 @@ make build
 # Host-side unit tests for every crate
 make test
 
-# End-to-end tests: each binary in sumi-integration-tests/data/{syscalls,glibc}/
+# End-to-end tests: each binary in sumi-integration-tests/data/{syscalls,glibc,rust_std}/
 # is built and executed inside sumi under KVM (requires /dev/kvm and gcc).
 make integration-test
 ```
 
-The integration test framework lives in `sumi-integration-tests/`. Each
-`data/syscalls/<name>.rs` is a single-file `no_std` Rust program that uses
-raw syscalls (via `include!("../common.rs")`) to exercise one kernel feature.
-Each `data/glibc/<name>.c` is a glibc-linked C program that exercises the
-dynamic linker / libc surface. `build.rs` compiles each file into a binary
-and emits one `#[test]` per binary; the harness in `tests/test_launcher.rs`
-runs each binary inside `sumi-vm` and asserts that the kernel printed
-`[exit] code=0`. To add a new test, drop a new file into `data/syscalls/`
-or `data/glibc/`.
+The integration test framework lives in `sumi-integration-tests/`. Files under
+`data/syscalls/` are single-file Rust syscall tests, `data/glibc/` contains
+glibc-linked C tests, and `data/rust_std/` contains Rust standard-library
+threading tests. `build.rs` compiles each file into a binary and emits one
+`#[test]` per binary; the harness runs each binary inside `sumi-vm` and checks
+the guest exit code.
 
 ## Coding Standards
 
@@ -126,4 +124,5 @@ KERNEL_STACK            First allocatable page (palloc starts here)
 - `PageAllocator` — bitmap-based page allocator, 2MB pages
 - `KernelAllocator` — freelist-based sub-page allocator built on top of PageAllocator
 - `RootPageTable` — 3-level page table (PML4 -> PDPT -> PD) with 2MB huge pages
+- `sched` — per-CPU state, M:N scheduler, clone/futex/thread lifecycle
 - `VirtBackend` / `VCpu` traits — hypervisor abstraction (KVM impl)

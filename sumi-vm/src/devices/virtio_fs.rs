@@ -12,7 +12,9 @@ use sumi_abi::fuse::*;
 use sumi_abi::virtio::*;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::virtio_mmio::{VirtioBackend, VirtqueueState};
+use super::virtio_mmio::{
+    VirtioBackend, VirtqueueState, post_used, read_avail_head, read_avail_idx, read_desc,
+};
 
 struct FuseNode {
     host_path: PathBuf,
@@ -79,44 +81,12 @@ impl VirtioFs {
     }
 
     fn process_queue_inner(&mut self, queue: &VirtqueueState, mem: &GuestMemoryMmap<()>) {
-        // Read available ring idx
-        let mut buf = [0u8; 4];
-        mem.read_slice(&mut buf, GuestAddress(queue.avail_addr))
-            .unwrap();
-        let avail_idx = u16::from_le_bytes([buf[2], buf[3]]);
+        let avail_idx = read_avail_idx(queue, mem);
 
         while self.last_avail_idx != avail_idx {
-            let ring_idx = (self.last_avail_idx % QUEUE_SIZE) as u64;
-            let mut head_buf = [0u8; 2];
-            mem.read_slice(
-                &mut head_buf,
-                GuestAddress(queue.avail_addr + 4 + ring_idx * 2),
-            )
-            .unwrap();
-            let head = u16::from_le_bytes(head_buf);
-
+            let head = read_avail_head(queue, self.last_avail_idx, mem);
             let total_written = self.process_descriptor_chain(queue, head, mem);
-
-            // Write to used ring
-            let mut used_buf = [0u8; 4];
-            mem.read_slice(&mut used_buf, GuestAddress(queue.used_addr))
-                .unwrap();
-            let used_idx = u16::from_le_bytes([used_buf[2], used_buf[3]]);
-
-            let entry_addr = queue.used_addr + 4 + (used_idx % QUEUE_SIZE) as u64 * 8;
-            mem.write_slice(&(head as u32).to_le_bytes(), GuestAddress(entry_addr))
-                .unwrap();
-            mem.write_slice(&total_written.to_le_bytes(), GuestAddress(entry_addr + 4))
-                .unwrap();
-
-            let new_used_idx = used_idx.wrapping_add(1);
-            // Write flags (unchanged) and new idx
-            mem.write_slice(
-                &new_used_idx.to_le_bytes(),
-                GuestAddress(queue.used_addr + 2),
-            )
-            .unwrap();
-
+            post_used(queue, head, total_written, mem);
             self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
         }
     }
@@ -132,7 +102,7 @@ impl VirtioFs {
 
         let mut idx = head;
         loop {
-            let desc = self.read_desc(queue, idx, mem);
+            let desc = read_desc(queue, idx, mem);
             if desc.flags & VIRTQ_DESC_F_WRITE != 0 {
                 writable_bufs.push((desc.addr, desc.len));
             } else {
@@ -162,18 +132,6 @@ impl VirtioFs {
         let header = unsafe { &*(req_data.as_ptr() as *const FuseInHeader) };
 
         self.dispatch_fuse(header, &req_data, &readable_bufs, &writable_bufs, mem)
-    }
-
-    fn read_desc(&self, queue: &VirtqueueState, idx: u16, mem: &GuestMemoryMmap<()>) -> VirtqDesc {
-        let addr = queue.desc_addr + idx as u64 * 16;
-        let mut buf = [0u8; 16];
-        mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
-        VirtqDesc {
-            addr: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            flags: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
-            next: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
-        }
     }
 
     fn dispatch_fuse(

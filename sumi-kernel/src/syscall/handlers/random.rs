@@ -95,6 +95,8 @@ mod tests {
             arg3: 0,
             arg4: 0,
             arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         };
         assert_eq!(
             sys_getrandom(&args),
@@ -114,6 +116,8 @@ mod tests {
             arg3: 0,
             arg4: 0,
             arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         };
         assert_eq!(
             sys_getrandom(&args),

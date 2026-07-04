@@ -88,13 +88,13 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     let (vaddr, saved_next) = if flags & MAP_FIXED != 0 {
         (VirtualAddr::new(addr_hint as usize), None)
     } else {
-        let mut next = crate::MMAP_NEXT.lock();
-        if next.as_usize() < aligned_len {
+        let mut mem = crate::MEMORY_STATE.lock();
+        if mem.mmap_next.as_usize() < aligned_len {
             return ENOMEM;
         }
-        let old = *next;
-        let base = next.as_usize() - aligned_len;
-        *next = VirtualAddr::new(base);
+        let old = mem.mmap_next;
+        let base = mem.mmap_next.as_usize() - aligned_len;
+        mem.mmap_next = VirtualAddr::new(base);
         (VirtualAddr::new(base), Some(old))
     };
 
@@ -317,8 +317,42 @@ pub(super) fn replace_dax_with_private(
     Ok(())
 }
 
-pub fn sys_mprotect(_args: &SyscallArgs) -> SyscallResult {
-    // No-op: 2 MB pages are all RWX in ring 0
+const PROT_NONE: i32 = 0x0;
+
+pub fn sys_mprotect(args: &SyscallArgs) -> SyscallResult {
+    let addr = args.arg0 as usize;
+    let len = args.arg1 as usize;
+    let prot = args.arg2 as i32;
+
+    if len == 0 {
+        return 0;
+    }
+
+    // Align range to 2MB page boundaries — we manage pages at 2MB granularity.
+    let aligned_start = addr & !(PAGE_SIZE - 1);
+    let aligned_end = match addr.checked_add(len) {
+        Some(end) => (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
+        None => return EINVAL,
+    };
+
+    let pt = crate::KERNEL_PAGE_TABLE.lock();
+    let mut vaddr = aligned_start;
+    while vaddr < aligned_end {
+        let va = VirtualAddr::new(vaddr);
+        if prot == PROT_NONE {
+            // Ignore errors — the page might not be mapped (guard page at start of range).
+            let _ = pt.clear_present_2mb(va);
+        } else {
+            // Restore presence for any page that was hidden. Ignore errors similarly.
+            let _ = pt.restore_present_2mb(va);
+        }
+        vaddr += PAGE_SIZE;
+    }
+    drop(pt);
+
+    // Bump the TLB generation so all CPUs flush their TLBs at the next syscall return.
+    crate::TLB_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
+
     0
 }
 
@@ -361,11 +395,16 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
             // gaps in library reservations.
             unmap_pages_in_range(aligned_start, aligned_end);
         }
+        // Bump TLB generation so all CPUs flush their local TLBs at the next syscall return.
+        crate::TLB_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
         return 0;
     }
 
     // No VMA found — fall back to anonymous unmap behavior.
     unmap_pages_in_range(aligned_start, aligned_end);
+
+    // Bump TLB generation so all CPUs flush their local TLBs at the next syscall return.
+    crate::TLB_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     0
 }
@@ -389,14 +428,13 @@ fn unmap_pages_in_range(start: usize, end: usize) {
 
 pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
     let requested = args.arg0;
-    let mut current = crate::BRK_CURRENT.lock();
-    let base = *crate::BRK_BASE.lock();
+    let mut mem = crate::MEMORY_STATE.lock();
 
-    if requested == 0 || (requested as usize) < base.as_usize() {
-        return current.as_u64() as SyscallResult;
+    if requested == 0 || (requested as usize) < mem.brk_base.as_usize() {
+        return mem.brk_current.as_u64() as SyscallResult;
     }
 
-    let old_end = align_up_2mb(current.as_u64());
+    let old_end = align_up_2mb(mem.brk_current.as_u64());
     let new_end = align_up_2mb(requested);
 
     if new_end > old_end {
@@ -406,7 +444,7 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
                 Ok(p) => p,
                 Err(_) => {
                     rollback_pages(old_end, vaddr);
-                    return current.as_u64() as SyscallResult;
+                    return mem.brk_current.as_u64() as SyscallResult;
                 }
             };
             zero_page(paddr);
@@ -417,7 +455,7 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
             {
                 let _ = crate::PAGE_ALLOCATOR.free(paddr);
                 rollback_pages(old_end, vaddr);
-                return current.as_u64() as SyscallResult;
+                return mem.brk_current.as_u64() as SyscallResult;
             }
             vaddr += PAGE_SIZE as u64;
         }
@@ -434,7 +472,7 @@ pub fn sys_brk(args: &SyscallArgs) -> SyscallResult {
         }
     }
 
-    *current = VirtualAddr::new(requested as usize);
+    mem.brk_current = VirtualAddr::new(requested as usize);
     requested as SyscallResult
 }
 
@@ -653,10 +691,10 @@ fn dax_path(
     Ok((vaddr.as_u64() + sub_page_offset as u64) as SyscallResult)
 }
 
-/// Restore the MMAP_NEXT pointer if we reserved address space but need to roll back.
+/// Restore the mmap_next pointer if we reserved address space but need to roll back.
 fn restore_mmap_next(saved_next: Option<VirtualAddr>) {
     if let Some(old) = saved_next {
-        *crate::MMAP_NEXT.lock() = old;
+        crate::MEMORY_STATE.lock().mmap_next = old;
     }
 }
 

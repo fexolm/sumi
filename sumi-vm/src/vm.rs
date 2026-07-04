@@ -1,6 +1,7 @@
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
-use sumi_abi::arch::layout::{INTERP_LOAD_BASE, PIE_LOAD_BASE};
+use sumi_abi::arch::layout::{HYPERCALL_MMIO_BASE, INTERP_LOAD_BASE, PIE_LOAD_BASE};
+use sumi_abi::hypercall::{HC_KICK_CPU, HC_SHUTDOWN, HYPERCALL_MMIO_SIZE};
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -14,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
     thread,
 };
 
@@ -26,6 +28,180 @@ impl Display for Hypervisor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Hypervisor::Kvm => write!(f, "KVM"),
+        }
+    }
+}
+
+/// Run-loop control verdict returned from `HypercallContext::dispatch_mmio`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HypercallControl {
+    /// Re-enter `KVM_RUN`; the hypercall was a kick or flush for a peer.
+    Continue,
+    /// This vCPU executed `HC_SHUTDOWN`; its run loop must terminate.
+    Stop,
+}
+
+/// Decoded intent of a hypercall MMIO write. Pure data — no side effects,
+/// so the decoder is unit-testable without constructing a `HypercallContext`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HypercallAction {
+    /// Wake one specific peer vCPU (the issuing CPU is excluded by decode).
+    SignalOne(u32),
+    /// Wake every peer in the bitmask (issuing CPU's bit is cleared by decode).
+    SignalMask(u64),
+    /// Set shutdown + exit code; signal every peer; issuing vCPU stops.
+    Shutdown { exit_code: i32 },
+    /// Address was outside the hypercall range — fall back to device dispatcher.
+    NotHypercall,
+    /// Address was in range but data length was wrong, or offset was unknown.
+    Malformed,
+}
+
+/// Shared per-VM state used by the hypercall MMIO dispatcher inside
+/// each vCPU's run loop. Constructed once by `SumiVm::run` and cloned
+/// into every vCPU thread's closure via `Arc`.
+pub struct HypercallContext {
+    /// One slot per vCPU id; entry `i` holds the host pthread tid of
+    /// vCPU `i` (or `u64::MAX` if not yet published).
+    pub tid_slots: Box<[Arc<AtomicU64>]>,
+    /// Set to `true` when any vCPU executes `HC_SHUTDOWN`.
+    pub shutdown: Arc<AtomicBool>,
+    /// Last guest-supplied exit code. Written by the vCPU that executes
+    /// `HC_SHUTDOWN`; read by the supervisor after joining.
+    pub exit_code: Arc<AtomicI32>,
+}
+
+impl HypercallContext {
+    /// Construct a context using the given per-vCPU host-tid slots.
+    /// `tid_slots[i]` MUST be the slot for vCPU `i`; ordering is the
+    /// caller's responsibility.
+    pub fn new(tid_slots: Vec<Arc<AtomicU64>>) -> Self {
+        Self {
+            tid_slots: tid_slots.into_boxed_slice(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            exit_code: Arc::new(AtomicI32::new(0)),
+        }
+    }
+
+    /// Test-only convenience constructor: allocates `vcpu_count` fresh
+    /// sentinel slots so tests don't have to build `Vec<Arc<AtomicU64>>`.
+    #[cfg(test)]
+    pub fn new_for_test(vcpu_count: usize) -> Self {
+        let slots: Vec<Arc<AtomicU64>> = (0..vcpu_count)
+            .map(|_| Arc::new(AtomicU64::new(u64::MAX)))
+            .collect();
+        Self::new(slots)
+    }
+
+    /// Construct a single-CPU hypercall context for debug mode (one
+    /// vCPU, no peers to signal). Used by `KvmVCpu::run_debug`.
+    pub fn single_cpu_for_debug() -> Self {
+        Self::new(vec![Arc::new(AtomicU64::new(u64::MAX))])
+    }
+
+    /// Pure decoder. No side effects, no `pthread_kill`. Unit-testable.
+    ///
+    /// Returns `HypercallAction::NotHypercall` when the address is outside
+    /// the hypercall MMIO range (caller should fall through to device
+    /// dispatcher). Returns `Malformed` for any in-range write that is
+    /// syntactically wrong (wrong width, unknown offset).
+    pub fn decode(addr: u64, data: &[u8], issuing_cpu_id: u32) -> HypercallAction {
+        let base = HYPERCALL_MMIO_BASE.as_u64();
+        let end = base + HYPERCALL_MMIO_SIZE as u64;
+        if !(base..end).contains(&addr) {
+            return HypercallAction::NotHypercall;
+        }
+        if data.len() != 8 {
+            return HypercallAction::Malformed;
+        }
+        let arg = u64::from_le_bytes(data.try_into().unwrap());
+        let offset = (addr - base) as usize;
+        match offset {
+            HC_KICK_CPU => {
+                let target = arg as u32;
+                if target == issuing_cpu_id {
+                    // Self-kick is a no-op: the issuing CPU is currently running
+                    // so it doesn't need a signal to wake up. Map to an empty
+                    // signal mask so the applier still returns Continue.
+                    HypercallAction::SignalMask(0)
+                } else {
+                    HypercallAction::SignalOne(target)
+                }
+            }
+            HC_SHUTDOWN => HypercallAction::Shutdown {
+                exit_code: arg as u32 as i32,
+            },
+            _ => HypercallAction::Malformed,
+        }
+    }
+
+    /// Apply a decoded action: perform `pthread_kill`, store flags,
+    /// and return the run-loop control verdict.
+    ///
+    /// Order for `Shutdown`: store exit_code (Release) → store shutdown
+    /// (Release) → broadcast SIGUSR1. This ensures every AP that observes
+    /// the SIGUSR1 and re-checks the shutdown flag will see it as `true`.
+    pub fn apply(&self, action: HypercallAction, issuing_cpu_id: u32) -> HypercallControl {
+        match action {
+            HypercallAction::NotHypercall | HypercallAction::Malformed => {
+                HypercallControl::Continue
+            }
+            HypercallAction::SignalOne(target) => {
+                self.signal_cpu(target);
+                HypercallControl::Continue
+            }
+            HypercallAction::SignalMask(mask) => {
+                for cpu in 0..self.tid_slots.len() {
+                    if (mask >> cpu) & 1 != 0 {
+                        self.signal_cpu(cpu as u32);
+                    }
+                }
+                HypercallControl::Continue
+            }
+            HypercallAction::Shutdown { exit_code } => {
+                self.exit_code.store(exit_code, Ordering::Release);
+                self.shutdown.store(true, Ordering::Release);
+                // Signal every peer vCPU. The issuing vCPU is excluded:
+                // it returns Stop and its run loop exits directly, so
+                // signaling itself is wasteful (and would be re-entrant).
+                for cpu_id in 0..self.tid_slots.len() {
+                    if cpu_id as u32 == issuing_cpu_id {
+                        continue;
+                    }
+                    self.signal_cpu(cpu_id as u32);
+                }
+                HypercallControl::Stop
+            }
+        }
+    }
+
+    /// Decode + apply in one call. Returns `None` when the address is
+    /// outside the hypercall range so the caller can fall through to the
+    /// device MMIO dispatcher.
+    pub fn dispatch_mmio(
+        &self,
+        addr: u64,
+        data: &[u8],
+        issuing_cpu_id: u32,
+    ) -> Option<HypercallControl> {
+        match Self::decode(addr, data, issuing_cpu_id) {
+            HypercallAction::NotHypercall => None,
+            other => Some(self.apply(other, issuing_cpu_id)),
+        }
+    }
+
+    fn signal_cpu(&self, cpu_id: u32) {
+        if let Some(slot) = self.tid_slots.get(cpu_id as usize) {
+            let tid = slot.load(Ordering::Acquire);
+            if tid != u64::MAX {
+                // SAFETY: pthread_kill with a valid tid and SIGUSR1 is
+                // well-defined; the no-op handler is installed once at
+                // SumiVm::run startup. Release-Acquire on the tid store
+                // ensures we observe a valid pthread_t here.
+                unsafe {
+                    libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
+                }
+            }
         }
     }
 }
@@ -75,10 +251,47 @@ pub struct SumiVm<Backend: VirtBackend + 'static> {
     mem: Arc<GuestMemoryMmap<()>>,
     _backend: Backend,
     kernel_entry: u64,
+    ap_entry: u64,
     vcpus: Vec<Backend::VCpuType>,
     gdb_port: Option<u16>,
     kernel_path: PathBuf,
     user_debug: Option<UserDebugInfo>,
+}
+
+/// No-op SIGUSR1 handler. Installed exactly once per process before
+/// any vCPU host thread enters `KVM_RUN`, so that
+/// `pthread_kill(tid, SIGUSR1)` causes KVM_RUN to return
+/// `VcpuExit::Intr` instead of terminating the process.
+///
+/// Must be a plain `extern "C"` function with an empty body: calling
+/// any libc function that is not async-signal-safe from inside a
+/// signal handler is UB.
+extern "C" fn sumi_sigusr1_handler(_: libc::c_int) {}
+
+fn install_sigusr1_handler_once() -> Result<()> {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    let mut res: Result<()> = Ok(());
+    INSTALLED.get_or_init(|| {
+        // SAFETY: sigaction with a plain function pointer and a
+        // zeroed sigset is always well-defined. The handler itself
+        // is signal-safe (empty body). We take no action if
+        // sigaction fails — the signal will remain at its default
+        // action of terminating the process, which the run() path
+        // will notice when it tries to join the joined-on thread.
+        unsafe {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = sumi_sigusr1_handler as *const () as usize;
+            // SA_RESTART is deliberately NOT set: we WANT KVM_RUN's
+            // underlying ioctl to return EINTR so we can inspect the
+            // shutdown flag between calls.
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &sa, core::ptr::null_mut()) != 0 {
+                res = Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        }
+    });
+    res
 }
 
 impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
@@ -104,6 +317,12 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         }
 
         let kernel_entry = Self::load_elf(&mem, &info.kernel_path)?;
+
+        // Look up ap_start_asm once at construction so a missing symbol
+        // surfaces before any KVM_RUN.
+        let kernel_elf_data = std::fs::read(&info.kernel_path)?;
+        let ap_entry = Self::find_symbol(&kernel_elf_data, "ap_start_asm")?;
+
         let tsc_khz = vcpus.first().map(|v| v.tsc_khz()).unwrap_or(0);
         Self::write_boot_info(&mem, info, tsc_khz)?;
 
@@ -126,13 +345,19 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             vcpus,
             _backend: backend,
             kernel_entry,
+            ap_entry,
             gdb_port: info.gdb_port,
             kernel_path: info.kernel_path.clone(),
             user_debug,
         })
     }
 
-    pub fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<i32> {
+        // Install the SIGUSR1 no-op handler unconditionally so it is
+        // present in both the normal run path and the debug path (which
+        // may call self.run() after detach).
+        install_sigusr1_handler_once()?;
+
         if let Some(port) = self.gdb_port {
             // Capture GDB launch info before moving fields out of self.
             let kernel_path = self.kernel_path.clone();
@@ -167,26 +392,144 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                 Ok(r) => r?,
                 Err(_) => eprintln!("[vm] vCPU thread panicked"),
             }
-        } else {
-            // Normal (non-debug) mode
-            let threads = self
-                .vcpus
-                .into_iter()
-                .map(|mut cpu| {
-                    let kernel_entry = self.kernel_entry;
-                    thread::spawn(move || {
-                        cpu.init(kernel_entry)?;
-                        cpu.run()
-                    })
-                })
-                .collect::<Vec<_>>();
 
-            for t in threads {
-                t.join().unwrap()?;
+            // Debug mode always returns exit code 0.
+            Ok(0)
+        } else {
+            // Normal (non-debug) mode: BSP on vCPU 0, APs on the rest.
+            let kernel_entry = self.kernel_entry;
+            let ap_entry = self.ap_entry;
+            let vcpu_count = self.vcpus.len();
+
+            // Snapshot every vCPU's tid slot so the hypercall context can
+            // fan out signals. The order matches cpu_id (== index in vcpus).
+            let tid_slots: Vec<Arc<AtomicU64>> =
+                self.vcpus.iter().map(|c| c.host_tid_slot()).collect();
+            let hc_ctx = Arc::new(HypercallContext::new(tid_slots));
+            let shutdown = Arc::clone(&hc_ctx.shutdown);
+
+            // Counter incremented by EVERY vCPU (BSP included) after it
+            // stores its tid. The supervisor spins until all slots are
+            // published before it sends any signal, so it never calls
+            // pthread_kill with a stale u64::MAX tid.
+            let tid_published_count = Arc::new(AtomicUsize::new(0));
+
+            let mut handles: Vec<thread::JoinHandle<Result<()>>> =
+                Vec::with_capacity(vcpu_count);
+
+            for (cpu_id, mut cpu) in self.vcpus.into_iter().enumerate() {
+                let tid_slot = cpu.host_tid_slot();
+                let hc_ctx = Arc::clone(&hc_ctx);
+                let tid_published_count = Arc::clone(&tid_published_count);
+                let cpu_id = cpu_id as u32;
+                handles.push(thread::spawn(move || -> Result<()> {
+                    // Every vCPU (BSP included) publishes its tid so the
+                    // hypercall dispatcher can fan out SIGUSR1 to any peer
+                    // when any CPU issues HC_SHUTDOWN.
+                    // SAFETY: pthread_self never fails.
+                    let tid = unsafe { libc::pthread_self() } as u64;
+                    tid_slot.store(tid, Ordering::Release);
+                    // Release pairs with the Acquire spin in the supervisor.
+                    tid_published_count.fetch_add(1, Ordering::Release);
+
+                    if cpu_id == 0 {
+                        cpu.init(kernel_entry)?;
+                    } else {
+                        cpu.init_ap(ap_entry, cpu_id)?;
+                    }
+                    cpu.run(cpu_id, &hc_ctx)
+                }));
+            }
+
+            // Wait until every vCPU has stored its tid before joining anyone:
+            // every slot is valid before we signal.
+            while tid_published_count.load(Ordering::Acquire) < vcpu_count {
+                std::hint::spin_loop();
+            }
+
+            // Wait for the BSP to finish. Its run loop exits either from
+            // VcpuExit::Hlt (legacy halt fallback) or from HypercallControl::Stop
+            // (HC_SHUTDOWN path).
+            let bsp_handle = handles.remove(0);
+            let bsp_result = bsp_handle.join();
+
+            // If the BSP halted without HC_SHUTDOWN, publish shutdown here.
+            // If HC_SHUTDOWN already did it, this store is a no-op.
+            shutdown.store(true, Ordering::Release);
+
+            // Kick every AP out of KVM_RUN. HC_SHUTDOWN already did this
+            // from inside the issuing CPU's dispatcher, but we re-issue
+            // here for the BSP-hlt fallback path.
+            for slot in hc_ctx.tid_slots.iter().skip(1) {
+                let tid = slot.load(Ordering::Acquire);
+                if tid != u64::MAX {
+                    // SAFETY: pthread_kill with a valid tid and SIGUSR1 is
+                    // well-defined; the handler is already installed.
+                    unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1) };
+                }
+            }
+
+            // Surface any errors.
+            let mut first_err: Option<Error> = None;
+            match bsp_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => first_err = Some(e),
+                Err(_) => {
+                    eprintln!("[vm] BSP vCPU thread panicked");
+                    first_err = Some(Error::VcpuThreadPanicked);
+                }
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                    Ok(Err(_)) => {}
+                    Err(_) => {
+                        eprintln!("[vm] AP vCPU thread panicked");
+                        if first_err.is_none() {
+                            first_err = Some(Error::VcpuThreadPanicked);
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+
+            // Return the guest exit code if HC_SHUTDOWN was called, else 0
+            // (BSP halted without a hypercall).
+            let code = if hc_ctx.shutdown.load(Ordering::Acquire) {
+                hc_ctx.exit_code.load(Ordering::Acquire)
+            } else {
+                0
+            };
+            Ok(code)
+        }
+    }
+
+    /// Look up the virtual address of a symbol in the kernel ELF's
+    /// symbol tables. Returns an error if the symbol is missing — this
+    /// is a hard kernel-build bug, not a runtime edge case, so it must
+    /// never reach production silently.
+    fn find_symbol(elf_data: &[u8], name: &str) -> Result<u64> {
+        let elf = Elf::parse(elf_data)?;
+        for sym in elf.syms.iter().chain(elf.dynsyms.iter()) {
+            if sym.st_value == 0 {
+                continue;
+            }
+            let sym_name = elf
+                .strtab
+                .get_at(sym.st_name)
+                .or_else(|| elf.dynstrtab.get_at(sym.st_name));
+            if sym_name == Some(name) {
+                return Ok(sym.st_value);
             }
         }
-
-        Ok(())
+        Err(Error::Parsing(goblin::error::Error::Malformed(format!(
+            "kernel ELF does not export symbol `{}` (LTO may have dropped it — \
+             mark the definition `#[unsafe(no_mangle)]`)",
+            name
+        ))))
     }
 
     /// Parse user ELF to find .text load address and interpreter info.
@@ -407,6 +750,8 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             wall_clock_sec,
             wall_clock_nsec,
             rng_seed,
+            num_cpus: info.vcpu_count as u32,
+            _pad1: 0,
         };
 
         // SAFETY: BootInfo is repr(C) with no padding holes that matter.
@@ -538,8 +883,143 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
 }
 
 pub trait VCpu: Send {
+    /// Initialise the BSP: sregs for long mode, RIP = kernel entry,
+    /// RSP = top of KERNEL_STACK, RDI = undefined (BSP takes no arg).
     fn init(&mut self, entry_point: u64) -> Result<()>;
-    fn run(&mut self) -> Result<()>;
+
+    /// Initialise an application processor: sregs identical to BSP,
+    /// RIP = `ap_entry`, RSP = undefined (the asm stub overwrites it
+    /// from `AP_BOOT_STACKS[cpu_id]`), RDI = `cpu_id`.
+    fn init_ap(&mut self, ap_entry: u64, cpu_id: u32) -> Result<()>;
+
+    fn run(&mut self, cpu_id: u32, hc_ctx: &HypercallContext) -> Result<()>;
     fn run_debug(&mut self, dbg: VCpuDebugReceiver) -> Result<()>;
     fn tsc_khz(&self) -> u32;
+
+    /// Return the host pthread id of this vCPU's worker thread once
+    /// it has been spawned. Used by the supervising thread to
+    /// `pthread_kill(SIGUSR1)` the vCPU out of KVM_RUN during
+    /// shutdown. Release on store / Acquire on load — required because
+    /// the supervisor reads the tid after observing the BSP join, and
+    /// only then signals the AP. Without the pairing the supervisor's
+    /// load could observe a stale `u64::MAX` even after the worker stored.
+    fn host_tid_slot(&self) -> Arc<AtomicU64>;
+}
+
+#[cfg(test)]
+mod hypercall_tests {
+    use super::*;
+    use sumi_abi::arch::layout::HYPERCALL_MMIO_BASE;
+    use sumi_abi::hypercall::{HC_KICK_CPU, HC_SHUTDOWN, HYPERCALL_MMIO_SIZE};
+
+    fn base() -> u64 {
+        HYPERCALL_MMIO_BASE.as_u64()
+    }
+
+    #[test]
+    fn decode_returns_not_hypercall_for_address_below_base() {
+        let action = HypercallContext::decode(base() - 0x1000, &[0u8; 8], 0);
+        assert_eq!(action, HypercallAction::NotHypercall);
+    }
+
+    #[test]
+    fn decode_returns_not_hypercall_for_address_above_range() {
+        let addr = base() + HYPERCALL_MMIO_SIZE as u64;
+        let action = HypercallContext::decode(addr, &[0u8; 8], 0);
+        assert_eq!(action, HypercallAction::NotHypercall);
+    }
+
+    #[test]
+    fn decode_returns_malformed_for_short_write() {
+        let addr = base() + HC_SHUTDOWN as u64;
+        let action = HypercallContext::decode(addr, &[0u8; 4], 0);
+        assert_eq!(action, HypercallAction::Malformed);
+    }
+
+    #[test]
+    fn decode_returns_malformed_for_long_write() {
+        let addr = base() + HC_SHUTDOWN as u64;
+        let action = HypercallContext::decode(addr, &[0u8; 16], 0);
+        assert_eq!(action, HypercallAction::Malformed);
+    }
+
+    #[test]
+    fn decode_returns_malformed_for_unknown_offset() {
+        // Offset 0x18 is reserved but not yet used.
+        let action = HypercallContext::decode(base() + 0x18, &0u64.to_le_bytes(), 0);
+        assert_eq!(action, HypercallAction::Malformed);
+    }
+
+    #[test]
+    fn decode_hc_kick_cpu_returns_signal_one() {
+        let arg = 3u64.to_le_bytes();
+        let action = HypercallContext::decode(base() + HC_KICK_CPU as u64, &arg, 0);
+        assert_eq!(action, HypercallAction::SignalOne(3));
+    }
+
+    #[test]
+    fn decode_hc_kick_cpu_self_kick_is_dropped() {
+        let arg = 2u64.to_le_bytes();
+        let action = HypercallContext::decode(base() + HC_KICK_CPU as u64, &arg, 2);
+        assert_eq!(action, HypercallAction::SignalMask(0));
+    }
+
+    #[test]
+    fn decode_hc_shutdown_carries_exit_code_signed() {
+        // Negative exit codes round-trip via the u32-as-i32 bit reinterpretation
+        // that the kernel-side `shutdown(-1)` uses.
+        let arg = ((-1i32) as u32 as u64).to_le_bytes();
+        let action = HypercallContext::decode(base() + HC_SHUTDOWN as u64, &arg, 0);
+        assert_eq!(action, HypercallAction::Shutdown { exit_code: -1 });
+    }
+
+    #[test]
+    fn decode_hc_shutdown_zero_exit_code() {
+        let arg = 0u64.to_le_bytes();
+        let action = HypercallContext::decode(base() + HC_SHUTDOWN as u64, &arg, 0);
+        assert_eq!(action, HypercallAction::Shutdown { exit_code: 0 });
+    }
+
+    #[test]
+    fn apply_shutdown_sets_flag_and_exit_code() {
+        let ctx = HypercallContext::new_for_test(2);
+        let ctl = ctx.apply(HypercallAction::Shutdown { exit_code: 42 }, 0);
+        assert_eq!(ctl, HypercallControl::Stop);
+        assert!(ctx.shutdown.load(Ordering::Acquire));
+        assert_eq!(ctx.exit_code.load(Ordering::Acquire), 42);
+    }
+
+    #[test]
+    fn apply_signal_one_returns_continue() {
+        let ctx = HypercallContext::new_for_test(4);
+        let ctl = ctx.apply(HypercallAction::SignalOne(3), 0);
+        assert_eq!(ctl, HypercallControl::Continue);
+        // Slot was sentinel u64::MAX, so signal_cpu took the
+        // not-published branch. Verifying it did NOT panic.
+    }
+
+    #[test]
+    fn dispatch_mmio_outside_range_returns_none() {
+        let ctx = HypercallContext::new_for_test(1);
+        let res = ctx.dispatch_mmio(0xDEAD_BEEF, &0u64.to_le_bytes(), 0);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn dispatch_mmio_shutdown_returns_stop() {
+        let ctx = HypercallContext::new_for_test(1);
+        let arg = 7u64.to_le_bytes();
+        let res = ctx.dispatch_mmio(base() + HC_SHUTDOWN as u64, &arg, 0);
+        assert_eq!(res, Some(HypercallControl::Stop));
+        assert_eq!(ctx.exit_code.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn new_for_test_allocates_n_slots_at_sentinel() {
+        let ctx = HypercallContext::new_for_test(8);
+        assert_eq!(ctx.tid_slots.len(), 8);
+        for s in ctx.tid_slots.iter() {
+            assert_eq!(s.load(Ordering::Acquire), u64::MAX);
+        }
+    }
 }

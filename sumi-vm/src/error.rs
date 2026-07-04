@@ -23,6 +23,9 @@ pub enum Error {
     #[error("unexpected vCPU exit: {0}")]
     UnexpectedExit(String),
 
+    #[error("vCPU host thread panicked")]
+    VcpuThreadPanicked,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

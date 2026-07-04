@@ -3,20 +3,39 @@ pub mod handlers;
 
 #[repr(C)]
 pub struct SyscallArgs {
-    pub nr: u64,
-    pub arg0: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub arg3: u64,
-    pub arg4: u64,
-    pub arg5: u64,
+    pub nr:            u64, // 0
+    pub arg0:          u64, // 8
+    pub arg1:          u64, // 16
+    pub arg2:          u64, // 24
+    pub arg3:          u64, // 32
+    pub arg4:          u64, // 40
+    pub arg5:          u64, // 48
+    /// User RIP at the time of `syscall` (CPU saves rcx = next RIP).
+    pub caller_rip:    u64, // 56
+    /// User RFLAGS at the time of `syscall` (CPU saves r11 = RFLAGS).
+    pub caller_rflags: u64, // 64
 }
+
+// The syscall_entry asm hard-codes these offsets via `lea` arithmetic.
+// A bad field reorder must be a build-time error.
+const _: () = {
+    assert!(core::mem::offset_of!(SyscallArgs, nr)            == 0);
+    assert!(core::mem::offset_of!(SyscallArgs, arg0)          == 8);
+    assert!(core::mem::offset_of!(SyscallArgs, arg1)          == 16);
+    assert!(core::mem::offset_of!(SyscallArgs, arg2)          == 24);
+    assert!(core::mem::offset_of!(SyscallArgs, arg3)          == 32);
+    assert!(core::mem::offset_of!(SyscallArgs, arg4)          == 40);
+    assert!(core::mem::offset_of!(SyscallArgs, arg5)          == 48);
+    assert!(core::mem::offset_of!(SyscallArgs, caller_rip)    == 56);
+    assert!(core::mem::offset_of!(SyscallArgs, caller_rflags) == 64);
+    assert!(core::mem::size_of::<SyscallArgs>()               == 72);
+};
 
 pub type SyscallResult = i64;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
-    match args.nr {
+    let ret = match args.nr {
         0 => handlers::io::sys_read(args),
         1 => handlers::io::sys_write(args),
         2 => handlers::io::sys_open(args),
@@ -92,6 +111,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         63 => handlers::process::sys_uname(args),
         218 => handlers::process::sys_set_tid_address(args),
         302 => handlers::time::sys_prlimit64(args),
+        24 => handlers::thread::sys_sched_yield(args),
         202 => handlers::thread::sys_futex(args),
         273 => handlers::thread::sys_set_robust_list(args),
         318 => handlers::random::sys_getrandom(args),
@@ -110,9 +130,36 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         52 => handlers::net::sys_getpeername(args),
         54 => handlers::net::sys_setsockopt(args),
         55 => handlers::net::sys_getsockopt(args),
+        56 => handlers::clone::sys_clone(args),
+        435 => handlers::clone::sys_clone3(args),
         nr => {
             crate::kprintln!("[syscall] unhandled nr={}", nr);
             errno::ENOSYS
         }
+    };
+
+    // If clone() or wake_blocked set need_resched while we were in the
+    // handler, schedule a context switch before returning to user code.
+    {
+        use core::sync::atomic::Ordering;
+        let cpu = crate::sched::percpu::this_cpu();
+
+        // If another CPU cleared or restored page-table entries
+        // (mprotect/munmap) and bumped TLB_GENERATION, flush our local TLB
+        // by reloading CR3 before returning to user code. The timer-tick
+        // handler performs the same check for the preemption return path.
+        // No-op under test (see `PerCpu::reload_tlb_if_stale`'s host stand-in).
+        cpu.reload_tlb_if_stale();
+
+        if cpu.need_resched.swap(false, Ordering::AcqRel) {
+            let current = crate::sched::current_thread();
+            let idle_ptr = cpu.idle_thread.load(Ordering::Relaxed);
+            if !core::ptr::eq(current as *const _, idle_ptr as *const _) {
+                cpu.runqueue.push(current);
+            }
+            crate::sched::schedule();
+        }
     }
+
+    ret
 }
