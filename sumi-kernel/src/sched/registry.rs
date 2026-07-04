@@ -1,6 +1,6 @@
 //! Global thread registry — maps Tid to Arc<Thread>.
 //!
-//! See `docs/design/multithreading-v2.md` §3.3.
+//! See `docs/design/multithreading-v2.md`.
 
 extern crate alloc;
 
@@ -70,8 +70,8 @@ pub static THREAD_REGISTRY: spin::Mutex<ThreadRegistry> =
 /// `clone3()` child, incremented at creation and decremented by `sys_exit`.
 /// Deliberately separate from `ThreadRegistry::alive_count`, which also
 /// counts idle threads and zombies still awaiting the reaper — counting
-/// those made the old "last thread exits" check in `sys_exit` dead code,
-/// since `alive_count()` could never actually reach 1 (F8).
+/// those make the "last thread exits" check in `sys_exit` impossible to
+/// express with `alive_count()`.
 pub static LIVE_USER_THREADS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -80,7 +80,7 @@ pub fn alloc_tid() -> Tid {
     THREAD_REGISTRY.lock().alloc_tid()
 }
 
-/// Register a thread. Keeps an Arc alive for the kernel's lifetime (Phase 3).
+/// Register a thread. Keeps an Arc alive for the kernel's lifetime.
 pub fn register(t: Arc<Thread>) {
     THREAD_REGISTRY.lock().register(t);
 }

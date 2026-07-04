@@ -1,5 +1,6 @@
-//! Futex wait queues. Phase 5 of the multithreading plan (§9 of
-//! `docs/design/multithreading-v2.md`).
+//! Futex wait queues.
+//!
+//! See `docs/design/multithreading-v2.md` for the supported futex semantics.
 //!
 //! Design note — lock ordering:
 //!   bucket.lock  →  runqueue.lock
@@ -88,7 +89,7 @@ pub fn wait(uaddr: *const u32, expected: u32) -> i64 {
     // (raw-clone test worker threads, glibc pthread mutex paths) pass
     // aligned u32 addresses by construction. We do NOT validate
     // alignment here — a misaligned user pointer is UB.
-    // TODO(phase 7+): align-check the user pointer in sys_futex.
+    // TODO: align-check the user pointer in sys_futex.
     let cur = unsafe {
         AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire)
     };

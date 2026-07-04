@@ -1,7 +1,7 @@
-//! Scheduler subsystem: Thread, RunQueue, context switching, and
-//! cooperative + preemptive scheduling. See
-//! `docs/design/multithreading-v2.md` §3.4, §4.3, §13 and
-//! `docs/design/multithreading-fixes.md`.
+//! Scheduler subsystem: threads, runqueues, context switching, futex wakeups,
+//! and cooperative + preemptive scheduling.
+//!
+//! See `docs/design/multithreading-v2.md` for the current scheduler model.
 
 extern crate alloc;
 
@@ -55,10 +55,9 @@ pub fn current_thread() -> &'static Thread {
 ///
 /// Every kernel entry point disables interrupts (SFMASK clears IF on
 /// syscall; all ISRs are interrupt gates that clear IF) and `__switch_to_asm`
-/// keeps IF at 0 across a switch (F2), so IF must always be 0 here — see
-/// the debug assertion below (F13: replaces the vacuous `preempt_count`
-/// check, since nothing outside the timer ISR trampoline ever increments
-/// `preempt_count`, so it can never actually be nonzero at this point).
+/// keeps IF at 0 across a switch, so IF must always be 0 here. The debug
+/// assertion below is stronger than checking `preempt_count`: outside the
+/// timer ISR trampoline, `preempt_count` should never be nonzero here.
 pub fn schedule() {
     use core::sync::atomic::Ordering;
 
@@ -112,7 +111,7 @@ pub fn schedule() {
         );
     }
 
-    // F3/F4: mark next on-CPU *before* handing its ctx.rsp to
+    // Mark next on-CPU *before* handing its ctx.rsp to
     // __switch_to_asm, so a concurrent wake_blocked/try_steal_work/
     // reap_zombies on another CPU that observes this store knows not to
     // touch it until __switch_to_asm clears it again (on next's own future
@@ -127,7 +126,7 @@ pub fn schedule() {
     switch_to(prev, next, next_fs_base);
     // Execution resumes here when a later schedule() switches back to `prev`
     // (production — see `switch_to`'s host stand-in for the test build).
-    // Phase 7: reap any zombie threads no longer current on any CPU.
+    // Reap any zombie threads no longer current on any CPU.
     reaper::reap_zombies();
 }
 
@@ -138,7 +137,7 @@ pub fn schedule() {
 ///
 /// The host stand-in reproduces the one side effect other CPUs'
 /// `wake_blocked` / `try_steal_work` / `reap_zombies` depend on: clearing
-/// `prev.on_cpu` once "the switch away" completes (F3/F4), so their
+/// `prev.on_cpu` once "the switch away" completes, so their
 /// on_cpu spin-wait terminates exactly as it would after a real switch.
 #[cfg(not(test))]
 fn switch_to(prev: &Thread, next: &Thread, next_fs_base: u64) {
@@ -183,7 +182,7 @@ pub fn wake_blocked(t: &Thread) {
         return;
     }
 
-    // F3: `t` may still be mid-switch — the waiter set Blocked and dropped
+    // `t` may still be mid-switch: the waiter set Blocked and dropped
     // the bucket lock before its own schedule() finished saving its
     // context. Spin until that save completes (on_cpu observed false)
     // before handing t.ctx.rsp to another CPU's __switch_to_asm; otherwise
@@ -219,7 +218,7 @@ fn kick_cpu(target_cpu_id: u32) {
 #[cfg(test)]
 fn kick_cpu(_target_cpu_id: u32) {}
 
-/// Initialise Phase 3 scheduler state for the BSP (cpu 0).
+/// Initialise scheduler state for the BSP (cpu 0).
 ///
 /// Constructs the "main" thread (TID = 1, wrapping the current boot stack)
 /// and a dedicated idle thread (fresh 2 MB stack), registers both, and
@@ -249,7 +248,7 @@ pub fn init_phase3_bsp() {
     main.state.store(ThreadState::Running as u32, Ordering::Release);
 }
 
-/// Initialise Phase 3 scheduler state for an AP and enter the idle loop.
+/// Initialise scheduler state for an AP and enter the idle loop.
 ///
 /// Builds an idle thread that reuses the AP's existing boot stack (no
 /// allocation), registers it, stores it in `PER_CPU[cpu_id]`, and enters
@@ -302,7 +301,7 @@ fn try_steal_work() -> bool {
         // SAFETY: stolen_ptr came from a live runqueue entry; the backing
         // Thread lives in THREAD_REGISTRY for the kernel's lifetime.
         let stolen = unsafe { &*stolen_ptr };
-        // F3: schedule_preempt() can push the currently-running thread onto
+        // schedule_preempt() can push the currently-running thread onto
         // its own CPU's runqueue before that CPU's own schedule() call has
         // finished switching away from it. A concurrent steal from this CPU
         // could win that runqueue pop race, so wait for the context save to
@@ -328,7 +327,7 @@ fn try_steal_work() -> bool {
 pub fn idle_loop() -> ! {
     use core::sync::atomic::Ordering;
     loop {
-        // F6: schedule() must be called with IF=0 — it is not reentrant,
+        // schedule() must be called with IF=0: it is not reentrant,
         // and a timer tick landing inside it (e.g. between the runqueue
         // check and the switch) would call schedule_preempt() while this
         // CPU is already mid-schedule(). IF is only re-enabled below at

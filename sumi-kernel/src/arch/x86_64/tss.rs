@@ -3,7 +3,7 @@
 //! Each CPU needs its own GDT because the TSS descriptor encodes the
 //! per-CPU TSS base address. Each TSS's IST1 slot points at a per-CPU
 //! interrupt stack drawn from `SYSCALL_STACKS[cpu_id]` — a 64 KiB buffer
-//! that is unused since Phase 4 replaced per-CPU syscall stacks.
+//! that is unused since syscall entry switched to per-thread kernel stacks.
 //!
 //! GDT layout (5 entries):
 //!   [0] 0x00  null descriptor
@@ -81,7 +81,7 @@ pub fn init_and_load(cpu_id: u32) {
     // before any other CPU can read it (they spin on KERNEL_READY first).
     unsafe {
         // Use the top of SYSCALL_STACKS[cpu_id] as the IST1 interrupt
-        // stack. This 64 KiB region is unused since Phase 4 retired
+        // stack. This 64 KiB region is unused since syscall entry retired
         // the per-CPU syscall stack mechanism. The timer/IPI ISRs use
         // IST1 so they always have a valid stack even if the interrupted
         // thread's kernel stack is nearly full.

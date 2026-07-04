@@ -27,7 +27,7 @@ pub use sumi_abi::arch::address::DirectMap as KernelDirectMap;
 /// `out dx, al` to the QEMU/KVM debug-console port. Real port I/O in
 /// production; `out` traps (#GP) at CPL>0, so the host stand-in routes
 /// `kprintln!` output (now reachable from `cargo test` via `sys_exit`
-/// and friends, F14) to stderr instead.
+/// and friends) to stderr instead.
 #[cfg(not(test))]
 #[inline(always)]
 pub fn debugcon_write_byte(byte: u8) {

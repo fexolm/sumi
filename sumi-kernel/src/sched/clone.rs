@@ -1,6 +1,6 @@
-//! Phase 4/6 — child-thread construction for `sys_clone` / `sys_clone3`.
+//! Child-thread construction for `sys_clone` / `sys_clone3`.
 //!
-//! See `docs/design/multithreading-v2.md` §5, §13.
+//! See `docs/design/multithreading-v2.md`.
 //!
 //! `sys_clone` / `sys_clone3` in `syscall/handlers/clone.rs` are the callers;
 //! this module owns the low-level kernel-stack-frame construction and the
@@ -272,8 +272,8 @@ unsafe extern "C" fn thread_entry_trampoline() -> ! {
 }
 
 /// Host stand-in for the naked-asm trampoline above: `clone_create_user_thread`
-/// (now unconditional, F14) needs *some* function address to write into the
-/// frame's `ctx.rsp` slot so its layout is checkable under test. This is
+/// needs *some* function address to write into the frame's `ctx.rsp` slot so
+/// its layout is checkable under test. This is
 /// never actually invoked under test — there is no real `__switch_to_asm`
 /// to jump into it — so it exists purely as a valid, distinct symbol.
 #[cfg(test)]

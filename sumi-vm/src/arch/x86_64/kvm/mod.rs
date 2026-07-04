@@ -130,7 +130,7 @@ impl VirtBackend for KvmVm {
         }
 
         // Register the guest memory region(s) with KVM, split around the
-        // LAPIC MMIO page (F1). KVM's in-kernel LAPIC only intercepts
+        // LAPIC MMIO page. KVM's in-kernel LAPIC only intercepts
         // guest-physical accesses to LAPIC_BASE_PHYS when no memslot backs
         // that page with RAM; with the default 2 GiB RAM + 2 GiB kernel-code
         // sizing, a single memslot spanning [0, 4 GiB) would otherwise cover
@@ -326,7 +326,7 @@ impl KvmVCpu {
         // IFUNC resolvers stay on the SSE2 baseline. If you set OSXSAVE
         // here, you also need to set XCR0 via xsetbv AND remove the CPUID
         // mask, or you will create a half-broken vCPU. See
-        // docs/glibc-support-design.md §5.
+        // docs/glibc-support-design.md.
         sregs.cr4 |= CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
 
         // EFER.LME enables Long Mode; EFER.LMA indicates Long Mode Active.
@@ -441,8 +441,8 @@ impl VCpu for KvmVCpu {
                     devs.handle_mmio_write(addr, data, &self.mem);
                 }
                 VcpuExit::Hlt => {
-                    // Phase 1 semantics: BSP hlt = end of user program
-                    // (sys_exit → halt_forever). APs hlt = idle park.
+                    // BSP hlt = end of user program (legacy halt fallback).
+                    // APs hlt = idle park.
                     // Either way, return — the supervising logic in
                     // vm::run() decides whether to also kick the APs.
                     return Ok(());

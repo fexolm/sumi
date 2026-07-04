@@ -1,13 +1,12 @@
-//! `clone(2)` and `clone3(2)` — Phase 4/6 implementation.
+//! `clone(2)` and `clone3(2)` implementation.
 //!
-//! See `docs/design/multithreading-v2.md` §5, §13.
+//! See `docs/design/multithreading-v2.md`.
 
 use crate::syscall::errno::{EINVAL, ENOMEM};
 use crate::syscall::{SyscallArgs, SyscallResult};
 
-// Linux x86_64 clone() flag bits. Only those relevant to Phase 4/6 are named;
-// the rest are listed in the design doc (§5.1) and will be wired in later
-// phases.
+// Linux x86_64 clone() flag bits currently used by the pthread-style thread
+// shape supported by sumi.
 const CLONE_VM:             u64 = 0x0000_0100;
 const CLONE_FS:             u64 = 0x0000_0200;
 const CLONE_FILES:          u64 = 0x0000_0400;
@@ -131,7 +130,7 @@ fn do_clone(
         Ordering::Release,
     );
     registry::register(child.clone());
-    // F8: counts toward the "last live user thread" check in sys_exit.
+    // Counts toward the "last live user thread" check in sys_exit.
     registry::LIVE_USER_THREADS.fetch_add(1, Ordering::Relaxed);
 
     let cpu = crate::sched::percpu::this_cpu();
@@ -141,7 +140,7 @@ fn do_clone(
     tid.0 as i64
 }
 
-/// Phase 4/6 `sys_clone`.
+/// Linux `clone(2)`.
 ///
 /// Arguments (Linux ABI):
 ///   rdi (arg0) : flags
@@ -187,7 +186,7 @@ struct CloneArgs {
 const CLONE_ARGS_SIZE_VER0: usize = 64;
 const _: () = assert!(core::mem::size_of::<CloneArgs>() == CLONE_ARGS_SIZE_VER0);
 
-/// Linux `clone3(2)` — Phase 6 implementation. Supports the v0 struct.
+/// Linux `clone3(2)`. Supports the v0 struct.
 /// Newer trailing fields (set_tid, set_tid_size, cgroup) are ignored if
 /// the user passes a larger size.
 pub fn sys_clone3(args: &SyscallArgs) -> SyscallResult {
@@ -273,7 +272,7 @@ mod tests {
         assert_eq!(sys_clone(&a), EINVAL);
     }
 
-    /// Real `do_clone` (F14) needs a current thread (for `parent.tgid`) and
+    /// Real `do_clone` needs a current thread (for `parent.tgid`) and
     /// an initialised per-cpu (for the runqueue push) — install both, like
     /// `init_phase3_bsp` does in production before any clone is reachable.
     fn install_parent() {

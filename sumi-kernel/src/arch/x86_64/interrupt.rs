@@ -1,4 +1,4 @@
-//! Interrupt and exception handlers for Phase 9.
+//! Interrupt and exception handlers.
 //!
 //! ## Exception handlers
 //! Naked trampolines save GP regs, call a Rust handler that prints
@@ -18,17 +18,11 @@
 //!      IST1 stack to the current thread's kernel stack, switches RSP, and
 //!      calls `schedule_preempt()`. On return, falls through to `.restore`.
 //!   6. Restores 15 GP regs, then an explicit RSP-switch + `ret` back to
-//!      user mode — NOT `iretq`. F9 in `docs/design/multithreading-fixes.md`
-//!      claimed a plain `iretq` would work here ("64-bit IRET always pops
-//!      SS:RSP"), but that is only half true: 64-bit mode always *pushes*
-//!      SS:RSP on interrupt entry (for IST), but IRET's pop of SS:RSP is
-//!      still conditional on the popped CS.RPL differing from the current
-//!      CPL. sumi runs every ring at CPL0 (`sregs.cs.dpl = 0` for both
-//!      "kernel" and "user" code — see `sumi-vm/.../kvm/mod.rs`), so that
-//!      condition is never true and a plain `iretq` silently leaves RSP
-//!      wrong. Confirmed empirically: switching this to `iretq` reproduced
-//!      exactly this failure (RIP correct, RSP left pointing into the ISR's
-//!      own frame) under KVM. The manual restore below is therefore kept.
+//!      user mode, not `iretq`. In 64-bit mode interrupt entry through IST
+//!      pushes SS:RSP, but IRET pops SS:RSP only when the popped CS.RPL
+//!      differs from current CPL. `sumi` runs both "kernel" and "user"
+//!      code at CPL0, so that condition is false and a plain `iretq` would
+//!      leave RSP pointing into the ISR frame.
 //!
 //! ## IPI ISR (vector 0x41)
 //! Used only to wake a CPU from `hlt` so it re-checks its runqueue. The
@@ -44,12 +38,12 @@ use crate::sched::thread::KERNEL_STACK_TOP_OFFSET;
 
 /// Called by the timer ISR trampoline with interrupts disabled (interrupt
 /// gate clears IF on entry). Sends EOI, reloads CR3 if this CPU's TLB is
-/// stale (F10), and marks the current CPU as needing a reschedule.
+/// stale, and marks the current CPU as needing a reschedule.
 #[unsafe(no_mangle)]
 extern "C" fn timer_interrupt() {
     super::lapic::eoi();
     let cpu = percpu::this_cpu();
-    // F10: without this, a thread preempted here resumes with a stale TLB
+    // Without this, a thread preempted here resumes with a stale TLB
     // (from a peer CPU's mprotect/munmap) until its next syscall — the
     // syscall postamble already does the same check, but a preempted
     // thread may run for a long time before its next syscall.

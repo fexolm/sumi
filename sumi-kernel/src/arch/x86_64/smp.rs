@@ -8,7 +8,7 @@
 //!   1. Program `PER_CPU[cpu_id]` and `IA32_GS_BASE` for this CPU.
 //!   2. Program per-CPU syscall MSRs (LSTAR / STAR / SFMASK).
 //!   3. Wait until the BSP publishes `KERNEL_READY`.
-//!   4. Enter the Phase 1 idle loop (`sti; hlt`).
+//!   4. Enter the scheduler idle loop (`sti; hlt`).
 //!
 //! Nothing before step 1 may touch `gs:` (GS_BASE is 0 on entry —
 //! KVM zeros all MSRs on a fresh vCPU). `init_for_cpu` is therefore
@@ -34,7 +34,7 @@ pub extern "C" fn ap_main_rust(cpu_id: u32) -> ! {
     // Idempotent with respect to the BSP.
     crate::arch::x86_64::syscall::init();
 
-    // Phase 9: load per-CPU TSS (IST1 stack for interrupts), share the
+    // Load per-CPU TSS (IST1 stack for interrupts), share the
     // BSP's IDT (same handlers, LAPIC vectors, same IDT base pointer),
     // and start this AP's own LAPIC periodic timer.
     crate::arch::x86_64::tss::init_and_load(cpu_id);
@@ -58,7 +58,7 @@ pub extern "C" fn ap_main_rust(cpu_id: u32) -> ! {
         core::hint::spin_loop();
     }
 
-    // 5. Phase 3 idle loop. Registers the AP's idle thread (reusing the
+    // 5. Scheduler idle loop. Registers the AP's idle thread (reusing the
     // AP boot stack) and enters idle_loop(), which parks the vCPU via
     // `hlt` until the scheduler has work. Never returns.
     crate::sched::init_phase3_ap(cpu_id);

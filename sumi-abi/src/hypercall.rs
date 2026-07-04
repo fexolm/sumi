@@ -8,19 +8,19 @@
 //! value channel: hypercalls that need to "return" do so by side effect
 //! (HC_SHUTDOWN tears down the VM; HC_KICK_CPU is fire-and-forget).
 //!
-//! See `docs/design/multithreading-v2.md` §4.5 and §13 Phase 2.
+//! See `docs/design/multithreading-v2.md` for the host/guest scheduler use.
 
 /// Wake the target vCPU out of `KVM_RUN`. Argument: target cpu_id.
 /// Used by the in-guest scheduler to deliver IPI-like wakes to an
-/// idle peer (Phase 3+ uses this from `sched::wake_blocked`).
+/// idle peer.
 pub const HC_KICK_CPU: usize = 0x00;
 
 // Offset 0x08 previously held HC_TLB_FLUSH, removed as dead code (no
 // callers — TLB staleness is instead handled by the lazy
-// generation-counter reload in `PerCpu::reload_tlb_if_stale`, §8.3). Left
+// generation-counter reload in `PerCpu::reload_tlb_if_stale`). Left
 // unassigned rather than reused so a stale host/guest pairing fails loudly
 // instead of silently misinterpreting an old build's hypercall. Re-add a
-// real cross-CPU TLB-shootdown hypercall here if a future phase needs one.
+// real cross-CPU TLB-shootdown hypercall here if it becomes necessary.
 
 /// Terminate the VM with the given exit code. Argument: i32 exit
 /// code, zero-extended into the low 32 bits of the u64. The host

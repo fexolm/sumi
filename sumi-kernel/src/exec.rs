@@ -434,7 +434,7 @@ fn prepare_initial_stack(
     sp = push_auxv(sp, AT_PAGESZ, 4096);
     // glibc on x86_64 probes CPU features via CPUID in init-arch.c, so AT_HWCAP
     // is cosmetic on this architecture. Advertise 0 to avoid claiming hardware
-    // features we have not validated. See docs/glibc-support-design.md §4.7.
+    // features we have not validated. See docs/glibc-support-design.md.
     sp = push_auxv(sp, AT_HWCAP, 0);
 
     // AT_BASE: interpreter load base, or 0 if no interpreter
@@ -529,7 +529,7 @@ core::arch::global_asm!(
     "xor r15, r15",
     "xor rbp, rbp",
     "cld",
-    // Phase 9: enable interrupts so the LAPIC timer can fire during user-mode
+    // Enable interrupts so the LAPIC timer can fire during user-mode
     // execution. SFMASK clears IF on every syscall entry, so interrupts are
     // only live while the CPU is in user mode (ring 3). This is safe because
     // the IDT is loaded and the LAPIC is configured before we reach here.

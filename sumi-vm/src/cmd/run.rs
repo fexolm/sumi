@@ -27,8 +27,8 @@ pub struct RunCommand {
     gdb_port: Option<u16>,
 
     /// Number of vCPUs (1..=64). Defaults to `num_cpus::get()` clamped.
-    /// Phase 1: CPU 0 is the BSP (runs the user program), CPUs 1..N-1
-    /// boot into an empty idle loop.
+    /// CPU 0 is the BSP; CPUs 1..N-1 boot as APs and enter the scheduler
+    /// idle loop.
     #[arg(long = "vcpus", value_name = "N", default_value_t = default_vcpus())]
     vcpus: usize,
 }

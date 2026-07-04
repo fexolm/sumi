@@ -4,7 +4,7 @@
 
 include!("../common.rs");
 
-// Phase 2/10 test: exit_group() must tear down the whole VM even while
+// exit_group() must tear down the whole VM even while
 // other threads (including the one calling it) are still alive and
 // runnable. Main spawns 4 children; every child spins forever except one,
 // which calls exit_group(7) after a short delay. If exit_group only

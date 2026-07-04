@@ -1,6 +1,6 @@
 //! Thread descriptor and associated layout types.
 //!
-//! See `docs/design/multithreading-v2.md` §3.1.
+//! See `docs/design/multithreading-v2.md`.
 
 extern crate alloc;
 
@@ -32,7 +32,7 @@ pub enum ThreadState {
 /// `sumi-vm/src/arch/x86_64/kvm/mod.rs`), and `XSAVE`/`XRSTOR` themselves
 /// `#UD` without `OSXSAVE`. `FXSAVE`/`FXRSTOR` only need `CR4.OSFXSR` (set
 /// at vCPU init) and cover every FPU/SSE register the guest can reach given
-/// that mask (F7).
+/// that mask.
 #[repr(C, align(16))]
 pub struct FxsaveArea([u8; 512]);
 
@@ -76,7 +76,7 @@ pub struct ThreadContext {
     pub r14: u64,    // 0x28
     pub r15: u64,    // 0x30
     pub rflags: u64, // 0x38
-    pub fxsave_area: FxsaveArea, // 0x40, 512 bytes, 16-aligned (F7).
+    pub fxsave_area: FxsaveArea, // 0x40, 512 bytes, 16-aligned.
 }
 
 /// Intrusive doubly-linked list node used by `RunQueue`.
@@ -109,11 +109,9 @@ impl RunLink {
     }
 }
 
-/// Intrusive node for futex wait queues. Phase 5 fills in the semantics.
-/// Kept here for layout stability so Phase 5 does not shift Thread offsets.
+/// Intrusive node for futex wait queues.
 #[repr(C)]
 pub struct WaitLink {
-    // Phase 5 fills these in.
     pub next: AtomicPtr<Thread>,
     pub uaddr: AtomicU64,
     pub bitset: AtomicU32,
@@ -137,9 +135,6 @@ impl WaitLink {
 
 /// Thread descriptor. Always heap-allocated behind `Arc<Thread>`.
 ///
-/// Fields beyond `run_link`/`wait_link` that are only relevant in later
-/// phases are included now for layout stability — adding them later would
-/// require touching every `Thread::new_*` constructor.
 #[repr(C, align(64))]
 pub struct Thread {
     pub tid: Tid,
@@ -154,40 +149,39 @@ pub struct Thread {
     pub kernel_stack_top: VirtualAddr,
     pub kernel_stack_phys: PhysicalAddr,
     pub kernel_stack_size: usize,
-    /// Phase 7: true if kernel_stack_phys was allocated from PAGE_ALLOCATOR
-    /// and should be freed by the reaper when this thread is destroyed.
+    /// True if kernel_stack_phys was allocated from PAGE_ALLOCATOR and should
+    /// be freed by the reaper when this thread is destroyed.
     pub kernel_stack_freeable: bool,
 
-    /// Zero for kthreads. Populated by clone() in Phase 4.
+    /// Zero for kthreads. Populated by clone().
     pub user_stack_base: VirtualAddr,
     pub user_stack_size: usize,
 
-    /// Per-thread FS base for TLS. Phase 6: written by arch_prctl / clone.
+    /// Per-thread FS base for TLS, written by arch_prctl / clone.
     pub fs_base: AtomicU64,
 
-    /// Phase 7: address to write 0 on thread exit (set_tid_address).
+    /// Address to write 0 on thread exit (set_tid_address).
     pub clear_child_tid: AtomicU64,
 
-    /// Phase 7: robust futex list head (set via prctl/clone flags).
+    /// Robust futex list head (set_robust_list).
     pub robust_list_head: AtomicU64,
 
     /// Last CPU this thread ran on. `u32::MAX` = "never ran".
     pub cpu: AtomicU32,
 
     /// True from the moment this thread is chosen as `next` in `schedule()`
-    /// until `__switch_to_asm` finishes capturing its context (F3/F4,
-    /// mirrors Linux's `p->on_cpu`). Consumers that might hand this
+    /// until `__switch_to_asm` finishes capturing its context. Consumers that might hand this
     /// thread's `ctx.rsp` to a *different* CPU's `__switch_to_asm` — or
     /// free its kernel stack — must spin until this is `false`:
-    /// `wake_blocked` (F3), `try_steal_work` (F3), `reap_zombies` (F4).
+    /// `wake_blocked`, `try_steal_work`, and `reap_zombies`.
     pub on_cpu: AtomicBool,
 
     pub run_link: RunLink,
     pub wait_link: WaitLink,
 
-    // Phase 3 kthread trampoline payload. Kthreads set these at spawn time;
+    // Kthread trampoline payload. Kthreads set these at spawn time;
     // `kthread_trampoline` reads them once on first schedule-in. User
-    // threads leave both at zero; Phase 4 clone() does not touch them.
+    // threads leave both at zero; clone() does not touch them.
     pub entry_fn: AtomicU64, // extern "C" fn(u64) -> ! as u64, or 0
     pub entry_arg: AtomicU64,
 }
@@ -202,7 +196,7 @@ pub const KERNEL_STACK_TOP_OFFSET: usize = core::mem::offset_of!(Thread, kernel_
 
 const _: () = {
     // The disp8-encoding threshold this used to enforce (< 256) no longer
-    // holds now that `ctx` embeds a 512-byte FXSAVE area (F7) — the asm
+    // holds now that `ctx` embeds a 512-byte FXSAVE area; the asm
     // emits a disp32 instead, which works identically, just one byte
     // larger per access. This bound is now just a sanity canary against
     // unexpected further Thread growth.
@@ -261,4 +255,3 @@ impl Thread {
         }
     }
 }
-

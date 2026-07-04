@@ -1,10 +1,10 @@
-//! Interrupt-safe locking primitive (F5/F13).
+//! Interrupt-safe locking primitive.
 //!
-//! `docs/design/multithreading-fixes.md` F5: the runqueue and zombie-list
-//! locks are reachable both from ordinary syscall context and from the
-//! timer ISR's `schedule_preempt` path. Every kernel entry point already
+//! The runqueue and zombie-list locks are reachable both from ordinary
+//! syscall context and from the timer ISR's `schedule_preempt` path. Every
+//! kernel entry point already
 //! clears IF (`SFMASK` on `syscall`, interrupt gates on ISRs) and
-//! `__switch_to_asm` now keeps IF at 0 across the whole switch (F2), so in
+//! `__switch_to_asm` keeps IF at 0 across the whole switch, so in
 //! practice IF is always already 0 at every call site that takes these
 //! locks. `IrqGuard` makes that invariant load-bearing rather than
 //! incidental: it is real `cli`/`sti`-bracketed irqsave locking, so a
@@ -16,7 +16,7 @@
 //! 3, same constraint as `percpu::init_for_cpu`'s MSR writes), so the actual
 //! instructions are gated `#[cfg(not(test))]`; the type and its call sites
 //! are identical in both configs, and `cargo test` exercises every other
-//! consumer's real logic — only the CPU-privileged flag toggle is skipped.
+//! consumer's real logic; only the CPU-privileged flag toggle is skipped.
 
 /// RAII guard: disables interrupts on construction, restores the prior IF
 /// state on drop. Bracket a `spin::Mutex::lock()` with one to make that
@@ -77,8 +77,8 @@ impl Drop for IrqGuard {
 }
 
 /// Read the current value of RFLAGS.IF. Used by `schedule()`'s debug
-/// assertion (F13) in place of the vacuous `preempt_count` check: every
-/// path that can reach `schedule()` must already have interrupts disabled.
+/// assertion: every path that can reach `schedule()` must already have
+/// interrupts disabled.
 #[cfg(not(test))]
 #[inline]
 pub fn interrupts_enabled() -> bool {
@@ -97,7 +97,7 @@ pub fn interrupts_enabled() -> bool {
 
 /// Host stand-in: there is no RFLAGS.IF to read on the test host, and no
 /// timer ISR that could re-enter `schedule()` there either, so `schedule()`
-/// (now callable under test, F14) never needs to trip this assertion.
+/// never needs to trip this assertion.
 #[cfg(test)]
 #[inline]
 pub fn interrupts_enabled() -> bool {

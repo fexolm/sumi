@@ -3,9 +3,8 @@
 //! One `PerCpu` per vCPU, kept in a static `[PerCpu; MAX_VCPUS]`. On each
 //! CPU, `IA32_GS_BASE` is programmed to point at that CPU's `PerCpu`, so
 //! the `syscall_entry` asm reads per-CPU scratch via `gs:<offset>` without
-//! touching any global. See `docs/design/multithreading-v2.md` §3.4 and
-//! §7.3 (no `swapgs` — ring 0 only, so `IA32_GS_BASE` is correct,
-//! not `IA32_KERNEL_GS_BASE`).
+//! touching any global. `sumi` runs at ring 0, so `IA32_GS_BASE` is used
+//! directly; there is no `swapgs` path.
 //!
 //! The byte offsets of `saved_user_rsp` and `current_thread` are hard-coded
 //! in the `syscall_entry` / `isr_timer` asm (`crate::arch::x86_64::syscall`,
@@ -15,7 +14,7 @@
 //! those constants stay correct — the `const _: () = assert!(...)` block
 //! below turns drift into a build-time error either way.
 
-/// Maximum number of vCPUs. Matches the sumi-vm `--vcpus` cap (§4.1).
+/// Maximum number of vCPUs. Matches the sumi-vm `--vcpus` cap.
 pub const MAX_VCPUS: usize = 64;
 
 /// Per-CPU kernel state. GS base on each vCPU points at one of these.
@@ -52,7 +51,7 @@ pub struct PerCpu {
     pub runqueue: super::runqueue::RunQueue,
     /// Tracks the last TLB generation this CPU has flushed to. When this
     /// lags behind `TLB_GENERATION`, the CPU reloads CR3 (see
-    /// `reload_tlb_if_stale`, F10).
+    /// `reload_tlb_if_stale`).
     pub tlb_generation: core::sync::atomic::AtomicU64,
 
     /// Preemption depth counter. 0 = preemptible. The timer ISR increments
@@ -86,7 +85,7 @@ impl PerCpu {
     /// Reload CR3 if this CPU's TLB generation lags the global counter,
     /// flushing stale non-global TLB entries left by a peer CPU's
     /// `mprotect`/`munmap`. Called from both the syscall-return postamble
-    /// and the timer-tick handler (F10) — anywhere this CPU is about to
+    /// and the timer-tick handler: anywhere this CPU is about to
     /// resume user-mode execution.
     #[cfg(not(test))]
     pub fn reload_tlb_if_stale(&self) {
@@ -106,15 +105,15 @@ impl PerCpu {
 
     /// Host stand-in for `reload_tlb_if_stale`: `mov cr3` is ring-0-only, so
     /// there is nothing to reload on the test host. The syscall-return
-    /// postamble that calls this can therefore stay unconditional (F14).
+    /// postamble that calls this can therefore stay unconditional.
     #[cfg(test)]
     pub fn reload_tlb_if_stale(&self) {}
 }
 
 // SAFETY: PerCpu is only ever mutated from its owning CPU, and the
 // scratch field (saved_user_rsp) is only ever read by that same CPU
-// inside syscall_entry. Fields added in later phases that need cross-CPU
-// access (e.g. need_resched, is_idle) must themselves use atomic types —
+// inside syscall_entry. Fields that need cross-CPU access
+// (e.g. need_resched, is_idle) must themselves use atomic types —
 // this blanket Sync impl does NOT make plain fields cross-CPU-safe.
 unsafe impl Sync for PerCpu {}
 
@@ -132,14 +131,14 @@ impl SyscallStackBuf {
     }
 }
 
-/// One `PerCpu` per vCPU. BSP uses index 0. Phase 1 brings up the rest.
+/// One `PerCpu` per vCPU. BSP uses index 0.
 #[cfg(not(test))]
 pub(crate) static mut PER_CPU: [PerCpu; MAX_VCPUS] =
     [const { PerCpu::zeroed() }; MAX_VCPUS];
 
 /// Dedicated 64 KiB interrupt stack (TSS IST1) per vCPU. Indexed by
-/// `cpu_id`. Kept here (not in `arch::x86_64::syscall`) so that Phase 1 AP
-/// bring-up is a no-op on this side.
+/// `cpu_id`. Kept here rather than in `arch::x86_64::syscall` because AP
+/// bring-up needs these stacks before any syscall path runs.
 #[cfg(not(test))]
 pub(crate) static mut SYSCALL_STACKS: [SyscallStackBuf; MAX_VCPUS] =
     [const { SyscallStackBuf::new() }; MAX_VCPUS];

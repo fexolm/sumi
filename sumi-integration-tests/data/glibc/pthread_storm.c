@@ -1,8 +1,7 @@
-// Stress test (design doc §14.3, scaled down from 100x1000 to fit the
-// harness's 30s timeout): WORKERS threads take a strict round-robin
-// ticket protected by a mutex+condvar, forcing every thread to block on
-// pthread_cond_wait most rounds and get woken by another thread's
-// broadcast. Exercises M:N scheduling saturation (WORKERS > vCPUs),
+// Stress test scaled to fit the harness's 30s timeout: WORKERS threads take
+// a strict round-robin ticket protected by a mutex+condvar, forcing every
+// thread to block on pthread_cond_wait most rounds and get woken by another
+// thread's broadcast. Exercises M:N scheduling saturation (WORKERS > vCPUs),
 // work-stealing, and futex wait/wake under load.
 #define _GNU_SOURCE
 #include <pthread.h>

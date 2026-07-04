@@ -1,7 +1,6 @@
-// Phase 6 test: verify glibc pthread_create correctly allocates a TCB and
+// Verify glibc pthread_create correctly allocates a TCB and
 // the kernel restores fs_base on context switch so the child reads its own
-// __thread variable. Calling pthread_join is deferred to Phase 7 (which
-// requires per-thread sys_exit + CLONE_CHILD_CLEARTID futex wake).
+// __thread variable. Calling pthread_join is covered by pthread_join.c.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>

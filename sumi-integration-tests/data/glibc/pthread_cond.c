@@ -1,4 +1,4 @@
-// Phase 8 test: producer pushes 10000 items into a bounded ring buffer
+// Producer pushes 10000 items into a bounded ring buffer
 // (capacity 64). 4 consumers pop and sum. Final sum must equal
 // sum(0..9999) = 49995000.
 #define _GNU_SOURCE

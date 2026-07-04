@@ -57,8 +57,8 @@ pub const INTERP_LOAD_BASE: u64 = 0x7f00_0000_0000;
 /// Physical base address of the local APIC MMIO page (xAPIC mode).
 ///
 /// KVM's in-kernel LAPIC intercepts guest accesses to this page only when
-/// no KVM memslot backs it with real RAM (see `docs/design/multithreading-fixes.md`
-/// F1). `sumi-vm` must never register a memslot covering this address, and
+/// no KVM memslot backs it with real RAM. `sumi-vm` must never register a
+/// memslot covering this address, and
 /// `PageAllocator` must never hand out the 2 MiB frame containing it —
 /// both sides reference this one constant to stay in sync. It happens to
 /// be exactly 2 MiB-aligned (0xFEE0_0000 == 2039 * PAGE_SIZE), so the
@@ -111,8 +111,7 @@ pub const DAX_SLOT_COUNT: usize = DAX_WINDOW_SIZE / PAGE_SIZE;
 /// has no KVM memslot covering it, so the write traps as
 /// `VcpuExit::MmioWrite` and is decoded by the hypercall dispatcher.
 ///
-/// See `sumi_abi::hypercall` for the offset / argument layout and
-/// `docs/design/multithreading-v2.md` §4.5.
+/// See `sumi_abi::hypercall` for the offset / argument layout.
 pub const HYPERCALL_MMIO_BASE: PhysicalAddr = PhysicalAddr::new(0x1_0000_2000);
 
 const _: () = {

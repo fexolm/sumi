@@ -146,8 +146,8 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
 
         // If another CPU cleared or restored page-table entries
         // (mprotect/munmap) and bumped TLB_GENERATION, flush our local TLB
-        // by reloading CR3 before returning to user code (F10: the timer-tick
-        // handler performs the same check for the preemption return path).
+        // by reloading CR3 before returning to user code. The timer-tick
+        // handler performs the same check for the preemption return path.
         // No-op under test (see `PerCpu::reload_tlb_if_stale`'s host stand-in).
         cpu.reload_tlb_if_stale();
 

@@ -1,4 +1,4 @@
-// Phase 8 test: 4 threads each increment a shared counter 100000 times
+// 4 threads each increment a shared counter 100000 times
 // under a mutex. Final value must be exactly 400000.
 #define _GNU_SOURCE
 #include <pthread.h>

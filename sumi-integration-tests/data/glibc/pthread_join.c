@@ -1,4 +1,4 @@
-// Phase 7 test: pthread_join returns cleanly.
+// pthread_join returns cleanly.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdio.h>

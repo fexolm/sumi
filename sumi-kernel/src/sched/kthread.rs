@@ -15,7 +15,7 @@ use super::thread::{FxsaveArea, RunLink, Thread, ThreadContext, ThreadState, Tid
 /// Build a `Thread` for a kernel thread, with a `kthread_trampoline` return
 /// address written at the top of its stack so the first `__switch_to_asm`
 /// restore jumps there. Shared by the BSP idle thread constructor (the only
-/// remaining caller now that `kthread_spawn` is gone — see F12).
+/// remaining caller now that `kthread_spawn` is gone).
 ///
 /// `stack_top_virt` must already be a writable virtual address — real
 /// guest memory in production, or a `TestDirectMap`-backed host buffer in
@@ -53,7 +53,7 @@ fn build_kthread_arc(
             rbp: 0, rbx: 0, r12: 0, r13: 0, r14: 0, r15: 0,
             // EFLAGS: bit 1 (reserved, always 1) | bit 9 (IF=1). __switch_to_asm
             // forces IF back to 0 for a thread's first switch-in regardless
-            // (F2); this only matters for the reserved bit.
+            // of this value; this only matters for the reserved bit.
             rflags: 0x202,
             fxsave_area: FxsaveArea::new(),
         }),
@@ -230,8 +230,8 @@ extern "C" fn idle_loop_entry(_arg: u64) -> ! {
     super::idle_loop()
 }
 
-/// Host stand-in: `build_idle_thread` (now unconditional, F14) needs some
-/// function address to write into the trampoline frame's return slot. Never
+/// Host stand-in: `build_idle_thread` needs some function address to write
+/// into the trampoline frame's return slot. Never
 /// actually invoked under test — there is no real `__switch_to_asm` to jump
 /// into it, and `idle_loop` itself stays arch-gated (real `cli`/`sti;hlt`).
 #[cfg(test)]
@@ -264,8 +264,8 @@ extern "C" fn kthread_trampoline() -> ! {
     entry(arg)
 }
 
-/// Host stand-in: `build_kthread_arc` (now unconditional, F14) needs some
-/// function address to write into the trampoline frame's return slot. Never
+/// Host stand-in: `build_kthread_arc` needs some function address to write
+/// into the trampoline frame's return slot. Never
 /// actually invoked under test — reached only via a real `__switch_to_asm`
 /// return, which does not exist on the host.
 #[cfg(test)]

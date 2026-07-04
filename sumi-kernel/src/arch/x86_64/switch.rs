@@ -1,7 +1,6 @@
 //! Low-level context switch.
 //!
-//! See `docs/design/multithreading-v2.md` §6.3 and
-//! `docs/design/multithreading-fixes.md` F2/F3/F4/F7.
+//! See `docs/design/multithreading-v2.md` for the scheduler invariants.
 
 use core::arch::naked_asm;
 
@@ -11,8 +10,8 @@ use crate::sched::thread::ThreadContext;
 /// them from `*next_ctx`, transferring execution to the thread whose return
 /// address sits on `next_ctx.rsp`.
 ///
-/// Also (F7) eager `fxsave`/`fxrstor`s the legacy x87/MMX/SSE register file
-/// alongside the GP context, and (F3/F4) clears `*prev_on_cpu` once `prev`'s
+/// Also eager `fxsave`/`fxrstor`s the legacy x87/MMX/SSE register file
+/// alongside the GP context, and clears `*prev_on_cpu` once `prev`'s
 /// context is fully captured and we've committed to running as `next` — the
 /// signal that it is now safe for another CPU to run or reap `prev`.
 ///
@@ -20,7 +19,7 @@ use crate::sched::thread::ThreadContext;
 /// `ret`, so the new thread observes the correct fs_base before the
 /// trampoline or any user code runs.
 ///
-/// # Interrupt discipline (F2)
+/// # Interrupt discipline
 ///
 /// Called with interrupts already disabled (every kernel entry point clears
 /// IF: `SFMASK` on `syscall`, interrupt gates on ISRs). `next_ctx.rflags`
@@ -73,7 +72,7 @@ pub unsafe extern "C" fn __switch_to_asm(
         "mov [rdi + 0x30], r15",
         "pushfq",
         "pop qword ptr [rdi + 0x38]",
-        "fxsave [rdi + 0x40]",   // F7: save prev's legacy x87/MMX/SSE state.
+        "fxsave [rdi + 0x40]",   // Save prev's legacy x87/MMX/SSE state.
 
         // Restore next callee-saved from *next_ctx (rsi).
         "mov rsp, [rsi + 0x00]",
@@ -88,11 +87,11 @@ pub unsafe extern "C" fn __switch_to_asm(
         // lands at stack_top - 88, which must lie inside the allocated kernel
         // stack page. clone.rs::clone_create_user_thread relies on this.
         "push qword ptr [rsi + 0x38]",
-        "and dword ptr [rsp], 0xFFFFFDFF", // F2: clear IF (bit 9) in the pushed copy — see doc comment.
+        "and dword ptr [rsp], 0xFFFFFDFF", // Clear IF (bit 9) in the pushed copy; see doc comment.
         "popfq",
-        "fxrstor [rsi + 0x40]",   // F7: restore next's legacy x87/MMX/SSE state.
+        "fxrstor [rsi + 0x40]",   // Restore next's legacy x87/MMX/SSE state.
 
-        // F3/F4: prev's context (GP + FPU) is now fully saved and we've
+        // prev's context (GP + FPU) is now fully saved and we've
         // switched onto next's stack, so it is safe for another CPU to run
         // or reap prev. rcx = prev_on_cpu (4th SysV arg); nothing above
         // touches rcx. A plain store is enough for release semantics: x86

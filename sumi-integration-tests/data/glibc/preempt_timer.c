@@ -1,4 +1,4 @@
-// Phase 9 test: verify timer preemption works.
+// Verify timer preemption works.
 //
 // A busy-loop thread that NEVER voluntarily yields must be preempted
 // by the LAPIC timer so that other threads can make progress. Without

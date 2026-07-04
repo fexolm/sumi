@@ -11,7 +11,7 @@ const PAGE_COUNT: usize = MAX_GUEST_MEMORY.div_ceil(PAGE_SIZE);
 const BITMAP_SIZE: usize = PAGE_COUNT.div_ceil(64);
 
 /// Page index of the 2 MiB frame backing the LAPIC MMIO page. Permanently
-/// reserved (F1): `sumi-vm` never registers a KVM memslot over this
+/// reserved: `sumi-vm` never registers a KVM memslot over this
 /// guest-physical range, so handing it out as ordinary RAM would let a
 /// guest write silently corrupt whatever the kernel put there instead of
 /// trapping to the emulated LAPIC register.
@@ -56,7 +56,7 @@ impl PageAllocatorImpl {
             page += 1;
         }
 
-        // Reserve the LAPIC hole (F1). Assert (compile-time, since this is a
+        // Reserve the LAPIC hole. Assert (compile-time, since this is a
         // const fn) that it doesn't fall inside the already-reserved range
         // computed above — the OR below would silently be a no-op in that
         // case, masking a future layout-constant regression.

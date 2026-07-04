@@ -1,7 +1,7 @@
 // CPUID feature bits we mask out so glibc IFUNC resolvers do not select
 // AVX/AVX2/AVX-512/FMA paths. We never enable CR4.OSXSAVE or set XCR0, so
 // any AVX instruction the guest executes would #UD. Masking the CPUID bits
-// forces glibc onto the SSE2 baseline. See docs/glibc-support-design.md §5.
+// forces glibc onto the SSE2 baseline. See docs/glibc-support-design.md.
 const CPUID_1_ECX_FMA: u32 = 1 << 12;
 const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
 const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;

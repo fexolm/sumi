@@ -4,7 +4,7 @@
 //! counter is updated while the lock is held, but can be sampled without
 //! the lock for a cheap "is anything runnable?" hint in the idle path.
 //!
-//! See `docs/design/multithreading-v2.md` §6.2.
+//! See `docs/design/multithreading-v2.md`.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,7 +48,7 @@ impl RunQueue {
 
     /// Append `t` to the tail. Safe to call from any CPU.
     pub fn push(&self, t: &Thread) {
-        // F5: irqsave — a timer tick that re-entered schedule_preempt while
+        // irqsave: a timer tick that re-entered schedule_preempt while
         // this lock is held would self-deadlock.
         let _irq = IrqGuard::new();
         let t_ptr: *mut Thread = t as *const Thread as *mut Thread;
@@ -86,7 +86,7 @@ impl RunQueue {
 
     /// Remove the head. Returns `None` if empty. Safe from any CPU.
     pub fn pop(&self) -> Option<*mut Thread> {
-        // F5: irqsave, see `push`.
+        // irqsave, see `push`.
         let _irq = IrqGuard::new();
         let mut g = self.inner.lock();
         let head = g.head;

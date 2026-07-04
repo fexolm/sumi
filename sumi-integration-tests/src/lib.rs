@@ -140,7 +140,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (String, String, boo
 
 /// Like `run_test`, but passes `--vcpus N` to sumi-vm and asserts
 /// that every CPU 1..N printed `[ap] cpu <id> online`. Used by the
-/// Phase 1 SMP smoke test.
+/// SMP smoke test.
 pub fn run_test_smp(name: &str, vcpus: u32) {
     if !kvm_available() {
         eprintln!("skipping {name} (smp): /dev/kvm not available");

@@ -1,4 +1,6 @@
-//! Phase 7 zombie reaper. See docs/design/multithreading-v2.md §10.1.
+//! Zombie reaper for exited threads.
+//!
+//! See `docs/design/multithreading-v2.md` for the thread lifecycle.
 
 extern crate alloc;
 
@@ -12,12 +14,12 @@ use crate::sched::thread::Thread;
 pub static ZOMBIE_LIST: spin::Mutex<Vec<Arc<Thread>>> = spin::Mutex::new(Vec::new());
 
 /// Cheap hint checked by `reap_zombies` on every context switch before
-/// taking `ZOMBIE_LIST.lock()` (F16). Set by `push_zombie`, cleared once
+/// taking `ZOMBIE_LIST.lock()`. Set by `push_zombie`, cleared once
 /// the list drains back to empty.
 static ZOMBIES_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub fn push_zombie(t: Arc<Thread>) {
-    // F5: irqsave, see `runqueue::RunQueue::push`.
+    // irqsave, see `runqueue::RunQueue::push`.
     let _irq = IrqGuard::new();
     ZOMBIE_LIST.lock().push(t);
     ZOMBIES_PENDING.store(true, Ordering::Release);
@@ -31,7 +33,7 @@ pub fn reap_zombies() {
     let mut zombies = ZOMBIE_LIST.lock();
     let mut i = 0;
     while i < zombies.len() {
-        // F4: reap only once the exiting thread's context save has fully
+        // Reap only once the exiting thread's context save has fully
         // completed (on_cpu == false). The old `current_thread`-scanning
         // check saw the thread as "off-CPU" as soon as schedule() published
         // `next`, which happens *before* `__switch_to_asm` finishes reading

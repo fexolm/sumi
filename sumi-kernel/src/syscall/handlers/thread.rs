@@ -33,8 +33,7 @@ const FUTEX_CLOCK_REALTIME: i32 = 256;
 const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
 /// Futex: WAIT blocks until a matching WAKE; WAKE wakes up to `val` waiters.
-/// Scheduler-integrated (see `sched::futex`) — real semantics under
-/// `cargo test` too (F14): `FUTEX_WAIT` on a mismatched value returns
+/// Scheduler-integrated (see `sched::futex`): `FUTEX_WAIT` on a mismatched value returns
 /// `EAGAIN` immediately, same as production; actually blocking still needs
 /// a second thread to wake it, so most host tests exercise the bookkeeping
 /// via `sched::futex` directly rather than through this dispatch.
@@ -101,7 +100,7 @@ mod tests {
     #[test]
     fn test_futex_private_flag() {
         // FUTEX_PRIVATE_FLAG (128) is stripped by FUTEX_CMD_MASK; the dispatch
-        // must reach the real FUTEX_WAIT arm (F14). Use a deliberately
+        // must reach the real FUTEX_WAIT arm. Use a deliberately
         // mismatched `expected` so `wait()` takes its EAGAIN fast path
         // instead of actually blocking — there is no second thread to wake
         // it on a single OS test thread.

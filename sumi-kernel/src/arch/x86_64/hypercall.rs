@@ -4,8 +4,7 @@
 //! `HYPERCALL_MMIO_BASE + offset`. The MMIO page is unmapped on the
 //! host side, so the write traps as `VcpuExit::MmioWrite` and is
 //! decoded by `sumi_vm::vm::HypercallContext`. See
-//! `sumi_abi::hypercall` for the wire format and
-//! `docs/design/multithreading-v2.md` §4.5 / §13 Phase 2.
+//! `sumi_abi::hypercall` for the wire format.
 
 use sumi_abi::arch::layout::HYPERCALL_MMIO_BASE;
 use sumi_abi::hypercall::{HC_KICK_CPU, HC_SHUTDOWN};
@@ -28,7 +27,7 @@ fn raw_hypercall(offset: usize, arg: u64) {
 }
 
 /// Wake `target_cpu_id` out of `KVM_RUN`. No-op if the target is
-/// not currently parked. Used by the scheduler IPI path (Phase 3+).
+/// not currently parked. Used by the scheduler IPI path.
 #[inline]
 pub fn kick_cpu(target_cpu_id: u32) {
     raw_hypercall(HC_KICK_CPU, target_cpu_id as u64);

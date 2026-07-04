@@ -425,9 +425,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                 handles.push(thread::spawn(move || -> Result<()> {
                     // Every vCPU (BSP included) publishes its tid so the
                     // hypercall dispatcher can fan out SIGUSR1 to any peer
-                    // that issues HC_SHUTDOWN. Phase 2: the BSP is always
-                    // the issuing CPU, but the design is correct for Phase 4+
-                    // where an AP may issue HC_SHUTDOWN.
+                    // when any CPU issues HC_SHUTDOWN.
                     // SAFETY: pthread_self never fails.
                     let tid = unsafe { libc::pthread_self() } as u64;
                     tid_slot.store(tid, Ordering::Release);
@@ -443,27 +441,25 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                 }));
             }
 
-            // Wait until every vCPU has stored its tid before joining anyone.
-            // This replaces the Phase 1 "wait for AP count" spin with an
-            // "all-or-nothing" barrier: every slot is valid before we signal.
+            // Wait until every vCPU has stored its tid before joining anyone:
+            // every slot is valid before we signal.
             while tid_published_count.load(Ordering::Acquire) < vcpu_count {
                 std::hint::spin_loop();
             }
 
             // Wait for the BSP to finish. Its run loop exits either from
-            // VcpuExit::Hlt (Phase 1 halt_forever fallback) or from
-            // HypercallControl::Stop (Phase 2 HC_SHUTDOWN path).
+            // VcpuExit::Hlt (legacy halt fallback) or from HypercallControl::Stop
+            // (HC_SHUTDOWN path).
             let bsp_handle = handles.remove(0);
             let bsp_result = bsp_handle.join();
 
-            // In the Phase 1 path the BSP did NOT set the shutdown flag,
-            // so publish it here. In the Phase 2 path it is already set;
-            // the second store is a no-op. Both paths work uniformly.
+            // If the BSP halted without HC_SHUTDOWN, publish shutdown here.
+            // If HC_SHUTDOWN already did it, this store is a no-op.
             shutdown.store(true, Ordering::Release);
 
             // Kick every AP out of KVM_RUN. HC_SHUTDOWN already did this
             // from inside the issuing CPU's dispatcher, but we re-issue
-            // here for the Phase 1 BSP-hlt fallback path.
+            // here for the BSP-hlt fallback path.
             for slot in hc_ctx.tid_slots.iter().skip(1) {
                 let tid = slot.load(Ordering::Acquire);
                 if tid != u64::MAX {
@@ -501,7 +497,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             }
 
             // Return the guest exit code if HC_SHUTDOWN was called, else 0
-            // (Phase 1 fallback: BSP halted without a hypercall).
+            // (BSP halted without a hypercall).
             let code = if hc_ctx.shutdown.load(Ordering::Acquire) {
                 hc_ctx.exit_code.load(Ordering::Acquire)
             } else {

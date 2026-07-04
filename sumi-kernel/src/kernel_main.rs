@@ -42,8 +42,8 @@ pub extern "C" fn _start() -> ! {
     sched::init_for_cpu(0);
     syscall::init();
 
-    // Phase 9: load TSS (for IST1 interrupt stack), IDT (exception and
-    // timer/IPI vectors), and start the LAPIC periodic timer (~1 ms).
+    // Load TSS (for IST1 interrupt stack), IDT (exception and timer/IPI
+    // vectors), and start the LAPIC periodic timer (~1 ms).
     // These must run BEFORE `sched::init_phase3_bsp()` so user-mode code
     // is always entered with a valid IDT and LAPIC timer running.
     sumi_kernel::arch::x86_64::tss::init_and_load(0);
@@ -69,16 +69,15 @@ pub extern "C" fn _start() -> ! {
     // must be set only after all such state is published.
     let user_program_path = exec::read_boot_info();
 
-    // Phase 3: register the BSP main thread and idle thread before APs
-    // start. Runs after PAGE_ALLOCATOR is usable (which it is from boot).
-    // Must run BEFORE KERNEL_READY so APs see valid PER_CPU[0].idle_thread.
+    // Register the BSP main thread and idle thread before APs start. Runs
+    // after PAGE_ALLOCATOR is usable (which it is from boot). Must run
+    // BEFORE KERNEL_READY so APs see valid PER_CPU[0].idle_thread.
     sched::init_phase3_bsp();
 
     // Last step of BSP init: release any AP currently spinning in
     // `ap_main_rust`. MUST come after every global the APs could touch
     // is published (virtio FS, virtio console, FD defaults, allocators,
-    // time, RNG seed, scheduler state). See docs/design/multithreading-v2.md
-    // §15.2 risk 10.
+    // time, RNG seed, scheduler state).
     use core::sync::atomic::Ordering;
     sched::KERNEL_READY.store(true, Ordering::Release);
 

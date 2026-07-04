@@ -37,7 +37,7 @@ pub extern "C" fn sumi_main() -> i32 {
     if tid == 0 {
         // ------------- CHILD -------------
         // Publish the sentinel, then spin yielding so the parent gets
-        // scheduled and observes the write. Phase 4 has no per-thread
+        // scheduled and observes the write. This test has no per-thread
         // exit yet; an infinite yield loop is the documented placeholder.
         unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!(SHARED), SENTINEL);

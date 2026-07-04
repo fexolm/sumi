@@ -69,8 +69,8 @@ pub fn sys_exit(args: &SyscallArgs) -> SyscallResult {
 
     // 3. Last live *user* thread → exit_group semantics (terminate VM).
     // registry::alive_count() also counts idle threads and unreaped
-    // zombies, so it can never actually reach 1 here (F8); LIVE_USER_THREADS
-    // tracks only the BSP main thread + clone() children.
+    // zombies, so it can never actually reach 1 here; LIVE_USER_THREADS tracks
+    // only the BSP main thread + clone() children.
     if registry::LIVE_USER_THREADS.fetch_sub(1, Ordering::AcqRel) == 1 {
         kprintln!("[exit] code={}", code);
         shutdown_vm(code);
@@ -131,8 +131,7 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
             }
             use core::sync::atomic::Ordering;
             // Update the authoritative per-thread value FIRST so a
-            // racing context switch (Phase 9: IRQ-driven preemption)
-            // never reloads a stale fs_base.
+            // racing IRQ-driven context switch never reloads a stale fs_base.
             crate::sched::current_thread()
                 .fs_base
                 .store(addr, Ordering::Relaxed);
