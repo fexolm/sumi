@@ -64,6 +64,10 @@ pub struct HypercallContext {
     /// One slot per vCPU id; entry `i` holds the host pthread tid of
     /// vCPU `i` (or `u64::MAX` if not yet published).
     pub tid_slots: Box<[Arc<AtomicU64>]>,
+    /// One sticky wake bit per vCPU. `HC_KICK_CPU` sets this before sending
+    /// SIGUSR1 so a kick that races just before a userspace HLT handler is
+    /// not lost.
+    pub wake_pending: Box<[Arc<AtomicBool>]>,
     /// Set to `true` when any vCPU executes `HC_SHUTDOWN`.
     pub shutdown: Arc<AtomicBool>,
     /// Last guest-supplied exit code. Written by the vCPU that executes
@@ -76,8 +80,12 @@ impl HypercallContext {
     /// `tid_slots[i]` MUST be the slot for vCPU `i`; ordering is the
     /// caller's responsibility.
     pub fn new(tid_slots: Vec<Arc<AtomicU64>>) -> Self {
+        let wake_pending: Vec<Arc<AtomicBool>> = (0..tid_slots.len())
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
         Self {
             tid_slots: tid_slots.into_boxed_slice(),
+            wake_pending: wake_pending.into_boxed_slice(),
             shutdown: Arc::new(AtomicBool::new(false)),
             exit_code: Arc::new(AtomicI32::new(0)),
         }
@@ -192,6 +200,9 @@ impl HypercallContext {
 
     fn signal_cpu(&self, cpu_id: u32) {
         if let Some(slot) = self.tid_slots.get(cpu_id as usize) {
+            if let Some(pending) = self.wake_pending.get(cpu_id as usize) {
+                pending.store(true, Ordering::Release);
+            }
             let tid = slot.load(Ordering::Acquire);
             if tid != u64::MAX {
                 // SAFETY: pthread_kill with a valid tid and SIGUSR1 is

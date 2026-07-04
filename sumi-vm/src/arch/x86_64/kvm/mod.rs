@@ -406,6 +406,10 @@ impl VCpu for KvmVCpu {
     fn run(&mut self, cpu_id: u32, hc_ctx: &HypercallContext) -> Result<()> {
         use std::sync::atomic::Ordering;
         loop {
+            if hc_ctx.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+
             let exit = match self.fd.run() {
                 Ok(e) => e,
                 Err(e) if e.errno() == libc::EINTR => {
@@ -441,11 +445,27 @@ impl VCpu for KvmVCpu {
                     devs.handle_mmio_write(addr, data, &self.mem);
                 }
                 VcpuExit::Hlt => {
-                    // BSP hlt = end of user program (legacy halt fallback).
-                    // APs hlt = idle park.
-                    // Either way, return — the supervising logic in
-                    // vm::run() decides whether to also kick the APs.
-                    return Ok(());
+                    if hc_ctx.shutdown.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    // A single-vCPU VM with no HC_SHUTDOWN path still uses
+                    // HLT as the legacy "we are done" fallback. In SMP, HLT is
+                    // also the normal scheduler idle path: the BSP may be idle
+                    // while an AP is still running user work, and APs must not
+                    // disappear just because their runqueue is temporarily
+                    // empty.
+                    if cpu_id == 0 && hc_ctx.tid_slots.len() == 1 {
+                        return Ok(());
+                    }
+                    let wake_pending = hc_ctx
+                        .wake_pending
+                        .get(cpu_id as usize)
+                        .map(|pending| pending.swap(false, Ordering::AcqRel))
+                        .unwrap_or(false);
+                    if !wake_pending {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                    continue;
                 }
                 VcpuExit::Intr => {
                     if hc_ctx.shutdown.load(Ordering::Acquire) {

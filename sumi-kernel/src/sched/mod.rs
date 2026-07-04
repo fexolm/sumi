@@ -282,7 +282,7 @@ pub fn init_phase3_ap(cpu_id: u32) -> ! {
 /// Work-stealing is necessary so that a CPU idling with a non-empty
 /// global workload does not starve threads that were enqueued on a busy
 /// peer (e.g. a CPU blocked in a long syscall with IF=0).
-fn try_steal_work() -> bool {
+pub(crate) fn try_steal_work() -> bool {
     use core::sync::atomic::Ordering;
 
     let cpu = percpu::this_cpu();

@@ -68,6 +68,13 @@ mod tests {
     use core::sync::atomic::Ordering;
     use crate::sched::thread::ThreadState;
 
+    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    fn clear_zombies() {
+        ZOMBIE_LIST.lock().clear();
+        ZOMBIES_PENDING.store(false, Ordering::Release);
+    }
+
     fn new_zombie(tid: u32) -> Arc<Thread> {
         let t = Arc::new(Thread::new_test(tid));
         t.state.store(ThreadState::Exited as u32, Ordering::Relaxed);
@@ -76,13 +83,15 @@ mod tests {
 
     #[test]
     fn zombie_list_starts_empty() {
-        ZOMBIE_LIST.lock().clear();
+        let _guard = TEST_LOCK.lock();
+        clear_zombies();
         assert_eq!(ZOMBIE_LIST.lock().len(), 0);
     }
 
     #[test]
     fn push_zombie_appends_to_list() {
-        ZOMBIE_LIST.lock().clear();
+        let _guard = TEST_LOCK.lock();
+        clear_zombies();
         push_zombie(new_zombie(7001));
         push_zombie(new_zombie(7002));
         let g = ZOMBIE_LIST.lock();
@@ -90,18 +99,19 @@ mod tests {
         assert_eq!(g[0].tid.0, 7001);
         assert_eq!(g[1].tid.0, 7002);
         drop(g);
-        ZOMBIE_LIST.lock().clear();
+        clear_zombies();
     }
 
     #[test]
     fn push_zombie_preserves_arc_count() {
-        ZOMBIE_LIST.lock().clear();
+        let _guard = TEST_LOCK.lock();
+        clear_zombies();
         let t = new_zombie(7003);
         let t_clone = t.clone();
         assert_eq!(Arc::strong_count(&t), 2);
         push_zombie(t);
         assert_eq!(Arc::strong_count(&t_clone), 2);
-        ZOMBIE_LIST.lock().clear();
+        clear_zombies();
         assert_eq!(Arc::strong_count(&t_clone), 1);
     }
 }

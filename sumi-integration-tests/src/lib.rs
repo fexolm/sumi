@@ -96,6 +96,7 @@ fn find_last_exit_code(stdout: &str) -> Option<i32> {
 /// via parallel reader threads so neither pipe fills up and blocks the
 /// child.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (String, String, bool) {
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn sumi-vm");
 

@@ -9,9 +9,14 @@ use crate::syscall::{SyscallArgs, SyscallResult};
 pub fn sys_sched_yield(_args: &SyscallArgs) -> SyscallResult {
     use core::sync::atomic::Ordering;
     let cpu = crate::sched::percpu::this_cpu();
-    // Fast path: nothing else is runnable.
+    // Fast path: nothing else is runnable locally. In SMP mode, first try
+    // to pull a runnable thread back from a peer CPU; otherwise a thread that
+    // repeatedly yields can spin locally while work is stranded elsewhere.
     if cpu.runqueue.load() == 0 {
-        return 0;
+        let _ = crate::sched::try_steal_work();
+        if cpu.runqueue.load() == 0 {
+            return 0;
+        }
     }
     let current = crate::sched::current_thread();
     // The idle thread must never call sched_yield directly.

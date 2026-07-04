@@ -323,6 +323,9 @@ pub unsafe extern "C" fn isr_timer() {
         "mov rax, gs:[{current_thread_off}]", // rax = *current_thread ptr
         "test rax, rax",
         "jz 2f",                              // null → skip preemption
+        "mov rdx, gs:[{idle_thread_off}]",    // rdx = *idle_thread ptr
+        "cmp rax, rdx",
+        "je 2f",                              // idle runs on its live stack; let idle_loop reschedule
         //
         // Load kernel_stack_top from the current thread:
         //   [thread + {kstack_off}] = Thread.kernel_stack_top
@@ -407,6 +410,7 @@ pub unsafe extern "C" fn isr_timer() {
 
         preempt_off         = const percpu::PREEMPT_COUNT_OFFSET,
         need_resched_off    = const core::mem::offset_of!(percpu::PerCpu, need_resched),
+        idle_thread_off     = const core::mem::offset_of!(percpu::PerCpu, idle_thread),
         kstack_off          = const KERNEL_STACK_TOP_OFFSET,
         current_thread_off  = const percpu::CURRENT_THREAD_OFFSET,
         saved_rsp_off        = const percpu::SAVED_USER_RSP_OFFSET,
