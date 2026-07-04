@@ -33,6 +33,13 @@ impl PageTableEntry {
         (self.0 & PRESENT) != 0
     }
 
+    /// True if this entry is a 2 MB huge-page leaf (as opposed to a pointer to
+    /// a lower-level table, or an empty slot). A hidden-but-real mapping made by
+    /// `clear_present` keeps this bit set even with PRESENT cleared.
+    pub fn is_huge_page(&self) -> bool {
+        (self.0 & HUGE_PAGE) != 0
+    }
+
     pub fn addr(&self) -> PhysicalAddr {
         PhysicalAddr::new(self.0 & ADDR_MASK)
     }
@@ -353,6 +360,17 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
             .ok_or(MemoryError::NotMapped {
                 addr: vaddr.as_usize(),
             })?;
+        // `get_mut_unconditional` returns the PD slot even when it is empty
+        // (the intermediate tables exist but this 2 MB range was never mapped —
+        // e.g. a guard page or a hole in a partially-mapped VMA). Blindly
+        // setting PRESENT on a zero slot would create a present non-huge PDE
+        // pointing at physical address 0, which the CPU would walk as a page
+        // table. Only restore a slot that is a real (hidden) huge-page leaf.
+        if !entry.is_huge_page() {
+            return Err(MemoryError::NotMapped {
+                addr: vaddr.as_usize(),
+            });
+        }
         entry.restore_present();
         Ok(())
     }
@@ -650,6 +668,31 @@ mod tests {
         assert!(
             matches!(result, Err(MemoryError::NotMapped { .. })),
             "restore_present on never-mapped address must return NotMapped, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn restore_present_on_empty_pd_slot_returns_not_mapped() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+        let pdata = alloc_data_page(&kalloc);
+
+        // Map A, which creates the PML4/PDPT/PD tables shared with B. B's PD
+        // slot is therefore reachable (intermediate tables exist) but empty —
+        // exactly the guard-page / partial-VMA case. restore_present must NOT
+        // set PRESENT on the zero slot (that would forge a non-huge PDE at
+        // physical address 0); it must report NotMapped.
+        pt.map_2mb(VADDR_A, pdata).expect("map A");
+
+        let result = pt.restore_present_2mb(VADDR_B);
+        assert!(
+            matches!(result, Err(MemoryError::NotMapped { addr }) if addr == VADDR_B.as_usize()),
+            "restore_present on an empty PD slot must return NotMapped, got {result:?}"
+        );
+        // The empty slot must remain empty — not a forged present entry.
+        assert!(
+            pt.get_if_present(VADDR_B).expect("walk B").is_none(),
+            "empty PD slot must stay absent after a failed restore"
         );
     }
 

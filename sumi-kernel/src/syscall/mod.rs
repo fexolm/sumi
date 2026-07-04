@@ -140,7 +140,6 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
 
     // If clone() or wake_blocked set need_resched while we were in the
     // handler, schedule a context switch before returning to user code.
-    #[cfg(not(test))]
     {
         use core::sync::atomic::Ordering;
         let cpu = crate::sched::percpu::this_cpu();
@@ -149,6 +148,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         // (mprotect/munmap) and bumped TLB_GENERATION, flush our local TLB
         // by reloading CR3 before returning to user code (F10: the timer-tick
         // handler performs the same check for the preemption return path).
+        // No-op under test (see `PerCpu::reload_tlb_if_stale`'s host stand-in).
         cpu.reload_tlb_if_stale();
 
         if cpu.need_resched.swap(false, Ordering::AcqRel) {

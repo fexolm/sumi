@@ -94,3 +94,12 @@ pub fn interrupts_enabled() -> bool {
     }
     (flags & (1 << 9)) != 0
 }
+
+/// Host stand-in: there is no RFLAGS.IF to read on the test host, and no
+/// timer ISR that could re-enter `schedule()` there either, so `schedule()`
+/// (now callable under test, F14) never needs to trip this assertion.
+#[cfg(test)]
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    false
+}

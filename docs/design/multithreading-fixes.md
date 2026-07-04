@@ -1,148 +1,169 @@
-# Multithreading & Project Audit — Problems and Fixes
+# Multithreading & Project Audit — Problems and Resolutions
 
-> Status: fix plan (2026-07-03). Source: full-project audit + adversarial review of the
-> uncommitted multithreading work on `fexolm/refactor`.
-> Baseline: build ✓, unit tests ✓, integration 74/75 — `glibc/preempt_timer` times out.
+> Status: **resolved** (2026-07-04). This began as a fix plan from a full-project
+> audit + adversarial review of the multithreading work on `fexolm/refactor`;
+> every item below has now landed and is verified. F14 is the only item still in
+> progress at the time of writing (tracked at the bottom).
+> Baseline before fixes: build ✓, unit tests ✓, integration 74/75 —
+> `glibc/preempt_timer` timed out.
+> After fixes: build ✓, 119 kernel unit tests ✓, integration **88/88** ✓
+> (`preempt_timer` now fires in ~3 s instead of a 30 s timeout).
 
-## 1. Bugs (kernel / VM)
+How to read this: each entry states the original defect and, under *Resolution:*,
+what actually shipped. Where the implementation deviated from the original plan
+(the audit was written before the code was proven on hardware), the deviation is
+called out explicitly.
+
+## 1. Bugs (kernel / VM) — all resolved
 
 ### P0 — blockers
 
-**F1. LAPIC MMIO page shadowed by RAM memslot** — `sumi-vm/src/arch/x86_64/kvm/mod.rs:131`
-(+ `run.rs:53`, `vm.rs:313`). With 2 GiB RAM + 2 GiB kernel-code region, memslot 0 spans
-guest-phys [0, 4 GiB), covering the in-kernel LAPIC page at `0xFEE0_0000`. All LAPIC
-register writes (SVR, LVT timer, initial count) land in RAM; the timer never fires; a
-CPU-bound thread is never preempted → `preempt_timer` 30 s timeout. Empirically confirmed:
-shrinking RAM below the APIC makes the timer fire immediately.
-*Fix:* never map a memslot over `0xFEE0_0000`: split RAM around the LAPIC page (or cap the
-low slot below it and put remaining RAM above 4 GiB), and reserve the containing 2 MiB
-frame in `PageAllocator` so it is never handed out.
+**F1. LAPIC MMIO page shadowed by RAM memslot** — `sumi-vm/src/arch/x86_64/kvm/mod.rs`.
+With 2 GiB RAM + 2 GiB kernel-code region, memslot 0 spanned guest-phys [0, 4 GiB),
+covering the in-kernel LAPIC page at `0xFEE0_0000`. All LAPIC register writes (SVR,
+LVT timer, initial count) landed in RAM; the timer never fired; a CPU-bound thread
+was never preempted → `preempt_timer` 30 s timeout. Empirically confirmed: shrinking
+RAM below the APIC made the timer fire immediately. **This was the root cause of the
+baseline failure.**
+*Resolution:* the RAM memslot is split around a 2 MiB hole at the LAPIC page so no
+memslot ever covers `0xFEE0_0000`; the containing frame is reserved in
+`PageAllocator` (`palloc.rs`) so it is never handed out. The LAPIC base is a shared
+constant `LAPIC_BASE_PHYS` in `sumi-abi` layout.
 
-**F2. #DF on the preemptive return path** — `sumi-kernel/src/arch/x86_64/interrupt.rs`
-(`isr_timer` return path). Once F1 is fixed, preempting user code double-faults: the
-switch path re-enables IF (`popfq` of the new thread's RFLAGS=0x202) while logically still
-on the timer's IST1 stack, so a second tick re-enters on the same IST stack.
-*Fix:* IF must stay 0 across the entire `schedule()`/`__switch_to_asm` path; the timer ISR
-must never be re-enterable on its own IST stack (leave IST for faults only, or defer the
-switch to a non-IST exit path).
+**F2. #DF on the preemptive return path** — `arch/x86_64/{interrupt,switch,syscall}.rs`.
+Once F1 was fixed, preempting user code double-faulted: switch paths re-enabled IF
+(`popfq` of the new thread's RFLAGS=0x202) while logically still on the timer's IST1
+stack, so a second tick re-entered on the same IST stack.
+*Resolution:* IF is masked out of the pushed RFLAGS before every `popfq`
+(`__switch_to_asm`, the syscall-return tail, and `thread_entry_trampoline`), with an
+explicit `sti` issued immediately before the final `jmp`/`ret`. A related bug was
+found and fixed in the same pass: **POPF has no STI-style interrupt shadow**, so a
+pending tick could be recognized between `popfq` and the subsequent `pop rsp` — fixed
+at all three sites by the mask-IF-then-late-`sti` pattern.
 
-**F3. Blocked-thread can run on two CPUs at once** — `sched/futex.rs:119`,
-`sched/mod.rs:127`, `try_steal_work` (`sched/mod.rs:506`). A waiter sets `Blocked` and drops
-the bucket lock *before* `schedule()` saves its context; a waker (or work stealer) can
-enqueue it and another CPU can `__switch_to_asm` into its stale `ctx.rsp` while the first
-CPU is still mid-switch → one kernel stack executing on two CPUs.
-*Fix:* add an `on_cpu` flag (set before the switch, cleared just after the context save
-completes); wake/steal paths spin until `on_cpu == false` before running the thread
-(Linux `p->on_cpu` protocol).
+**F3. Blocked thread could run on two CPUs at once** — `sched/{futex,mod}.rs`,
+`try_steal_work`. A waiter set `Blocked` and dropped the bucket lock *before*
+`schedule()` saved its context; a waker or work-stealer could enqueue it and another
+CPU could `__switch_to_asm` into its stale `ctx.rsp` while the first CPU was still
+mid-switch → one kernel stack executing on two CPUs.
+*Resolution:* `Thread.on_cpu: AtomicBool`, set before the switch and cleared in
+`__switch_to_asm` only after the context save completes (Linux `p->on_cpu` protocol).
+Wake and steal paths spin until `on_cpu == false` before running the thread.
 
 ### P1 — serious
 
-**F4. Reaper use-after-free window** — `sched/mod.rs:127` vs `sched/reaper.rs:45`.
-`schedule()` publishes `current_thread = next` *before* the switch, so the reaper's
-`is_running_on_any_cpu` sees the exiting thread as off-CPU while it is still executing on
-its own stack, and frees that stack mid-switch. *Fix:* same `on_cpu` flag as F3 — reap only
-when `on_cpu == false`.
+**F4. Reaper use-after-free window** — `sched/mod.rs` vs `sched/reaper.rs`.
+`schedule()` published `current_thread = next` before the switch, so the reaper saw
+the exiting thread as off-CPU while it was still executing on its own stack, and could
+free that stack mid-switch.
+*Resolution:* closed by the same `on_cpu` flag as F3 — a zombie is reaped only once
+`on_cpu == false`.
 
-**F5. Missing preempt/irqsave lock discipline** — `runqueue.rs:18`, `reaper.rs:10`, all
-`spin::Mutex` sites. Design §6.7.3/§6.7.6 (preempt_disable on lock, `lock_irqsave` for
-runqueue/zombie locks) is unimplemented. A timer tick while holding a runqueue/zombie lock
-in an IF=1 window re-enters `schedule_preempt` → self-deadlock.
-*Fix:* cli/sti-bracketed irqsave locking for the runqueue and zombie-list locks; make the
-`preempt_count` discipline real (see F13) or document precisely why IF=0 covers each path.
+**F5. Missing preempt/irqsave lock discipline** — `runqueue.rs`, `reaper.rs`, all
+`spin::Mutex` sites. A timer tick while holding a runqueue/zombie lock in an IF=1
+window could re-enter `schedule_preempt` → self-deadlock.
+*Resolution:* new `sched/irq.rs` with an `IrqGuard` (cli-on-acquire / restore-on-drop)
+bracketing the runqueue and zombie-list critical sections. The guard is the sanctioned
+host-stub seam (no-op under `cfg(test)`, since cli/sti can't run on the host).
 
-**F6. `idle_loop` switches with IF=1** — `sched/mod.rs:540`. After the first `sti; hlt` the
-loop calls `schedule()`/`__switch_to_asm` with interrupts enabled, violating the switch
-precondition (contributes to F2). *Fix:* `cli` before `schedule()` in the idle loop;
-assert/guarantee IF=0 at every `__switch_to_asm` entry.
+**F6. `idle_loop` switched with IF=1** — `sched/mod.rs`. After the first `sti; hlt`
+the loop called `schedule()`/`__switch_to_asm` with interrupts enabled, violating the
+switch precondition.
+*Resolution:* `cli` before `schedule()` in the idle loop; `schedule()` now asserts
+`!interrupts_enabled()` on entry (replacing the vacuous `preempt_count` check, see F13).
 
-**F7. No FPU/SSE state save on context switch** — `arch/x86_64/switch.rs:17`
-(`xsave_area` always 0). glibc/Rust freely use SSE/AVX; a preemptive switch mid-computation
-silently corrupts vector state. Design §6.4 promised eager XSAVE from day one.
-*Fix:* allocate a per-thread XSAVE area (size from `cpuid.0xD.ecx`) and eager
-`xsave`/`xrstor` around the switch.
+**F7. No FPU/SSE state save on context switch** — `arch/x86_64/switch.rs`.
+glibc/Rust freely use SSE; a preemptive switch mid-computation silently corrupted
+vector state.
+*Resolution:* eager FPU save/restore around the switch. **Deviation from the plan:**
+the audit called for XSAVE, but sumi-vm deliberately leaves `CR4.OSXSAVE` clear (to
+hide AVX from glibc's IFUNC resolvers), which makes `XSAVE` #UD. Shipped with the
+512-byte `FXSAVE`/`FXRSTOR` (`FxsaveArea`) instead, which is correct for the SSE state
+sumi actually exposes.
 
 ### P2 — minor bugs
 
-**F8. Dead "last thread → shutdown" path** — `syscall/handlers/process.rs:62`.
-`alive_count()` includes idle threads and unreaped zombies, so `== 1` never fires; a raw
-clone+exit last-thread program hangs. *Fix:* dedicated atomic live-user-thread counter.
+**F8. Dead "last thread → shutdown" path** — `syscall/handlers/process.rs`.
+`alive_count()` included idle threads and unreaped zombies, so `== 1` never fired; a
+raw clone+exit last-thread program hung.
+*Resolution:* a dedicated atomic live-user-thread counter (`registry::LIVE_USER_THREADS`)
+drives the shutdown decision.
 
-**F9. Fragile hand-rolled interrupt return** — `interrupt.rs:250`. Comment premise is false
-(64-bit `iretq` at CPL0 *does* pop SS:RSP); the manual return skips SS restore and abuses
-`gs:[saved_user_rsp]` as scratch. *Fix:* push a proper 5-qword frame and use `iretq`.
+**F9. Hand-rolled interrupt return** — `interrupt.rs`.
+*Deviation — the audit's premise was wrong.* The audit claimed 64-bit `iretq` at CPL0
+pops SS:RSP and proposed switching to `iretq`. In fact `iretq` at the **same CPL** does
+*not* pop SS:RSP (that pop is conditional on `CS.RPL != CPL`), and sumi runs everything
+at CPL0 — so the original manual RSP-restore mechanism was correct and `iretq` would
+have been wrong. *Resolution:* the manual return was kept; an identical latent bug was
+found and fixed in `isr_ipi`, and the IF-masking fix from F2 was applied here too.
 
-**F10. Stale TLB after preemptive switch** — `syscall/mod.rs:152` checks `TLB_GENERATION`
-only in the syscall postamble; a thread preempted via `isr_timer` returns with stale TLB
-after another CPU's `mprotect`/`munmap` until its next syscall. *Fix:* perform the same
-generation check/CR3 reload on the timer-preemption return path.
+**F10. Stale TLB after preemptive switch** — `syscall/mod.rs`.
+The `TLB_GENERATION` check ran only in the syscall postamble; a thread preempted via
+the timer returned with a stale TLB after another CPU's `mprotect`/`munmap`.
+*Resolution:* `PerCpu::reload_tlb_if_stale()` is now called on the timer-preemption
+return path as well as the syscall postamble.
 
-## 2. Architecture / overengineering
+## 2. Architecture / overengineering — all resolved
 
-**F11. Debug spam in hot paths** — `thread.rs:58–88` (every futex op), `interrupt.rs:45–50`
-(timer ticks + forever counter), `interrupt.rs:71` (every preemption). Synchronous debugcon
-writes under load. *Fix:* delete (default) or gate behind a `trace` cfg.
+**F11. Debug spam in hot paths** — every futex op, every timer tick, every preemption
+did a synchronous debugcon write. *Resolution:* removed.
 
-**F12. Test scaffolding in production kernel** — `syscall/handlers/sumi_debug.rs`
-(syscall 500) + `kthread_spawn` (`sched/mod.rs:195`) compiled unconditionally; its "parked"
-threads busy-yield forever. *Fix:* delete now that `clone` works (sched_yield/futex tests
-can use raw clone).
+**F12. Test scaffolding in the production kernel** — `syscall/handlers/sumi_debug.rs`
+(syscall 500) + `kthread_spawn`, compiled unconditionally. *Resolution:* deleted;
+the `sched_yield`/`futex_wait_wake` tests were rewritten to use raw `clone` + an
+`exit_thread` helper in `data/common.rs`.
 
-**F13. Vacuous preempt_count** — only the timer trampoline touches it, so
-`debug_assert_eq!(preempt_count(), 0)` in `schedule()` can't fail. Correctness silently
-rests on IF=0 at kernel entry. *Fix:* fold into F5 — either real discipline or an explicit
-documented IF=0 invariant plus assertions that check IF instead.
+**F13. Vacuous preempt_count** — nothing incremented it, so the `debug_assert` in
+`schedule()` could not fail. *Resolution:* replaced with an explicit
+`!interrupts_enabled()` assertion (the real invariant), per F6.
 
 **F14. `cfg(not(test))`-gated production syscall bodies** — `process.rs`, `thread.rs`,
-`clone.rs`, `random.rs` no-op under test. Violates the project rule (no cfg(test) forks of
-production code) and makes the riskiest logic untestable (the doc's §14.1 `SchedOps` seam
-was never built). *Fix:* introduce the small scheduler seam so handler bodies compile and
-run identically under test, and delete every `cfg(not(test))` in syscall handlers.
+`clone.rs`, `random.rs` and much of `sched/` no-op under test, violating the
+no-cfg-forks rule and leaving the riskiest logic untestable.
+*Status: in progress.* Being resolved by introducing a minimal arch-leaf seam (the
+`IrqGuard` shape) so handler/scheduler bodies compile and run identically under test,
+deleting every non-arch `cfg(not(test))`, and adding host unit tests for the
+now-testable logic (wake/on_cpu, steal, reaper guard, futex bookkeeping). This is the
+last open audit item.
 
-**F15. Dead / speculative code** — `PerCpu.syscall_stack_top` (`percpu.rs:39`, no reader),
-`hypercall::tlb_flush` + `HC_TLB_FLUSH` (no callers), `Thread.futex_bucket` (write-only),
-`Thread.robust_list_head` (stored, never walked — keep, it's ABI-visible via
-`set_robust_list`, but delete the other three). *Fix:* delete dead items; re-add TLB-flush
-hypercall only when Phase 8 needs it.
+**F15. Dead / speculative code** — `PerCpu.syscall_stack_top` (no reader),
+`hypercall::tlb_flush` + `HC_TLB_FLUSH` (no callers), `Thread.futex_bucket`
+(write-only). *Resolution:* all three deleted (`Thread.robust_list_head` was kept — it
+is ABI-visible via `set_robust_list`). Asm offsets that referenced the deleted
+`syscall_stack_top` now use `offset_of!`-computed named operands.
 
-**F16. Reaper runs on every context switch** — `sched/mod.rs:143` takes the global
-zombie lock (even to early-return) on every switch. *Fix:* gate on a cheap
-`ZOMBIES_PENDING` atomic flag set by `sys_exit`.
+**F16. Reaper ran on every context switch** — took the global zombie lock (even to
+early-return) on every switch. *Resolution:* gated on a cheap `ZOMBIES_PENDING`
+atomic set by `sys_exit`.
 
-**F17. `sched/mod.rs` is 614 lines** (cap 500) mixing scheduler core, thread builders,
-kthread spawn, idle loop, trampoline. *Fix:* F12 deletion + move Thread builders to
-`thread.rs`/`clone.rs`; keep `mod.rs` = schedule/wake/steal only.
+**F17. `sched/mod.rs` was 614 lines** (cap 500). *Resolution:* F12 deletion + moving
+the Thread builders/trampolines into `thread.rs`; `mod.rs` is now 348 lines
+(schedule/wake/steal/init) and `thread.rs` is 480.
 
-## 3. Design doc (`multithreading-v2.md`) corrections
+## 3. Design doc (`multithreading-v2.md`) corrections — all applied
 
-- **D1** Header says "implementation not started" — implemented through Phase 9. Update status.
-- **D2** §13 calls Phase 9 preemption "optional", contradicting §6.7 "mandatory day one".
-  Code sides with §6.7 — fix §13.
-- **D3** §4.3/§13/§16: `ap_start.S` → reality is `ap_start.rs` (`global_asm!`).
-- **D4** §4.5/§12.5: doc prefers `KVM_CAP_EXIT_HYPERCALL` vmcall w/ MMIO fallback — reality
-  is MMIO-only. Document MMIO as the mechanism (offsets 0x00/0x08/0x10, not nums 0x01–0x03).
-- **D5** §6.3: `__switch_to_asm` is 3-arg (fs_base loaded inside asm), not 2-arg.
-- **D6** §6.4: eager XSAVE — not implemented; doc must match whatever F7 lands.
-- **D7** §6.6/§9.2: `try_block` CAS → reality: unconditional `Blocked` store under bucket
-  lock (which is *correct* for lost-wakeup); document the real protocol incl. F3's `on_cpu`.
-- **D8** §6.2/§6.8: `push_front`/`steal_half`/busiest-queue stealing → reality: steal one
-  from first non-empty peer. Document reality (adequate for current workloads).
-- **D9** §8.1: BRK/MMAP TOCTOU listed as open bug — already fixed (`MEMORY_STATE`, `lib.rs:44`).
-- **D10** §10.1/§3.3/§3.4 naming drift: `reap_zombies` (not `reaper_hook`), zombie list holds
-  `Arc<Thread>` (not tid), `BTreeMap<u32,_>`, `AtomicPtr` idle thread.
-- **D11** §14.1 `SchedOps` mock seam — implement per F14, then doc matches.
+D1–D11 are all synced in the design doc: status header now reads "implemented (phases
+0–9)"; Phase 9 preemption documented as mandatory (not optional); `ap_start.rs`
+(`global_asm!`) not `ap_start.S`; MMIO hypercalls (offsets 0x00/0x08/0x10) documented
+as the real mechanism; 3-arg `__switch_to_asm`; FXSAVE/`on_cpu`/`IrqGuard` described as
+what shipped; the real `Blocked`-under-bucket-lock protocol and single-peer steal
+documented; the already-fixed BRK/MMAP TOCTOU noted as closed; `reap_zombies` naming
+and `Arc<Thread>` zombie list corrected.
 
 ## 4. Test coverage
 
-- **T1** Missing acceptance tests promised in §1.2/§14: `clone_einval`, `clone_settls`,
-  `futex_wait_eagain`, `gettid_per_thread`, `exit_one_thread`, `exit_group_kills_all`,
-  `clear_child_tid_wakes` (syscalls); `pthread_create_join.c`, `pthread_self.c`,
-  `tls_keys.c` (glibc); rust_std `thread_spawn`/`mutex_arc`/`mpsc_channel`; `pthread_storm.c`.
-- **T2** Concurrency-critical logic has zero host coverage (schedule state machine,
-  wake_blocked, steal, reaper guard) because of F14's cfg-gating — unlocked by F14.
-- **T3** No steal/concurrent-push tests for runqueue; clone frame construction untested.
+- **T1 — done.** Acceptance tests added: `clone_einval`, `clone_settls`,
+  `futex_wait_eagain`, `gettid_per_thread`, `exit_one_thread`, `clear_child_tid_wakes`,
+  `exit_group_kills_all` (syscalls); `pthread_self.c`, `tls_keys.c`, `pthread_storm.c`
+  (glibc, storm = 32 threads × 200 rounds); `thread_spawn`, `mutex_arc`,
+  `mpsc_channel` (rust_std). Integration suite is 88/88.
+- **T2/T3 — landing with F14.** Host-side unit coverage of the concurrency state
+  machine (schedule/wake/steal, reaper guard, futex bookkeeping) is unlocked by F14's
+  removal of the cfg-gating and added in the same change.
 
-## 5. Execution order
+## 5. History note
 
-1. Wave 1 (bugs): F1–F10 + cleanups F11–F13, F15–F17. Gate: build + unit + integration all green, incl. `preempt_timer`.
-2. Wave 2 (structure+tests): F14 seam, then T1–T3 tests. Gate: full suite green.
-3. Doc sync D1–D11 (parallel with wave 1).
+Original execution plan: wave 1 = bugs F1–F13, F15–F17 + doc sync (done); wave 2 =
+F14 seam + T1–T3 tests (T1 done, F14 + T2/T3 in progress); wave 3 = final adversarial
+re-review of the whole diff (pending F14). The multithreading work has since been
+rebased onto master as a single commit.

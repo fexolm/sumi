@@ -7,23 +7,20 @@ use crate::syscall::{SyscallArgs, SyscallResult};
 /// switch). Otherwise push self to the tail and call schedule() so the next
 /// thread at the head runs.
 pub fn sys_sched_yield(_args: &SyscallArgs) -> SyscallResult {
-    #[cfg(not(test))]
-    {
-        use core::sync::atomic::Ordering;
-        let cpu = crate::sched::percpu::this_cpu();
-        // Fast path: nothing else is runnable.
-        if cpu.runqueue.load() == 0 {
-            return 0;
-        }
-        let current = crate::sched::current_thread();
-        // The idle thread must never call sched_yield directly.
-        let idle_ptr = cpu.idle_thread.load(Ordering::Relaxed);
-        if core::ptr::eq(current as *const _, idle_ptr as *const _) {
-            return 0;
-        }
-        cpu.runqueue.push(current);
-        crate::sched::schedule();
+    use core::sync::atomic::Ordering;
+    let cpu = crate::sched::percpu::this_cpu();
+    // Fast path: nothing else is runnable.
+    if cpu.runqueue.load() == 0 {
+        return 0;
     }
+    let current = crate::sched::current_thread();
+    // The idle thread must never call sched_yield directly.
+    let idle_ptr = cpu.idle_thread.load(Ordering::Relaxed);
+    if core::ptr::eq(current as *const _, idle_ptr as *const _) {
+        return 0;
+    }
+    cpu.runqueue.push(current);
+    crate::sched::schedule();
     0
 }
 
@@ -36,11 +33,11 @@ const FUTEX_CLOCK_REALTIME: i32 = 256;
 const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
 /// Futex: WAIT blocks until a matching WAKE; WAKE wakes up to `val` waiters.
-///
-/// Scheduler-integrated in kernel builds (see `sched::futex`). Under
-/// `cfg(test)` the scheduler is unavailable, so both WAIT and WAKE are
-/// no-ops that return 0. Tests that need real futex semantics must run
-/// as integration tests under KVM.
+/// Scheduler-integrated (see `sched::futex`) — real semantics under
+/// `cargo test` too (F14): `FUTEX_WAIT` on a mismatched value returns
+/// `EAGAIN` immediately, same as production; actually blocking still needs
+/// a second thread to wake it, so most host tests exercise the bookkeeping
+/// via `sched::futex` directly rather than through this dispatch.
 pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     let uaddr = args.arg0 as *const u32;
     let op    = args.arg1 as i32;
@@ -52,35 +49,19 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     }
 
     match cmd {
-        FUTEX_WAIT => {
-            #[cfg(not(test))]
-            { crate::sched::futex::wait(uaddr, val) }
-            #[cfg(test)]
-            { let _ = (uaddr, val); 0 }
-        }
-        FUTEX_WAKE => {
-            #[cfg(not(test))]
-            { crate::sched::futex::wake(uaddr, val) }
-            #[cfg(test)]
-            { let _ = (uaddr, val); 0 }
-        }
+        FUTEX_WAIT => crate::sched::futex::wait(uaddr, val),
+        FUTEX_WAKE => crate::sched::futex::wake(uaddr, val),
         FUTEX_WAIT_BITSET => {
             // arg3 (r10) = timeout pointer (ignored in sumi — no timed waits)
             // arg4 (r8)  = unused
             // arg5 (r9)  = bitset
             let bitset = args.arg5 as u32;
-            #[cfg(not(test))]
-            { crate::sched::futex::wait_bitset(uaddr, val, bitset) }
-            #[cfg(test)]
-            { let _ = (uaddr, val, bitset); 0 }
+            crate::sched::futex::wait_bitset(uaddr, val, bitset)
         }
         FUTEX_WAKE_BITSET => {
             // arg5 (r9) = bitset
             let bitset = args.arg5 as u32;
-            #[cfg(not(test))]
-            { crate::sched::futex::wake_bitset(uaddr, val, bitset) }
-            #[cfg(test)]
-            { let _ = (uaddr, val, bitset); 0 }
+            crate::sched::futex::wake_bitset(uaddr, val, bitset)
         }
         _ => ENOSYS,
     }
@@ -92,15 +73,10 @@ pub fn sys_set_robust_list(args: &SyscallArgs) -> SyscallResult {
     if args.arg1 != ROBUST_LIST_HEAD_SIZE {
         return EINVAL;
     }
-    #[cfg(not(test))]
-    {
-        use core::sync::atomic::Ordering;
-        crate::sched::current_thread()
-            .robust_list_head
-            .store(args.arg0, Ordering::Relaxed);
-    }
-    #[cfg(test)]
-    { let _ = args; }
+    use core::sync::atomic::Ordering;
+    crate::sched::current_thread()
+        .robust_list_head
+        .store(args.arg0, Ordering::Relaxed);
     0
 }
 
@@ -125,13 +101,19 @@ mod tests {
     #[test]
     fn test_futex_private_flag() {
         // FUTEX_PRIVATE_FLAG (128) is stripped by FUTEX_CMD_MASK; the dispatch
-        // reaches the FUTEX_WAIT arm and returns 0 (cfg(test) no-op).
+        // must reach the real FUTEX_WAIT arm (F14). Use a deliberately
+        // mismatched `expected` so `wait()` takes its EAGAIN fast path
+        // instead of actually blocking — there is no second thread to wake
+        // it on a single OS test thread.
+        let t: &'static crate::sched::thread::Thread =
+            Box::leak(Box::new(crate::sched::thread::Thread::new_test(9001)));
+        crate::sched::percpu::install_test_thread(0, t);
         let word: u32 = 7;
         let op = (FUTEX_WAIT | FUTEX_PRIVATE_FLAG) as u64;
-        let args = make_args(&word as *const u32 as u64, op, 7);
+        let args = make_args(&word as *const u32 as u64, op, 8);
         assert_eq!(
             sys_futex(&args),
-            0,
+            EAGAIN,
             "FUTEX_WAIT|FUTEX_PRIVATE_FLAG must dispatch to FUTEX_WAIT arm",
         );
     }
@@ -160,11 +142,18 @@ mod tests {
 
     #[test]
     fn set_robust_list_accepts_size_24() {
+        let t: &'static crate::sched::thread::Thread =
+            Box::leak(Box::new(crate::sched::thread::Thread::new_test(9002)));
+        crate::sched::percpu::install_test_thread(0, t);
         let args = SyscallArgs {
             nr: 273, arg0: 0x1000, arg1: 24,
             arg2: 0, arg3: 0, arg4: 0, arg5: 0,
             caller_rip: 0, caller_rflags: 0,
         };
         assert_eq!(sys_set_robust_list(&args), 0);
+        assert_eq!(
+            t.robust_list_head.load(core::sync::atomic::Ordering::Relaxed),
+            0x1000,
+        );
     }
 }

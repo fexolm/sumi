@@ -7,11 +7,17 @@ use sumi_abi::{
 /// PAGE_TABLE_ALIGN must be a power of two and at least as large as the
 /// `align(4096)` on `PageTable`, so that virtual addresses produced by
 /// `p2v` satisfy the alignment assertion in `VirtualAddr::as_ref_mut`.
-const PAGE_TABLE_ALIGN: usize = 4096;
+/// Set to the full `PAGE_SIZE` (2 MiB, not just 4 KiB) so `p2v` also
+/// satisfies callers that require page-aligned addresses at `PAGE_SIZE`
+/// granularity (e.g. `sched::clone::clone_create_user_thread`'s kernel-stack
+/// top) — `KERNEL_STACK` and every `PageAllocator` allocation are
+/// `PAGE_SIZE`-aligned, so preserving that alignment through `p2v` requires
+/// `aligned_ptr` itself to be `PAGE_SIZE`-aligned, not just 4 KiB-aligned.
+const PAGE_TABLE_ALIGN: usize = PAGE_SIZE;
 
-/// Backs physical addresses with a 4096-byte-aligned heap buffer.
+/// Backs physical addresses with a `PAGE_SIZE`-aligned heap buffer.
 /// Physical address KERNEL_STACK maps to buf[0], so subsequent allocations
-/// at KERNEL_STACK + k*PAGE_TABLE_SIZE are also PAGE_TABLE_ALIGN-aligned.
+/// at KERNEL_STACK + k*PAGE_SIZE are also PAGE_TABLE_ALIGN-aligned.
 pub struct TestDirectMap {
     phys_base: usize,
     _buf: std::vec::Vec<u8>,

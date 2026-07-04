@@ -103,6 +103,12 @@ impl PerCpu {
             self.tlb_generation.store(global_gen, Ordering::Relaxed);
         }
     }
+
+    /// Host stand-in for `reload_tlb_if_stale`: `mov cr3` is ring-0-only, so
+    /// there is nothing to reload on the test host. The syscall-return
+    /// postamble that calls this can therefore stay unconditional (F14).
+    #[cfg(test)]
+    pub fn reload_tlb_if_stale(&self) {}
 }
 
 // SAFETY: PerCpu is only ever mutated from its owning CPU, and the
@@ -171,34 +177,92 @@ impl ApBootStackBuf {
 pub(crate) static mut AP_BOOT_STACKS: [ApBootStackBuf; MAX_VCPUS] =
     [const { ApBootStackBuf::new() }; MAX_VCPUS];
 
-/// Initialise `PER_CPU[cpu_id]` and load this CPU's `IA32_GS_BASE`
-/// with the address of that slot.
+/// Raw pointer to the backing storage for every vCPU's `PerCpu`.
+/// Production: the real `PER_CPU` static. Host tests: a fresh array leaked
+/// once per OS thread (`cargo test` runs every `#[test]` on its own thread,
+/// with no MSR to program), so parallel tests never alias the same memory
+/// the way sharing one process-wide static would.
 ///
-/// Must be called exactly once per vCPU, on that vCPU, BEFORE
-/// `syscall::init()`.
-///
-/// Gated out of `cfg(test)` because it writes an MSR (would GP-fault
-/// in ring 3). Tests cover layout only; the MSR write is exercised
-/// by the KVM integration tests.
+/// Returns a raw pointer rather than a `&mut`/`&` reference so `init_for_cpu`
+/// can write through it without ever casting away a shared reference's
+/// constness (that cast is UB even when the target has interior mutability).
 #[cfg(not(test))]
-pub fn init_for_cpu(cpu_id: u32) {
+fn per_cpu_array_ptr() -> *mut [PerCpu; MAX_VCPUS] {
+    core::ptr::addr_of_mut!(PER_CPU)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_PER_CPU: *mut [PerCpu; MAX_VCPUS] =
+        std::boxed::Box::into_raw(std::boxed::Box::new(core::array::from_fn(|_| PerCpu::zeroed())));
+}
+
+#[cfg(test)]
+fn per_cpu_array_ptr() -> *mut [PerCpu; MAX_VCPUS] {
+    TEST_PER_CPU.with(|p| *p)
+}
+
+/// Read-only view of the per-CPU array, for `get()`/`this_cpu()` (test).
+/// Callers must not hold the returned reference across a call to
+/// `init_for_cpu`, which writes a fresh element through `per_cpu_array_ptr()`.
+fn per_cpu_array() -> &'static [PerCpu; MAX_VCPUS] {
+    // SAFETY: `per_cpu_array_ptr()` always points at a valid, live `'static`
+    // `[PerCpu; MAX_VCPUS]` (the real `PER_CPU` static in production; a
+    // leaked, never-freed per-OS-thread array under test). `init_for_cpu`
+    // is the only writer, and only immediately before this function's
+    // caller reads the slot it just wrote (see its own SAFETY comment).
+    unsafe { &*per_cpu_array_ptr() }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Per-OS-thread "which vCPU am I" identity, standing in for the real
+    /// `IA32_GS_BASE` MSR that has no meaning on the test host.
+    static TEST_CURRENT_CPU: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Publish `pc_ptr` as "this CPU"'s `PerCpu` for every subsequent
+/// `this_cpu()` call. Production: programs `IA32_GS_BASE` so `this_cpu()`
+/// can read it back with a single `mov reg, gs:0`. Test: records the slot's
+/// `cpu_id` in a thread-local, since there is no GS base to program.
+#[cfg(not(test))]
+fn publish_this_cpu(pc_ptr: *mut PerCpu) {
     /// IA32_GS_BASE MSR. Not `IA32_KERNEL_GS_BASE` (0xC000_0102): sumi
     /// runs only in ring 0, so there is no `swapgs` path.
     const IA32_GS_BASE: u32 = 0xC000_0101;
+    // SAFETY: ring 0, valid MSR, value is the linear address of a `'static`
+    // `PerCpu` just initialised by `init_for_cpu`.
+    unsafe { crate::arch::x86_64::syscall::wrmsr(IA32_GS_BASE, pc_ptr as u64); }
+}
 
+#[cfg(test)]
+fn publish_this_cpu(pc_ptr: *mut PerCpu) {
+    // SAFETY: pc_ptr was just written by `init_for_cpu` above, from a slot
+    // in this OS thread's own `TEST_PER_CPU` array.
+    let cpu_id = unsafe { (*pc_ptr).cpu_id };
+    TEST_CURRENT_CPU.with(|c| c.set(cpu_id));
+}
+
+/// Initialise `PER_CPU[cpu_id]` (or its host stand-in under test) and make
+/// it "this CPU"'s per-cpu block for every subsequent `this_cpu()` call.
+///
+/// Must be called exactly once per vCPU, on that vCPU, BEFORE
+/// `syscall::init()`.
+pub fn init_for_cpu(cpu_id: u32) {
     debug_assert!((cpu_id as usize) < MAX_VCPUS);
     let idx = cpu_id as usize;
+    // SAFETY: per_cpu_array_ptr() points at a MAX_VCPUS-length array and
+    // idx < MAX_VCPUS (checked above).
+    let pc_ptr = unsafe { (per_cpu_array_ptr() as *mut PerCpu).add(idx) };
 
-    // SAFETY: each CPU writes its own distinct array slot. For the
-    // BSP this is serialized (only cpu 0 runs). For APs, each AP
-    // writes `PER_CPU[cpu_id]` exactly once from its own thread of
-    // execution, and no other CPU reads that slot until the owner
-    // has stored `IA32_GS_BASE` and begun running. Cross-CPU
-    // visibility of any field other than `self_ptr` is neither
-    // needed nor claimed.
+    // SAFETY: each CPU/test-thread writes only its own distinct array slot,
+    // and `publish_this_cpu` (below) is the only thing that lets another
+    // CPU/thread address it — so the write below always happens-before any
+    // read of this slot. For the BSP this is serialized (only cpu 0 runs
+    // before publishing). For APs, each AP writes `PER_CPU[cpu_id]` exactly
+    // once from its own thread of execution. Under test, `TEST_PER_CPU` is
+    // itself thread-local, so no other OS thread ever addresses this slot.
     unsafe {
-        let pc_ptr: *mut PerCpu = core::ptr::addr_of_mut!(PER_CPU[idx]);
-
         core::ptr::write(
             pc_ptr,
             PerCpu {
@@ -216,15 +280,14 @@ pub fn init_for_cpu(cpu_id: u32) {
                 preempt_count:   core::cell::UnsafeCell::new(0),
             },
         );
-
-        // Ring 0, valid MSR, value is the linear address of a `'static`.
-        crate::arch::x86_64::syscall::wrmsr(IA32_GS_BASE, pc_ptr as u64);
     }
+    publish_this_cpu(pc_ptr);
 }
 
-/// Return a reference to the currently running CPU's `PerCpu`. Not used
-/// in Phase 0, declared so later phases have a stable entry point.
-/// Undefined behaviour if called before `init_for_cpu`.
+/// Return a reference to the currently running CPU's `PerCpu`.
+/// Undefined behaviour if called before `init_for_cpu` (production); under
+/// test, returns the zeroed slot at index 0 if `init_for_cpu` was never
+/// called on this OS thread.
 #[cfg(not(test))]
 pub fn this_cpu() -> &'static PerCpu {
     let pc: *const PerCpu;
@@ -240,21 +303,24 @@ pub fn this_cpu() -> &'static PerCpu {
     }
 }
 
+#[cfg(test)]
+pub fn this_cpu() -> &'static PerCpu {
+    let idx = TEST_CURRENT_CPU.with(|c| c.get());
+    &per_cpu_array()[idx as usize]
+}
+
 /// Return a reference to `PER_CPU[cpu_id]` if that CPU has been initialised
 /// (i.e. `init_for_cpu` has run on it). Returns `None` for uninitialised slots
 /// and out-of-range indices.
 ///
 /// Used by `wake_blocked` to push to a specific CPU's runqueue.
-#[cfg(not(test))]
 pub fn get(cpu_id: u32) -> Option<&'static PerCpu> {
     if (cpu_id as usize) >= MAX_VCPUS {
         return None;
     }
-    // SAFETY: `PER_CPU` is a `'static` array; reading at a valid index and
-    // returning with `'static` lifetime is sound. The slot's `self_ptr` is
-    // null until `init_for_cpu` runs; we use that as the "not yet ready"
-    // sentinel.
-    let pc = unsafe { &*core::ptr::addr_of!(PER_CPU[cpu_id as usize]) };
+    let pc = &per_cpu_array()[cpu_id as usize];
+    // `self_ptr` is null until `init_for_cpu` runs on that slot; used as
+    // the "not yet ready" sentinel.
     if pc.self_ptr.is_null() { None } else { Some(pc) }
 }
 
@@ -293,6 +359,20 @@ const _: () = {
         "PerCpu must be 64-byte aligned",
     );
 };
+
+/// Test helper: initialise `cpu_id` (as `init_for_cpu` does) and publish
+/// `thread` as its `current_thread`, so handler/scheduler logic that calls
+/// `sched::current_thread()` has something valid to read. Mirrors what
+/// `init_phase3_bsp`/`init_phase3_ap` do in production before any syscall
+/// or `schedule()` call is reachable.
+#[cfg(test)]
+pub(crate) fn install_test_thread(cpu_id: u32, thread: &'static super::thread::Thread) {
+    init_for_cpu(cpu_id);
+    this_cpu().current_thread.store(
+        thread as *const super::thread::Thread as *mut super::thread::Thread,
+        core::sync::atomic::Ordering::Release,
+    );
+}
 
 #[cfg(test)]
 mod tests {

@@ -18,70 +18,73 @@ fn is_canonical_user(val: u64) -> bool {
 }
 
 pub fn sys_getpid(_args: &SyscallArgs) -> SyscallResult {
-    #[cfg(not(test))]
-    { crate::sched::current_thread().tgid.0 as i64 }
-    #[cfg(test)]
-    { 1 }
+    crate::sched::current_thread().tgid.0 as i64
+}
+
+/// Terminate the VM: real hypercall MMIO write in production (never
+/// returns — the host tears down every vCPU thread). Host stand-in: there
+/// is no VM to terminate under `cargo test`, so this panics with a
+/// distinguishing message instead of silently falling through a `-> !` fn.
+#[cfg(not(test))]
+fn shutdown_vm(exit_code: i32) -> ! {
+    crate::arch::x86_64::hypercall::shutdown(exit_code)
+}
+
+#[cfg(test)]
+fn shutdown_vm(exit_code: i32) -> ! {
+    panic!("hypercall shutdown({exit_code}) reached in host test build");
 }
 
 pub fn sys_exit(args: &SyscallArgs) -> SyscallResult {
-    #[cfg(not(test))]
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        use crate::sched::{self, current_thread, reaper, registry, thread::ThreadState};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::sched::{self, current_thread, reaper, registry, thread::ThreadState};
 
-        let code = args.arg0 as i32;
-        let me = current_thread();
-        me.exit_code.store(code, Ordering::Release);
+    let code = args.arg0 as i32;
+    let me = current_thread();
+    me.exit_code.store(code, Ordering::Release);
 
-        // 1. CLONE_CHILD_CLEARTID handshake: zero *ctid and futex_wake.
-        //    Without this, pthread_join hangs forever.
-        let clear = me.clear_child_tid.swap(0, Ordering::AcqRel);
-        if clear != 0 {
-            // SAFETY: sumi is a unikernel — kernel and user share the same
-            // address space. The address was written by set_tid_address and
-            // points at a u32 in the user's thread-local storage. A bad
-            // pointer will fault via #PF, which is acceptable for a dying thread.
-            unsafe {
-                AtomicU32::from_ptr(clear as *mut u32).store(0, Ordering::Release);
-            }
-            let _ = crate::sched::futex::wake(clear as *const u32, 1);
+    // 1. CLONE_CHILD_CLEARTID handshake: zero *ctid and futex_wake.
+    //    Without this, pthread_join hangs forever.
+    let clear = me.clear_child_tid.swap(0, Ordering::AcqRel);
+    if clear != 0 {
+        // SAFETY: sumi is a unikernel — kernel and user share the same
+        // address space. The address was written by set_tid_address and
+        // points at a u32 in the user's thread-local storage. A bad
+        // pointer will fault via #PF, which is acceptable for a dying thread.
+        unsafe {
+            AtomicU32::from_ptr(clear as *mut u32).store(0, Ordering::Release);
         }
+        let _ = crate::sched::futex::wake(clear as *const u32, 1);
+    }
 
-        // 2. Grab an Arc from the registry (for the zombie list).
-        let me_arc = match registry::lookup(me.tid) {
-            Some(a) => a,
-            None => {
-                // Running thread not in registry is a hard invariant violation.
-                kprintln!("[exit] BUG: current thread tid={} not in registry", me.tid.0);
-                crate::arch::x86_64::hypercall::shutdown(1);
-            }
-        };
-
-        // 3. Last live *user* thread → exit_group semantics (terminate VM).
-        // registry::alive_count() also counts idle threads and unreaped
-        // zombies, so it can never actually reach 1 here (F8); LIVE_USER_THREADS
-        // tracks only the BSP main thread + clone() children.
-        if registry::LIVE_USER_THREADS.fetch_sub(1, Ordering::AcqRel) == 1 {
-            kprintln!("[exit] code={}", code);
-            crate::arch::x86_64::hypercall::shutdown(code);
+    // 2. Grab an Arc from the registry (for the zombie list).
+    let me_arc = match registry::lookup(me.tid) {
+        Some(a) => a,
+        None => {
+            // Running thread not in registry is a hard invariant violation.
+            kprintln!("[exit] BUG: current thread tid={} not in registry", me.tid.0);
+            shutdown_vm(1);
         }
+    };
 
-        // 4. Transfer Arc to zombie list. Reaper will unregister + free.
-        reaper::push_zombie(me_arc);
-
-        // 5. Mark Exited so schedule's CAS doesn't re-enqueue us.
-        me.state.store(ThreadState::Exited as u32, Ordering::Release);
-
-        // 6. Final schedule — never returns to this thread.
-        sched::schedule();
-        panic!("schedule() returned to Exited thread tid={}", me.tid.0);
+    // 3. Last live *user* thread → exit_group semantics (terminate VM).
+    // registry::alive_count() also counts idle threads and unreaped
+    // zombies, so it can never actually reach 1 here (F8); LIVE_USER_THREADS
+    // tracks only the BSP main thread + clone() children.
+    if registry::LIVE_USER_THREADS.fetch_sub(1, Ordering::AcqRel) == 1 {
+        kprintln!("[exit] code={}", code);
+        shutdown_vm(code);
     }
-    #[cfg(test)]
-    {
-        let _ = args;
-        panic!("sys_exit reached in host test build");
-    }
+
+    // 4. Transfer Arc to zombie list. Reaper will unregister + free.
+    reaper::push_zombie(me_arc);
+
+    // 5. Mark Exited so schedule's CAS doesn't re-enqueue us.
+    me.state.store(ThreadState::Exited as u32, Ordering::Release);
+
+    // 6. Final schedule — never returns to this thread.
+    sched::schedule();
+    panic!("schedule() returned to Exited thread tid={}", me.tid.0);
 }
 
 pub fn sys_getuid(_args: &SyscallArgs) -> SyscallResult {
@@ -104,6 +107,19 @@ pub fn sys_getppid(_args: &SyscallArgs) -> SyscallResult {
     0
 }
 
+/// Load IA32_FS_BASE with `addr` so %fs-relative addressing (TLS) sees the
+/// new base immediately. Host stand-in: no MSR on the test host — every
+/// test-reachable read of the FS base goes through `current_thread().fs_base`
+/// instead, which the caller updates before calling this leaf.
+#[cfg(not(test))]
+fn set_fs_base_msr(addr: u64) {
+    // SAFETY: ring 0, valid MSR, canonical value verified by the caller.
+    unsafe { crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, addr); }
+}
+
+#[cfg(test)]
+fn set_fs_base_msr(_addr: u64) {}
+
 pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
     let code = args.arg0;
     let addr = args.arg1;
@@ -113,38 +129,27 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
             if !is_canonical_user(addr) {
                 return EINVAL;
             }
-            #[cfg(not(test))]
-            {
-                use core::sync::atomic::Ordering;
-                // Update the authoritative per-thread value FIRST so a
-                // racing context switch (Phase 9: IRQ-driven preemption)
-                // never reloads a stale fs_base.
-                crate::sched::current_thread()
-                    .fs_base
-                    .store(addr, Ordering::Relaxed);
-                // SAFETY: ring 0, valid MSR, canonical value verified above.
-                unsafe {
-                    crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, addr);
-                }
-            }
-            #[cfg(test)]
-            { let _ = addr; }
+            use core::sync::atomic::Ordering;
+            // Update the authoritative per-thread value FIRST so a
+            // racing context switch (Phase 9: IRQ-driven preemption)
+            // never reloads a stale fs_base.
+            crate::sched::current_thread()
+                .fs_base
+                .store(addr, Ordering::Relaxed);
+            set_fs_base_msr(addr);
             0
         }
         ARCH_GET_FS => {
             if addr == 0 {
                 return EFAULT;
             }
-            #[cfg(not(test))]
-            {
-                use core::sync::atomic::Ordering;
-                let v = crate::sched::current_thread()
-                    .fs_base
-                    .load(Ordering::Relaxed);
-                // SAFETY: unikernel shares the address space; bad pointer
-                // traps via #PF.
-                unsafe { *(addr as *mut u64) = v; }
-            }
+            use core::sync::atomic::Ordering;
+            let v = crate::sched::current_thread()
+                .fs_base
+                .load(Ordering::Relaxed);
+            // SAFETY: unikernel shares the address space; bad pointer
+            // traps via #PF.
+            unsafe { *(addr as *mut u64) = v; }
             0
         }
         _ => EINVAL,
@@ -152,23 +157,13 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
 }
 
 pub fn sys_gettid(_args: &SyscallArgs) -> SyscallResult {
-    #[cfg(not(test))]
-    { crate::sched::current_thread().tid.0 as i64 }
-    #[cfg(test)]
-    { 1 }
+    crate::sched::current_thread().tid.0 as i64
 }
 
 pub fn sys_exit_group(args: &SyscallArgs) -> SyscallResult {
     let code = args.arg0 as i32;
     kprintln!("[exit] code={}", code);
-    #[cfg(not(test))]
-    {
-        crate::arch::x86_64::hypercall::shutdown(code);
-    }
-    #[cfg(test)]
-    {
-        panic!("sys_exit_group({}) reached in host test build", code);
-    }
+    shutdown_vm(code);
 }
 
 #[repr(C)]
@@ -207,15 +202,10 @@ fn write_field(field: &mut [u8; 65], val: &[u8]) {
 }
 
 pub fn sys_set_tid_address(args: &SyscallArgs) -> SyscallResult {
-    #[cfg(not(test))]
-    {
-        use core::sync::atomic::Ordering;
-        let t = crate::sched::current_thread();
-        t.clear_child_tid.store(args.arg0, Ordering::Relaxed);
-        t.tid.0 as i64
-    }
-    #[cfg(test)]
-    { let _ = args; 1 }
+    use core::sync::atomic::Ordering;
+    let t = crate::sched::current_thread();
+    t.clear_child_tid.store(args.arg0, Ordering::Relaxed);
+    t.tid.0 as i64
 }
 
 // PR_SET_VMA: glibc 2.34+ calls prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)
@@ -255,11 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn arch_prctl_set_fs_canonical_accepted_in_test_build() {
-        // In test build, the cfg(not(test)) branch is skipped; just the
-        // canonical check + return 0.
+    fn arch_prctl_set_fs_canonical_accepted_updates_current_thread() {
+        let t: &'static crate::sched::thread::Thread =
+            Box::leak(Box::new(crate::sched::thread::Thread::new_test(9101)));
+        crate::sched::percpu::install_test_thread(0, t);
         let args = make_args(ARCH_SET_FS, 0x7FFF_FFFF_0000);
         assert_eq!(sys_arch_prctl(&args), 0);
+        assert_eq!(
+            t.fs_base.load(core::sync::atomic::Ordering::Relaxed),
+            0x7FFF_FFFF_0000,
+        );
     }
 
     #[test]
@@ -274,4 +269,3 @@ mod tests {
         assert_eq!(sys_arch_prctl(&args), EINVAL);
     }
 }
-

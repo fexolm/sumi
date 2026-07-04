@@ -2,11 +2,8 @@
 //!
 //! See `docs/design/multithreading-v2.md` §5, §13.
 
-use crate::syscall::errno::EINVAL;
+use crate::syscall::errno::{EINVAL, ENOMEM};
 use crate::syscall::{SyscallArgs, SyscallResult};
-
-#[cfg(not(test))]
-use crate::syscall::errno::ENOMEM;
 
 // Linux x86_64 clone() flag bits. Only those relevant to Phase 4/6 are named;
 // the rest are listed in the design doc (§5.1) and will be wired in later
@@ -16,13 +13,9 @@ const CLONE_FS:             u64 = 0x0000_0200;
 const CLONE_FILES:          u64 = 0x0000_0400;
 const CLONE_SIGHAND:        u64 = 0x0000_0800;
 const CLONE_THREAD:         u64 = 0x0001_0000;
-#[cfg(not(test))]
 const CLONE_SETTLS:         u64 = 0x0008_0000;
-#[cfg(not(test))]
 const CLONE_PARENT_SETTID:  u64 = 0x0010_0000;
-#[cfg(not(test))]
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-#[cfg(not(test))]
 const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
 
 /// Required pthread-style flag set. Any missing bit → `EINVAL`.
@@ -35,7 +28,6 @@ const REQUIRED: u64 =
 /// can restore them. This is required for glibc's clone3 child stub, which
 /// reads `rdx` (thread fn) and `r8` (thread arg) without re-loading them
 /// from the child stack — exactly as the parent had them at `syscall` time.
-#[cfg(not(test))]
 struct ParentRegs {
     arg0: u64, // rdi
     arg1: u64, // rsi
@@ -47,6 +39,24 @@ struct ParentRegs {
     caller_rflags: u64,
 }
 
+/// Direct map used to translate a new child thread's kernel-stack physical
+/// address into a writable virtual one (see `sched::clone::clone_create_user_thread`).
+/// Real: the production `KERNEL_ALLOCATOR`'s direct map, backed by KVM guest
+/// RAM. Host stand-in: a `TestDirectMap` sized to comfortably cover every
+/// `sys_clone`/`sys_clone3` call across this test binary, lazily created on
+/// first use and shared (`crate::PAGE_ALLOCATOR`, which `clone_create_user_thread`
+/// always allocates from, is itself a single process-wide bitmap).
+#[cfg(not(test))]
+fn clone_thread_direct_map() -> &'static crate::arch::KernelDirectMap {
+    crate::KERNEL_ALLOCATOR.direct_map()
+}
+
+#[cfg(test)]
+fn clone_thread_direct_map() -> &'static crate::memory::test_utils::TestDirectMap {
+    static TEST_DM: spin::Once<crate::memory::test_utils::TestDirectMap> = spin::Once::new();
+    TEST_DM.call_once(|| crate::memory::test_utils::TestDirectMap::new(32))
+}
+
 /// Core clone implementation shared by `sys_clone` and `sys_clone3`.
 ///
 /// `child_stack_top` is the child's user rsp. `regs` holds the parent's
@@ -55,7 +65,6 @@ struct ParentRegs {
 ///
 /// All pointer and flag validation must be done by the caller before invoking
 /// this function.
-#[cfg(not(test))]
 fn do_clone(
     flags: u64,
     child_stack_top: u64,
@@ -102,6 +111,7 @@ fn do_clone(
     let child = match clone_create_user_thread(
         tid, tgid, frame, fs_base,
         VirtualAddr::new(0), 0, clear_ctid,
+        clone_thread_direct_map(),
     ) {
         Ok(t) => t,
         Err(CloneError::OutOfMemory) => return ENOMEM,
@@ -153,17 +163,12 @@ pub fn sys_clone(args: &SyscallArgs) -> SyscallResult {
     if flags & REQUIRED != REQUIRED { return EINVAL; }
     if child_rsp == 0 { return EINVAL; }
 
-    #[cfg(not(test))]
-    {
-        let regs = ParentRegs {
-            arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
-            arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
-            caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
-        };
-        do_clone(flags, child_rsp, ptid_ptr, ctid_ptr, tls, regs)
-    }
-    #[cfg(test)]
-    { let _ = (ptid_ptr, ctid_ptr, tls); 0 }
+    let regs = ParentRegs {
+        arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
+        arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
+        caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
+    };
+    do_clone(flags, child_rsp, ptid_ptr, ctid_ptr, tls, regs)
 }
 
 /// Linux `clone_args` v0 (CLONE_ARGS_SIZE_VER0 = 64).
@@ -215,20 +220,15 @@ pub fn sys_clone3(args: &SyscallArgs) -> SyscallResult {
     let ptid_ptr = ca.parent_tid as *mut i32;
     let ctid_ptr = ca.child_tid  as *mut i32;
 
-    #[cfg(not(test))]
-    {
-        // For clone3, the parent's syscall argument registers are in args.arg0-arg5.
-        // These include rdx (thread fn) and r8 (thread arg) that glibc's
-        // clone3 child stub expects to find restored when the child runs.
-        let regs = ParentRegs {
-            arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
-            arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
-            caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
-        };
-        do_clone(ca.flags, stack_top, ptid_ptr, ctid_ptr, ca.tls, regs)
-    }
-    #[cfg(test)]
-    { let _ = (ptid_ptr, ctid_ptr); 0 }
+    // For clone3, the parent's syscall argument registers are in args.arg0-arg5.
+    // These include rdx (thread fn) and r8 (thread arg) that glibc's
+    // clone3 child stub expects to find restored when the child runs.
+    let regs = ParentRegs {
+        arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
+        arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
+        caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
+    };
+    do_clone(ca.flags, stack_top, ptid_ptr, ctid_ptr, ca.tls, regs)
 }
 
 #[cfg(test)]
@@ -273,18 +273,30 @@ mod tests {
         assert_eq!(sys_clone(&a), EINVAL);
     }
 
+    /// Real `do_clone` (F14) needs a current thread (for `parent.tgid`) and
+    /// an initialised per-cpu (for the runqueue push) — install both, like
+    /// `init_phase3_bsp` does in production before any clone is reachable.
+    fn install_parent() {
+        let t: &'static crate::sched::thread::Thread =
+            Box::leak(Box::new(crate::sched::thread::Thread::new_test(9201)));
+        crate::sched::percpu::install_test_thread(0, t);
+    }
+
     #[test]
     fn minimum_valid_flags_pass_validation() {
-        // Host build path returns 0 on a validated-but-not-executed clone.
+        install_parent();
+        // Real do_clone now runs end-to-end and returns the new child's TID
+        // (never 0/1, which are reserved).
         let a = args(REQUIRED, 0x1000);
-        assert_eq!(sys_clone(&a), 0);
+        assert!(sys_clone(&a) > 1);
     }
 
     #[test]
     fn extra_ignored_flags_accepted() {
+        install_parent();
         // CLONE_PARENT_SETTID (0x0010_0000) is allowed in addition to REQUIRED.
         let a = args(REQUIRED | 0x0010_0000, 0x1000);
-        assert_eq!(sys_clone(&a), 0);
+        assert!(sys_clone(&a) > 1);
     }
 
     fn clone3_args_struct(
@@ -326,10 +338,11 @@ mod tests {
 
     #[test]
     fn clone3_v0_minimum_ok() {
-        // The host test path returns 0 on a validated-but-not-executed clone3.
+        install_parent();
+        // Real do_clone3 now runs end-to-end and returns the new child's TID.
         let ca = clone3_args_struct(REQUIRED, 0x1000, 0x2000, 0);
         let args = clone3_syscall_args(&ca, 64);
-        assert_eq!(sys_clone3(&args), 0);
+        assert!(sys_clone3(&args) > 1);
     }
 
     #[test]

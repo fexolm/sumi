@@ -7,11 +7,8 @@
 //! trampoline that transitions a freshly-created thread into user mode for the
 //! first time.
 
-#[cfg(not(test))]
 use alloc::sync::Arc;
-#[cfg(not(test))]
-use sumi_abi::address::VirtualAddr;
-#[cfg(not(test))]
+use sumi_abi::address::{DirectMap, VirtualAddr};
 use crate::sched::thread::{Thread, Tid};
 
 /// Kernel-stack state needed to enter user mode for the first time.
@@ -82,8 +79,18 @@ pub enum CloneError {
 /// The caller is responsible for allocating a TID, assigning it, pushing
 /// the returned Arc to the registry and runqueue, and setting state to
 /// Runnable.
-#[cfg(not(test))]
-pub fn clone_create_user_thread(
+///
+/// Generic over `DM: DirectMap` (rather than hard-coded to the global
+/// `crate::KERNEL_ALLOCATOR`) so this function is directly host-testable
+/// with `crate::memory::test_utils::TestDirectMap` — same seam as
+/// `RootPageTable`/`KernelAllocator`. Production calls it with
+/// `crate::KERNEL_ALLOCATOR.direct_map()`.
+// Each parameter is an independent, already-validated piece of the new
+// Thread's state (the caller — `do_clone` — is where they'd naturally
+// group, but it validates and forwards them one at a time); no subset of
+// them shares a lifecycle that would justify a bundling struct.
+#[allow(clippy::too_many_arguments)]
+pub fn clone_create_user_thread<DM: DirectMap>(
     tid: Tid,
     tgid: Tid,
     frame: InitialFrame,
@@ -91,6 +98,7 @@ pub fn clone_create_user_thread(
     user_stack_base: VirtualAddr,
     user_stack_size: usize,
     clear_child_tid: u64,
+    dm: &DM,
 ) -> Result<Arc<Thread>, CloneError> {
     use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
@@ -105,9 +113,7 @@ pub fn clone_create_user_thread(
     let stack_phys = crate::PAGE_ALLOCATOR
         .alloc(1)
         .map_err(|_| CloneError::OutOfMemory)?;
-    let stack_top_virt = stack_phys
-        .add(PAGE_SIZE)
-        .to_virtual(crate::KERNEL_ALLOCATOR.direct_map());
+    let stack_top_virt = stack_phys.add(PAGE_SIZE).to_virtual(dm);
 
     // 2. Write the initial frame at the top of the kernel stack.
     //
@@ -263,4 +269,14 @@ unsafe extern "C" fn thread_entry_trampoline() -> ! {
         // Jump to user code at the instruction after the parent's syscall.
         "jmp r11",
     )
+}
+
+/// Host stand-in for the naked-asm trampoline above: `clone_create_user_thread`
+/// (now unconditional, F14) needs *some* function address to write into the
+/// frame's `ctx.rsp` slot so its layout is checkable under test. This is
+/// never actually invoked under test — there is no real `__switch_to_asm`
+/// to jump into it — so it exists purely as a valid, distinct symbol.
+#[cfg(test)]
+extern "C" fn thread_entry_trampoline() -> ! {
+    unreachable!("thread_entry_trampoline stub invoked under host test")
 }

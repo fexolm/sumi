@@ -23,7 +23,6 @@ pub fn push_zombie(t: Arc<Thread>) {
     ZOMBIES_PENDING.store(true, Ordering::Release);
 }
 
-#[cfg(not(test))]
 pub fn reap_zombies() {
     if !ZOMBIES_PENDING.load(Ordering::Acquire) {
         return;

@@ -13,13 +13,9 @@
 //! the bucket (and the waker will not see it), or it has pushed itself and
 //! already set `Blocked` under the lock.
 
-use core::sync::atomic::AtomicPtr;
-#[cfg(not(test))]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use crate::sched::thread::Thread;
-#[cfg(not(test))]
-use crate::sched::thread::ThreadState;
+use crate::sched::thread::{Thread, ThreadState};
 
 /// Number of hash buckets. Power of two.
 pub const FUTEX_BUCKETS: usize = 256;
@@ -67,7 +63,6 @@ fn bucket_for(uaddr: usize) -> &'static FutexBucket {
 }
 
 /// Prepend `t` at the head of `bucket`. Caller must hold `bucket.lock`.
-#[cfg(not(test))]
 fn bucket_push(bucket: &FutexBucket, t: &Thread) {
     let t_ptr = t as *const Thread as *mut Thread;
     let old_head = bucket.head.load(Ordering::Relaxed);
@@ -78,7 +73,6 @@ fn bucket_push(bucket: &FutexBucket, t: &Thread) {
 /// FUTEX_WAIT. Parks the current thread if `*uaddr == expected`, until
 /// a matching `wake` unblocks it. Returns 0 on wake, EAGAIN if the
 /// value already changed.
-#[cfg(not(test))]
 pub fn wait(uaddr: *const u32, expected: u32) -> i64 {
     use crate::syscall::errno::EAGAIN;
 
@@ -137,7 +131,6 @@ pub fn wait(uaddr: *const u32, expected: u32) -> i64 {
 /// glibc 2.34+ uses `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` with
 /// `bitset = FUTEX_BITSET_MATCH_ANY` for timed waits; the bitset filter
 /// is a no-op in that case but the syscall variant is required.
-#[cfg(not(test))]
 pub fn wait_bitset(uaddr: *const u32, expected: u32, bitset: u32) -> i64 {
     use crate::syscall::errno::EAGAIN;
 
@@ -172,7 +165,6 @@ pub fn wait_bitset(uaddr: *const u32, expected: u32, bitset: u32) -> i64 {
 
 /// FUTEX_WAKE_BITSET. Like `wake` but only wakes threads whose stored
 /// `wait_link.bitset & wake_bitset != 0`.
-#[cfg(not(test))]
 pub fn wake_bitset(uaddr: *const u32, max: u32, bitset: u32) -> i64 {
     if max == 0 || bitset == 0 {
         return 0;
@@ -210,7 +202,6 @@ pub fn wake_bitset(uaddr: *const u32, max: u32, bitset: u32) -> i64 {
 
 /// FUTEX_WAKE. Wakes up to `max` waiters queued on `uaddr`. Returns the
 /// number actually woken.
-#[cfg(not(test))]
 pub fn wake(uaddr: *const u32, max: u32) -> i64 {
     if max == 0 {
         return 0;

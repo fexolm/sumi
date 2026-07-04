@@ -10,6 +10,7 @@ use core::sync::atomic::AtomicBool;
 pub mod clone;
 pub mod futex;
 pub mod irq;
+pub mod kthread;
 pub mod percpu;
 pub mod reaper;
 pub mod registry;
@@ -19,7 +20,6 @@ pub mod thread;
 pub use percpu::{MAX_VCPUS, PerCpu};
 pub use thread::{Thread, ThreadContext, ThreadState, Tid};
 
-#[cfg(not(test))]
 pub use percpu::{get as get_cpu, init_for_cpu, this_cpu};
 
 /// Published by the BSP as the last step of its init path. APs spin on this
@@ -36,7 +36,6 @@ pub static KERNEL_READY: AtomicBool = AtomicBool::new(false);
 ///
 /// Must only be called after `init_phase3_bsp` / `init_phase3_ap` — the
 /// `current_thread` field is non-null only from that point on.
-#[cfg(not(test))]
 pub fn current_thread() -> &'static Thread {
     use core::sync::atomic::Ordering;
     let ptr = percpu::this_cpu().current_thread.load(Ordering::Relaxed);
@@ -60,7 +59,6 @@ pub fn current_thread() -> &'static Thread {
 /// the debug assertion below (F13: replaces the vacuous `preempt_count`
 /// check, since nothing outside the timer ISR trampoline ever increments
 /// `preempt_count`, so it can never actually be nonzero at this point).
-#[cfg(not(test))]
 pub fn schedule() {
     use core::sync::atomic::Ordering;
 
@@ -126,10 +124,29 @@ pub fn schedule() {
 
     let next_fs_base = next.fs_base.load(Ordering::Relaxed);
 
-    // SAFETY: see SAFETY comment above. No non-irqsave spin::Mutex is held
-    // across this call. `next_fs_base` is canonical: arch_prctl validates
-    // user writes, clone forwards user pointers that either fault at access
-    // or are valid. `&prev.on_cpu` points at the same Thread as `prev.ctx`.
+    switch_to(prev, next, next_fs_base);
+    // Execution resumes here when a later schedule() switches back to `prev`
+    // (production — see `switch_to`'s host stand-in for the test build).
+    // Phase 7: reap any zombie threads no longer current on any CPU.
+    reaper::reap_zombies();
+}
+
+/// The one genuinely hardware-only step of `schedule()`: hand off the live
+/// register/stack state from `prev` to `next`. This is the
+/// "`__switch_to_asm` invocation" leaf — inline asm that cannot execute on
+/// the host (there is no second real call stack to switch into).
+///
+/// The host stand-in reproduces the one side effect other CPUs'
+/// `wake_blocked` / `try_steal_work` / `reap_zombies` depend on: clearing
+/// `prev.on_cpu` once "the switch away" completes (F3/F4), so their
+/// on_cpu spin-wait terminates exactly as it would after a real switch.
+#[cfg(not(test))]
+fn switch_to(prev: &Thread, next: &Thread, next_fs_base: u64) {
+    // SAFETY: prev and next are distinct live Threads (checked by the only
+    // caller, schedule()). No non-irqsave spin::Mutex is held across this
+    // call. `next_fs_base` is canonical: arch_prctl validates user writes,
+    // clone forwards user pointers that either fault at access or are
+    // valid. `&prev.on_cpu` points at the same Thread as `prev.ctx`.
     unsafe {
         crate::arch::x86_64::switch::__switch_to_asm(
             prev.ctx.get(),
@@ -138,9 +155,12 @@ pub fn schedule() {
             &prev.on_cpu,
         );
     }
-    // Execution resumes here when a later schedule() switches back to `prev`.
-    // Phase 7: reap any zombie threads no longer current on any CPU.
-    reaper::reap_zombies();
+}
+
+#[cfg(test)]
+fn switch_to(prev: &Thread, _next: &Thread, _next_fs_base: u64) {
+    use core::sync::atomic::Ordering;
+    prev.on_cpu.store(false, Ordering::Release);
 }
 
 /// Transition a blocked thread to Runnable and enqueue it on its home CPU.
@@ -148,7 +168,6 @@ pub fn schedule() {
 /// No-op if the thread is not in the Blocked state (idempotent CAS). After
 /// enqueuing, sets the target CPU's `need_resched` and sends an IPI if the
 /// CPU is idling.
-#[cfg(not(test))]
 pub fn wake_blocked(t: &Thread) {
     use core::sync::atomic::Ordering;
 
@@ -184,9 +203,21 @@ pub fn wake_blocked(t: &Thread) {
     if target.cpu_id != percpu::this_cpu().cpu_id
         && target.is_idle.load(Ordering::Acquire)
     {
-        crate::arch::x86_64::hypercall::kick_cpu(target.cpu_id);
+        kick_cpu(target.cpu_id);
     }
 }
+
+/// IPI leaf: wake a peer CPU parked in `idle_loop`'s `hlt`. Real hypercall
+/// MMIO write in production; no-op under test — there is no second vCPU to
+/// wake, and every other side effect `wake_blocked` performs (state CAS,
+/// on_cpu spin, runqueue push, need_resched) is already unconditional.
+#[cfg(not(test))]
+fn kick_cpu(target_cpu_id: u32) {
+    crate::arch::x86_64::hypercall::kick_cpu(target_cpu_id);
+}
+
+#[cfg(test)]
+fn kick_cpu(_target_cpu_id: u32) {}
 
 /// Initialise Phase 3 scheduler state for the BSP (cpu 0).
 ///
@@ -198,11 +229,12 @@ pub fn wake_blocked(t: &Thread) {
 pub fn init_phase3_bsp() {
     use core::sync::atomic::Ordering;
 
-    let main = thread::build_current_main_thread();
+    let dm = crate::KERNEL_ALLOCATOR.direct_map();
+    let main = kthread::build_current_main_thread(dm);
     registry::register_main(main.clone());
     registry::LIVE_USER_THREADS.fetch_add(1, Ordering::Relaxed);
 
-    let idle = thread::build_idle_thread();
+    let idle = kthread::build_idle_thread(dm);
     registry::register(idle.clone());
 
     let cpu = percpu::this_cpu();
@@ -226,7 +258,7 @@ pub fn init_phase3_bsp() {
 pub fn init_phase3_ap(cpu_id: u32) -> ! {
     use core::sync::atomic::Ordering;
 
-    let idle = thread::build_idle_thread_for_ap_reusing_boot_stack(cpu_id);
+    let idle = kthread::build_idle_thread_for_ap_reusing_boot_stack(cpu_id);
     registry::register(idle.clone());
 
     let cpu = percpu::this_cpu();
@@ -251,7 +283,6 @@ pub fn init_phase3_ap(cpu_id: u32) -> ! {
 /// Work-stealing is necessary so that a CPU idling with a non-empty
 /// global workload does not starve threads that were enqueued on a busy
 /// peer (e.g. a CPU blocked in a long syscall with IF=0).
-#[cfg(not(test))]
 fn try_steal_work() -> bool {
     use core::sync::atomic::Ordering;
 
