@@ -1,128 +1,94 @@
 # sumi
 
-Unikernel that runs Linux ELF binaries in one shared address space. There is no
-process isolation, but there is M:N threading over a fixed set of KVM vCPUs.
+sumi is a Rust unikernel that runs Linux x86_64 ELF binaries under KVM in one
+shared address space. There is no process isolation; user programs, kernel
+services, and threads share the kernel page table.
 
-## Architecture
+## First Read
 
-| Crate | Role | Target |
-|-------|------|--------|
-| `sumi-vm` | KVM hypervisor / loader | `x86_64-unknown-linux-gnu` |
-| `sumi-kernel` | The unikernel itself | `x86_64-unknown-none` (bare-metal) |
-| `sumi-abi` | Shared types between loader and kernel | `no_std`, both targets |
-| `sumi-integration-tests` | End-to-end test runner; one test program per file in `data/` | host (build.rs cross-compiles each test) |
+For codebase orientation, file maps, runtime flow, layout constants, and test
+recipes, read:
 
-### Build & Test
+- `.claude/code-context.md`
+
+Then read only the source files relevant to the task.
+
+## Build And Test
+
+The common entry points are in the `Makefile`:
 
 ```bash
-# Build kernel + VM
 make build
-
-# Host-side unit tests for every crate
+make clippy
 make test
-
-# End-to-end tests: each binary in sumi-integration-tests/data/{syscalls,glibc,rust_std}/
-# is built and executed inside sumi under KVM (requires /dev/kvm and gcc).
 make integration-test
+make all
 ```
 
-The integration test framework lives in `sumi-integration-tests/`. Files under
-`data/syscalls/` are single-file Rust syscall tests, `data/glibc/` contains
-glibc-linked C tests, and `data/rust_std/` contains Rust standard-library
-threading tests. `build.rs` compiles each file into a binary and emits one
-`#[test]` per binary; the harness runs each binary inside `sumi-vm` and checks
-the guest exit code.
+Use `.claude/code-context.md` for the exact crate-level commands and
+integration-test details.
 
 ## Coding Standards
 
 This is a bare-metal systems project. Every decision matters.
 
-### Performance First
-- Minimize allocations. Prefer static/stack when possible.
-- Avoid unnecessary abstractions — a direct function call is better than a trait object.
-- Think about cache lines, alignment, and memory layout.
-- Use `#[inline(always)]` only for genuinely hot paths in arch-specific code.
-- Prefer `spin::Mutex` over complex lock-free structures unless profiling proves otherwise.
+### Performance
+
+- Minimize allocations. Prefer static or stack storage when possible.
+- Avoid unnecessary abstraction. Use concrete code until a shared abstraction
+  removes real complexity.
+- Think about cache lines, alignment, memory layout, and hot-path instruction
+  count.
+- Use `#[inline(always)]` only for genuinely hot arch-specific paths.
+- Prefer simple locked data structures unless profiling proves otherwise.
 
 ### Simplicity
-- No frameworks, no macros where a function suffices.
-- Files under 500 lines. Split when logic is distinct, not for aesthetics.
-- No premature abstraction — write the concrete case first, generalize only when there are 3+ users.
-- If a comment explains *what* the code does, the code is too complex. Comments explain *why*.
+
+- No frameworks.
+- No macro when a function is enough.
+- Keep files under about 500 lines. Split when logic is distinct.
+- Comments explain why, not what.
 
 ### Safety
-- Minimize `unsafe` surface. Every `unsafe` block must have a `// SAFETY:` comment.
-- Validate at system boundaries (ELF parsing, hypercalls, hardware registers).
-- Internal invariants are enforced by types, not runtime checks.
-- No panics in kernel code paths — return `Result` or use `debug_assert!`.
 
-### Rust Specifics
-- Edition 2024, resolver 3.
-- `#![no_std]` for kernel and abi crates; `#[cfg(test)]` enables std for tests.
-- Use `PhysicalAddr` / `VirtualAddr` — never raw `usize` for addresses in public APIs.
-- Page table operations go through `DirectMap` trait for testability.
+- Minimize `unsafe`.
+- Every `unsafe` block needs a `// SAFETY:` comment naming the upheld
+  precondition.
+- Validate at system boundaries: ELF parsing, hypercalls, MMIO, user pointers,
+  hardware registers.
+- Do not add panics in production kernel paths. Return `Result` or use
+  `debug_assert!` for internal invariants.
 
-### Testing
-- Kernel code is testable on the host via `#[cfg(test)]` with mock `DirectMap`.
-- Every allocator/memory subsystem change must have unit tests.
-- Tests must verify edge cases: zero-size, max-size, alignment, double-free, concurrent access.
-- Use `TestDirectMap` pattern from `kmalloc.rs` for memory subsystem tests.
+### Rust
 
-### Delivery Checklist
-Every implementation MUST pass before being presented as complete:
-1. `cargo test` — all unit tests pass.
-2. `cargo build -p sumi-kernel --target x86_64-unknown-none` — bare-metal kernel links.
-3. `cargo build -p sumi-vm` — VM host binary builds.
-4. KVM smoke test: `sumi-vm run <kernel>` — kernel boots and exits cleanly.
-5. KVM integration test: if a new device/subsystem was added, run `sumi-vm run --share <dir> <kernel>` (or equivalent) and verify the init path succeeds.
-If any step fails, fix it before reporting done. Never present a broken build.
+- Workspace edition is 2024, resolver 3.
+- `sumi-kernel` and `sumi-abi` are `#![no_std]` outside tests.
+- Use `PhysicalAddr` and `VirtualAddr` in public APIs instead of raw `usize`
+  addresses.
+- Page-table and allocator code should remain host-testable through direct-map
+  test doubles.
 
-## Multi-Agent Development Workflow
+## Delivery Checklist
 
-This project uses a 4-agent workflow to ensure quality. Use `/develop` to run the full pipeline, or individual commands for specific phases.
+Before presenting code as complete, run the checks that match the blast radius:
 
-### Agents
+1. `cargo test` or the focused `cargo test -p <crate>`.
+2. `cargo build -p sumi-kernel --target x86_64-unknown-none`.
+3. `cargo build -p sumi-vm`.
+4. `make clippy` for broad kernel or VM changes.
+5. `make integration-test` for syscall, ELF loading, scheduler, virtio, or
+   user-program behavior changes when `/dev/kvm` is available.
 
-| Agent | Model | Role |
-|-------|-------|------|
-| Architect | opus | Designs approach, defines interfaces, considers trade-offs |
-| Implementor | sonnet | Writes the actual code following architect's plan |
-| Reviewer | opus | Critically reviews all decisions and code, must be convinced |
-| Tester | sonnet | Writes unit tests, runs them, verifies correctness |
+If a required check cannot run, report that explicitly.
 
-### Commands
+## Multi-Agent Workflow
 
-- `/develop <task>` — Full pipeline: architect -> implement -> review -> fix -> test
-- `/architect <task>` — Architecture/design analysis only
-- `/review` — Critical review of current changes
-- `/test` — Write tests and verify current changes
+This repo has Claude command files under `.claude/commands/` and agent prompts
+under `.claude/agents/`.
 
-### Workflow Rules
-1. Architect plans before code is written.
-2. Implementor follows the plan precisely.
-3. Reviewer challenges everything — assumptions, performance, safety, edge cases.
-4. If reviewer finds issues, implementor must fix them.
-5. Tester writes tests that cover the implementation AND the reviewer's concerns.
-6. No code is considered done until tests pass.
+- `/develop <task>`: architect, implement, review, fix loop, test, final verify.
+- `/architect <task>`: design only.
+- `/review`: review current uncommitted changes.
+- `/test`: add and run tests for current changes or a specified area.
 
-## Memory Layout (x86_64)
-
-```
-0x0000_0000_0000_0000  Kernel code (physical, loaded by ELF loader)
-                        ... page tables, stack ...
-KERNEL_STACK            First allocatable page (palloc starts here)
-                        ... physical memory ...
-0x0000_7FFF_FFFF_FFFF  MAX_PHYSICAL_ADDR (128 TB)
-
-0xFFFF_8880_0000_0000  DIRECT_MAP_OFFSET (virtual, identity map of all physical memory)
-0xFFFF_FFFF_8000_0000  KERNEL_CODE_VIRT (virtual, 2GB kernel code region)
-```
-
-## Key Abstractions
-
-- `DirectMap` trait — translates physical <-> virtual addresses; real impl uses offset, tests use buffer
-- `PageAllocator` — bitmap-based page allocator, 2MB pages
-- `KernelAllocator` — freelist-based sub-page allocator built on top of PageAllocator
-- `RootPageTable` — 3-level page table (PML4 -> PDPT -> PD) with 2MB huge pages
-- `sched` — per-CPU state, M:N scheduler, clone/futex/thread lifecycle
-- `VirtBackend` / `VCpu` traits — hypervisor abstraction (KVM impl)
+For significant kernel work, prefer architect -> implement -> review -> test.
