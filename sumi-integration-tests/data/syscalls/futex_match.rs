@@ -12,17 +12,14 @@ const FUTEX_PRIVATE_FLAG: u64 = 128;
 pub extern "C" fn sumi_main() -> i32 {
     let word: u32 = 7;
 
-    // FUTEX_WAIT with matching value: returns 0 immediately (no waiters
-    // possible in single-threaded unikernel).
-    check_eq!(sys_futex(&word, FUTEX_WAIT, 7), 0);
-
-    // PRIVATE_FLAG is stripped — same behavior.
-    check_eq!(sys_futex(&word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 7), 0);
-
-    // FUTEX_WAIT with mismatched value → EAGAIN.
+    // FUTEX_WAIT with mismatched value → EAGAIN (value changed before we
+    // could queue). This does NOT block.
     check_eq!(sys_futex(&word, FUTEX_WAIT, 99), EAGAIN);
 
-    // FUTEX_WAKE → returns 0 (no waiters).
+    // PRIVATE_FLAG stripped, mismatch → EAGAIN.
+    check_eq!(sys_futex(&word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 99), EAGAIN);
+
+    // FUTEX_WAKE → returns 0 (no waiters on this address).
     check_eq!(sys_futex(&word, FUTEX_WAKE, 1), 0);
 
     // Unknown op → ENOSYS.

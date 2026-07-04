@@ -4,6 +4,22 @@ pub mod debugcon;
 pub mod pagetable;
 #[cfg(not(test))]
 pub mod syscall;
+#[cfg(not(test))]
+pub mod ap_start;
+#[cfg(not(test))]
+pub mod smp;
+#[cfg(not(test))]
+pub mod hypercall;
+#[cfg(not(test))]
+pub mod switch;
+#[cfg(not(test))]
+pub mod tss;
+#[cfg(not(test))]
+pub mod idt;
+#[cfg(not(test))]
+pub mod lapic;
+#[cfg(not(test))]
+pub mod interrupt;
 
 pub use self::pagetable::RootPageTable;
 pub use sumi_abi::arch::address::DirectMap as KernelDirectMap;

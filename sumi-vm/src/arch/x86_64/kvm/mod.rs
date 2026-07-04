@@ -1,16 +1,17 @@
 use kvm_bindings::{
     KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP, KVM_MAX_CPUID_ENTRIES,
-    kvm_guest_debug, kvm_userspace_memory_region,
+    KVM_MP_STATE_RUNNABLE, kvm_guest_debug, kvm_mp_state, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VcpuExit;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use sumi_abi::arch::address::DirectMap;
 use sumi_abi::arch::address::{get_pdpt_index, get_pml4_index};
 use sumi_abi::arch::layout::{
     DAX_WINDOW_BASE, DAX_WINDOW_SIZE, DIRECT_MAP_PDPT, DIRECT_MAP_PDPT_COUNT, DIRECT_MAP_PML4,
     DIRECT_MAP_PML4_ENTRIES_COUNT, DIRECT_MAP_PML4_OFFSET, HUGE_PAGE_SIZE_1G, KERNEL_CODE_PD,
-    KERNEL_CODE_PDPD, KERNEL_STACK, PAGE_SIZE, PAGE_TABLE_ENTRIES, PAGE_TABLE_SIZE,
+    KERNEL_CODE_PDPD, KERNEL_STACK, LAPIC_BASE_PHYS, PAGE_SIZE, PAGE_TABLE_ENTRIES,
+    PAGE_TABLE_SIZE,
 };
 use sumi_abi::layout::{KERNEL_CODE_PHYS, KERNEL_CODE_VIRT};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -20,7 +21,7 @@ use crate::debug::{DebugCommand, DebugEvent, RegisterFile, StopReason, VCpuDebug
 use crate::devices::DeviceRegistry;
 use crate::{
     error::Result,
-    vm::{VCpu, VirtBackend, VmCreateInfo},
+    vm::{HypercallControl, HypercallContext, VCpu, VirtBackend, VmCreateInfo},
 };
 
 use crate::error::Error;
@@ -71,6 +72,11 @@ impl VirtBackend for KvmVm {
     fn new(_info: &VmCreateInfo) -> Result<Self> {
         let kvm = kvm_ioctls::Kvm::new()?;
         let vm_fd = kvm.create_vm()?;
+        // Enable the in-kernel LAPIC model. Must be called before any
+        // create_vcpu(); with this active KVM handles LAPIC MMIO and timer
+        // delivery entirely in-kernel, so the guest LAPIC registers at
+        // 0xFEE00000 don't exit to user-space.
+        vm_fd.create_irq_chip()?;
         Ok(Self {
             vm_fd,
             next_vcpu_id: AtomicUsize::new(0),
@@ -123,18 +129,45 @@ impl VirtBackend for KvmVm {
             mem.write_slice(&entry_val.to_le_bytes(), entry_addr)?;
         }
 
-        // Register the guest memory region with KVM (slot 0).
+        // Register the guest memory region(s) with KVM, split around the
+        // LAPIC MMIO page (F1). KVM's in-kernel LAPIC only intercepts
+        // guest-physical accesses to LAPIC_BASE_PHYS when no memslot backs
+        // that page with RAM; with the default 2 GiB RAM + 2 GiB kernel-code
+        // sizing, a single memslot spanning [0, 4 GiB) would otherwise cover
+        // it, turning every LAPIC register write into an ordinary (and
+        // silently wrong) memory store. Slot 0 covers everything below the
+        // hole; slot 2 (if any guest RAM lands above it) covers the rest.
+        // Slot 1 is reserved for the DAX window below.
         let guest_memory_size = mem.last_addr().0 + 1;
+        let hole_start = LAPIC_BASE_PHYS.as_u64();
+        let hole_end = hole_start + PAGE_SIZE as u64;
 
+        let low_slot_size = guest_memory_size.min(hole_start);
         unsafe {
             self.vm_fd
                 .set_user_memory_region(kvm_userspace_memory_region {
                     slot: 0,
                     guest_phys_addr: GUEST_BASE.0,
-                    memory_size: guest_memory_size,
+                    memory_size: low_slot_size,
                     userspace_addr: mem.get_host_address(GUEST_BASE).unwrap() as u64,
                     flags: 0,
                 })?;
+        }
+
+        if guest_memory_size > hole_end {
+            let high_addr = GuestAddress(hole_end);
+            // SAFETY: hole_end < guest_memory_size (checked above), so
+            // high_addr lies within the backing `mem` mapping.
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(kvm_userspace_memory_region {
+                        slot: 2,
+                        guest_phys_addr: hole_end,
+                        memory_size: guest_memory_size - hole_end,
+                        userspace_addr: mem.get_host_address(high_addr).unwrap() as u64,
+                        flags: 0,
+                    })?;
+            }
         }
 
         // Allocate the 128 GB DAX window on the host and register as KVM memslot 1.
@@ -189,6 +222,7 @@ pub struct KvmVCpu {
     fd: kvm_ioctls::VcpuFd,
     devices: Arc<Mutex<DeviceRegistry>>,
     mem: Arc<GuestMemoryMmap<()>>,
+    host_tid: Arc<AtomicU64>,
 }
 
 impl KvmVCpu {
@@ -197,7 +231,14 @@ impl KvmVCpu {
         devices: Arc<Mutex<DeviceRegistry>>,
         mem: Arc<GuestMemoryMmap<()>>,
     ) -> Self {
-        Self { fd, devices, mem }
+        Self {
+            fd,
+            devices,
+            mem,
+            // u64::MAX is the sentinel meaning "tid not yet published".
+            // pthread_t is theoretically 0-valid so 0 is not a safe sentinel.
+            host_tid: Arc::new(AtomicU64::new(u64::MAX)),
+        }
     }
 }
 
@@ -252,19 +293,16 @@ impl KvmVCpu {
     fn get_cr3(&self) -> Result<u64> {
         Ok(self.fd.get_sregs()?.cr3)
     }
-}
 
-impl VCpu for KvmVCpu {
-    fn tsc_khz(&self) -> u32 {
-        self.fd.get_tsc_khz().unwrap_or(0)
-    }
-
-    fn init(&mut self, entry_point: u64) -> Result<()> {
-        // Mask AVX/AVX2/AVX-512/FMA from the guest CPUID before the first
-        // KVM_RUN. We do not enable CR4.OSXSAVE or set XCR0, so the guest
-        // cannot legally execute AVX instructions. Masking the CPUID bits
-        // keeps glibc IFUNC resolvers on the SSE2 baseline. See
-        // docs/glibc-support-design.md §5.
+    /// Common register + sregs programming shared between BSP and APs.
+    /// - `rip`: instruction pointer at first KVM_RUN.
+    /// - `rsp`: user-facing SysV-ABI-aligned RSP for the first call frame.
+    ///   For APs this is a scratch value; `ap_start_asm` overwrites it
+    ///   from `AP_BOOT_STACKS[cpu_id]` on its first instruction.
+    /// - `rdi`: System V ABI first integer argument. BSP passes 0;
+    ///   APs pass `cpu_id`.
+    fn init_common(&mut self, rip: u64, rsp: u64, rdi: u64) -> Result<()> {
+        // CPUID masking — identical to the existing code.
         // TODO: Hoist CPUID setup into KvmVm::new and pass the masked CpuId through
         // to each vCPU. Currently we re-open /dev/kvm here, which is a layering
         // inversion. See round 2 review issue W1.
@@ -273,22 +311,15 @@ impl VCpu for KvmVCpu {
         cpuid_mask::apply(cpuid.as_mut_slice());
         self.fd.set_cpuid2(&cpuid)?;
 
-        // General purpose registers:
-        // - RIP: instruction pointer where the guest will start executing
-        // - RSP: stack pointer inside guest memory
-        // - RFLAGS: set the reserved bit required by x86
         let mut regs = self.fd.get_regs()?;
-        // Start executing at the ELF entry point supplied by the kernel image.
-        regs.rip = entry_point;
-        // _start is entered without a CALL frame; keep SysV ABI expectation
-        // (RSP % 16 == 8 on function entry) so local variables that require
-        // 16-byte alignment remain aligned after prologue.
-        regs.rsp = KERNEL_STACK.to_virtual(&DirectMap).as_u64() - 8;
-        regs.rflags = RFLAGS_RESERVED; // required reserved bit
+        regs.rip = rip;
+        regs.rsp = rsp;
+        regs.rdi = rdi;
+        regs.rflags = RFLAGS_RESERVED;
         self.fd.set_regs(&regs)?;
 
         let mut sregs = self.fd.get_sregs()?;
-        sregs.cr3 = DIRECT_MAP_PML4.as_u64(); // CR3 = physical address of the PML4 (page-table root)
+        sregs.cr3 = DIRECT_MAP_PML4.as_u64();
 
         // CR4.OSXSAVE is intentionally NOT set. The CPUID mask in
         // apply_cpuid_avx_mask removes all VEX/EVEX feature bits so glibc
@@ -296,8 +327,6 @@ impl VCpu for KvmVCpu {
         // here, you also need to set XCR0 via xsetbv AND remove the CPUID
         // mask, or you will create a half-broken vCPU. See
         // docs/glibc-support-design.md §5.
-        // CR4.PAE must be set to enable physical-address-extension paging required
-        // by 64-bit mode page tables.
         sregs.cr4 |= CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT;
 
         // EFER.LME enables Long Mode; EFER.LMA indicates Long Mode Active.
@@ -305,15 +334,15 @@ impl VCpu for KvmVCpu {
         sregs.efer = EFER_LME | EFER_LMA | EFER_SCE;
 
         // Code segment descriptor: set as a 64-bit code segment.
-        sregs.cs.l = 1; // L bit = 1 => 64-bit code segment
-        sregs.cs.db = 0; // DB = 0 => default operand size is 32-bit (unused in 64-bit)
-        sregs.cs.s = 1; // S = 1 => code/data descriptor (not system)
-        sregs.cs.type_ = CS_TYPE; // executable, read, accessed
+        sregs.cs.l = 1;
+        sregs.cs.db = 0;
+        sregs.cs.s = 1;
+        sregs.cs.type_ = CS_TYPE;
         sregs.cs.present = 1;
-        sregs.cs.dpl = 0; // ring 0
+        sregs.cs.dpl = 0;
         sregs.cs.selector = CS_SELECTOR;
 
-        // Stack/data segment for the guest (selector points into the GDT).
+        // Stack/data segment for the guest.
         sregs.ss.s = 1;
         sregs.ss.type_ = SS_TYPE;
         sregs.ss.present = 1;
@@ -325,18 +354,69 @@ impl VCpu for KvmVCpu {
 
         // CR0: enable protected mode (PE) and paging (PG). Also enable NE (numeric
         // error) so x87 exceptions behave as expected.
-        sregs.cr0 |= CR0_PG | CR0_PE | CR0_MP; // paging + protected mode + monitor coprocessor
-        sregs.cr0 |= CR0_NE; // numeric error
-        sregs.cr0 &= !CR0_EM; // enable x87/SSE instructions
-        sregs.cr0 &= !CR0_TS; // allow immediate FPU/SSE use
+        sregs.cr0 |= CR0_PG | CR0_PE | CR0_MP;
+        sregs.cr0 |= CR0_NE;
+        sregs.cr0 &= !CR0_EM;
+        sregs.cr0 &= !CR0_TS;
 
         self.fd.set_sregs(&sregs)?;
         Ok(())
     }
+}
 
-    fn run(&mut self) -> Result<()> {
+impl VCpu for KvmVCpu {
+    fn tsc_khz(&self) -> u32 {
+        self.fd.get_tsc_khz().unwrap_or(0)
+    }
+
+    fn host_tid_slot(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.host_tid)
+    }
+
+    fn init(&mut self, entry_point: u64) -> Result<()> {
+        // BSP: RDI is not an argument to `_start`, pass 0 for a
+        // deterministic initial register file.
+        self.init_common(
+            entry_point,
+            KERNEL_STACK.to_virtual(&DirectMap).as_u64() - 8,
+            0,
+        )
+    }
+
+    fn init_ap(&mut self, ap_entry: u64, cpu_id: u32) -> Result<()> {
+        // `ap_start_asm` overwrites RSP from AP_BOOT_STACKS[cpu_id]
+        // before any call; pass KERNEL_STACK - 8 as a valid-looking
+        // placeholder in case some early trap examines it.
+        self.init_common(
+            ap_entry,
+            KERNEL_STACK.to_virtual(&DirectMap).as_u64() - 8,
+            cpu_id as u64,
+        )?;
+        // With KVM_CREATE_IRQCHIP active, KVM initialises AP vCPUs in
+        // KVM_MP_STATE_UNINITIALIZED (awaiting INIT-SIPI-SIPI). Since sumi
+        // bypasses the BIOS startup sequence and sets the AP registers
+        // directly, we must override the state to KVM_MP_STATE_RUNNABLE so
+        // KVM_RUN proceeds immediately.
+        self.fd.set_mp_state(kvm_mp_state {
+            mp_state: KVM_MP_STATE_RUNNABLE,
+        })?;
+        Ok(())
+    }
+
+    fn run(&mut self, cpu_id: u32, hc_ctx: &HypercallContext) -> Result<()> {
+        use std::sync::atomic::Ordering;
         loop {
-            match self.fd.run()? {
+            let exit = match self.fd.run() {
+                Ok(e) => e,
+                Err(e) if e.errno() == libc::EINTR => {
+                    if hc_ctx.shutdown.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match exit {
                 VcpuExit::IoOut(0xE9, data) => {
                     use std::io::Write;
                     let stdout = std::io::stdout();
@@ -349,10 +429,30 @@ impl VCpu for KvmVCpu {
                     devs.handle_mmio_read(addr, data);
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    // Check for a hypercall trap BEFORE the device dispatcher
+                    // so we don't hold the DeviceRegistry lock during signaling.
+                    if let Some(ctl) = hc_ctx.dispatch_mmio(addr, data, cpu_id) {
+                        match ctl {
+                            HypercallControl::Continue => continue,
+                            HypercallControl::Stop => return Ok(()),
+                        }
+                    }
                     let mut devs = self.devices.lock().unwrap();
                     devs.handle_mmio_write(addr, data, &self.mem);
                 }
-                VcpuExit::Hlt => return Ok(()),
+                VcpuExit::Hlt => {
+                    // Phase 1 semantics: BSP hlt = end of user program
+                    // (sys_exit → halt_forever). APs hlt = idle park.
+                    // Either way, return — the supervising logic in
+                    // vm::run() decides whether to also kick the APs.
+                    return Ok(());
+                }
+                VcpuExit::Intr => {
+                    if hc_ctx.shutdown.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    // Spurious wake: just re-enter.
+                }
                 VcpuExit::Shutdown => {
                     eprintln!("[vm] SHUTDOWN (triple fault)");
                     let regs = self.fd.get_regs()?;
@@ -369,6 +469,10 @@ impl VCpu for KvmVCpu {
         let mut breakpoints = BreakpointManager::new();
         // Address where we need to single-step past a breakpoint then re-insert
         let mut stepping_past_bp: Option<u64> = false.then_some(0);
+
+        // Single-CPU context for hypercall dispatch inside run_debug. Debug
+        // mode is always one vCPU, so there are no peers to signal.
+        let hc_ctx = HypercallContext::single_cpu_for_debug();
 
         // Enable debug mode (software breakpoints intercepted by KVM)
         self.set_debug_mode(false)?;
@@ -449,8 +553,9 @@ impl VCpu for KvmVCpu {
                             arch: Default::default(),
                         };
                         self.fd.set_guest_debug(&debug)?;
-                        // Run normally until exit
-                        return self.run();
+                        // Run normally until exit using the already-constructed
+                        // single-CPU context (no peers to signal on detach).
+                        return self.run(0, &hc_ctx);
                     }
                     DebugCommand::Kill => {
                         return Ok(());
@@ -473,6 +578,16 @@ impl VCpu for KvmVCpu {
                     devs.handle_mmio_read(addr, data);
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    if let Some(ctl) = hc_ctx.dispatch_mmio(addr, data, 0) {
+                        match ctl {
+                            HypercallControl::Continue => continue,
+                            HypercallControl::Stop => {
+                                // Tell GDB the program exited.
+                                dbg.event_tx.send(DebugEvent::Stopped(StopReason::Exited)).ok();
+                                return Ok(());
+                            }
+                        }
+                    }
                     let mut devs = self.devices.lock().unwrap();
                     devs.handle_mmio_write(addr, data, &self.mem);
                 }

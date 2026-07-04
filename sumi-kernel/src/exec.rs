@@ -216,8 +216,11 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     let sp = setup_stack(path, &elf_info, interp_info.as_ref())?;
 
     // 7. Set brk state
-    *crate::BRK_BASE.lock() = brk_base;
-    *crate::BRK_CURRENT.lock() = brk_base;
+    {
+        let mut mem = crate::MEMORY_STATE.lock();
+        mem.brk_base = brk_base;
+        mem.brk_current = brk_base;
+    }
 
     // Entry point: interpreter's entry if present, else main binary's
     let entry = match &interp_info {
@@ -526,6 +529,11 @@ core::arch::global_asm!(
     "xor r15, r15",
     "xor rbp, rbp",
     "cld",
+    // Phase 9: enable interrupts so the LAPIC timer can fire during user-mode
+    // execution. SFMASK clears IF on every syscall entry, so interrupts are
+    // only live while the CPU is in user mode (ring 3). This is safe because
+    // the IDT is loaded and the LAPIC is configured before we reach here.
+    "sti",
     "jmp rax",
 );
 

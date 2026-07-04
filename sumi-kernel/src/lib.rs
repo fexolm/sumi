@@ -7,6 +7,7 @@ pub mod drivers;
 pub mod exec;
 pub mod fs;
 pub mod memory;
+pub mod sched;
 pub mod syscall;
 pub mod time;
 
@@ -30,10 +31,27 @@ pub static VIRTIO_FS: spin::Once<fs::virtio_fs::VirtioFsClient> = spin::Once::ne
 pub static VIRTIO_CONSOLE: spin::Once<drivers::virtio::console::VirtioConsole> = spin::Once::new();
 pub static RNG_SEED: spin::Once<[u8; 32]> = spin::Once::new();
 
-// User program memory state
-pub static BRK_BASE: spin::Mutex<VirtualAddr> = spin::Mutex::new(VirtualAddr::new(0));
-pub static BRK_CURRENT: spin::Mutex<VirtualAddr> = spin::Mutex::new(VirtualAddr::new(0));
-pub static MMAP_NEXT: spin::Mutex<VirtualAddr> = spin::Mutex::new(USER_MMAP_BASE);
+/// Global TLB generation counter. Bumped whenever a page-table change requires
+/// all CPUs to flush their TLBs (mprotect PROT_NONE, munmap). Each CPU checks
+/// this at syscall return and performs a CR3 reload if its local generation lags.
+pub static TLB_GENERATION: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Unified lock for all user-space memory bookkeeping.
+/// Previously split across three separate statics (BRK_BASE, BRK_CURRENT, MMAP_NEXT);
+/// merged so that operations that touch multiple fields (e.g. brk + mmap interplay)
+/// can be done atomically under one lock.
+pub struct MemoryState {
+    pub brk_base: VirtualAddr,
+    pub brk_current: VirtualAddr,
+    pub mmap_next: VirtualAddr,
+}
+
+pub static MEMORY_STATE: spin::Mutex<MemoryState> = spin::Mutex::new(MemoryState {
+    brk_base: VirtualAddr::new(0),
+    brk_current: VirtualAddr::new(0),
+    mmap_next: USER_MMAP_BASE,
+});
 
 /// Returns the global VirtioFsClient. Panics if not yet initialized.
 pub fn fs() -> &'static fs::virtio_fs::VirtioFsClient {

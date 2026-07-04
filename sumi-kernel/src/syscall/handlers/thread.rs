@@ -1,37 +1,106 @@
 use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
 
+/// Yield the CPU to another runnable thread.
+///
+/// Fast path: if the runqueue is empty, return immediately (no context
+/// switch). Otherwise push self to the tail and call schedule() so the next
+/// thread at the head runs.
+pub fn sys_sched_yield(_args: &SyscallArgs) -> SyscallResult {
+    #[cfg(not(test))]
+    {
+        use core::sync::atomic::Ordering;
+        let cpu = crate::sched::percpu::this_cpu();
+        // Fast path: nothing else is runnable.
+        if cpu.runqueue.load() == 0 {
+            return 0;
+        }
+        let current = crate::sched::current_thread();
+        // The idle thread must never call sched_yield directly.
+        let idle_ptr = cpu.idle_thread.load(Ordering::Relaxed);
+        if core::ptr::eq(current as *const _, idle_ptr as *const _) {
+            return 0;
+        }
+        cpu.runqueue.push(current);
+        crate::sched::schedule();
+    }
+    0
+}
+
 const FUTEX_WAIT: i32 = 0;
 const FUTEX_WAKE: i32 = 1;
+const FUTEX_WAIT_BITSET: i32 = 9;
+const FUTEX_WAKE_BITSET: i32 = 10;
 const FUTEX_PRIVATE_FLAG: i32 = 128;
 const FUTEX_CLOCK_REALTIME: i32 = 256;
 const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
-/// Single-threaded futex. WAIT returns 0 if *uaddr==val (no blocking),
-/// EAGAIN if mismatch. WAKE returns 0 (no waiters).
+/// Futex: WAIT blocks until a matching WAKE; WAKE wakes up to `val` waiters.
+///
+/// Scheduler-integrated in kernel builds (see `sched::futex`). Under
+/// `cfg(test)` the scheduler is unavailable, so both WAIT and WAKE are
+/// no-ops that return 0. Tests that need real futex semantics must run
+/// as integration tests under KVM.
 pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     let uaddr = args.arg0 as *const u32;
-    let op = args.arg1 as i32;
-    let val = args.arg2 as u32;
-    let cmd = op & FUTEX_CMD_MASK;
+    let op    = args.arg1 as i32;
+    let val   = args.arg2 as u32;
+    let cmd   = op & FUTEX_CMD_MASK;
+
+    if uaddr.is_null() {
+        return EFAULT;
+    }
+
     match cmd {
         FUTEX_WAIT => {
-            if uaddr.is_null() {
-                return EFAULT;
-            }
-            // SAFETY: User passed a valid aligned u32 pointer.
-            let current = unsafe { core::ptr::read_volatile(uaddr) };
-            if current == val { 0 } else { EAGAIN }
+            #[cfg(not(test))]
+            { crate::sched::futex::wait(uaddr, val) }
+            #[cfg(test)]
+            { let _ = (uaddr, val); 0 }
         }
-        FUTEX_WAKE => 0,
+        FUTEX_WAKE => {
+            #[cfg(not(test))]
+            { crate::sched::futex::wake(uaddr, val) }
+            #[cfg(test)]
+            { let _ = (uaddr, val); 0 }
+        }
+        FUTEX_WAIT_BITSET => {
+            // arg3 (r10) = timeout pointer (ignored in sumi — no timed waits)
+            // arg4 (r8)  = unused
+            // arg5 (r9)  = bitset
+            let bitset = args.arg5 as u32;
+            #[cfg(not(test))]
+            { crate::sched::futex::wait_bitset(uaddr, val, bitset) }
+            #[cfg(test)]
+            { let _ = (uaddr, val, bitset); 0 }
+        }
+        FUTEX_WAKE_BITSET => {
+            // arg5 (r9) = bitset
+            let bitset = args.arg5 as u32;
+            #[cfg(not(test))]
+            { crate::sched::futex::wake_bitset(uaddr, val, bitset) }
+            #[cfg(test)]
+            { let _ = (uaddr, val, bitset); 0 }
+        }
         _ => ENOSYS,
     }
 }
 
-// Single-threaded unikernel: pretend the robust list is registered. We never
-// walk it because we never exit a thread other than the main one. Returning 0
-// (instead of ENOSYS via the dispatch fall-through) silences glibc startup spam.
-pub fn sys_set_robust_list(_args: &SyscallArgs) -> SyscallResult {
+pub fn sys_set_robust_list(args: &SyscallArgs) -> SyscallResult {
+    // glibc always passes sizeof(struct robust_list_head) = 24.
+    const ROBUST_LIST_HEAD_SIZE: u64 = 24;
+    if args.arg1 != ROBUST_LIST_HEAD_SIZE {
+        return EINVAL;
+    }
+    #[cfg(not(test))]
+    {
+        use core::sync::atomic::Ordering;
+        crate::sched::current_thread()
+            .robust_list_head
+            .store(args.arg0, Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    { let _ = args; }
     0
 }
 
@@ -48,52 +117,22 @@ mod tests {
             arg3: 0,
             arg4: 0,
             arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         }
     }
 
     #[test]
-    fn test_futex_wait_match() {
-        // FUTEX_WAIT with val matching *uaddr must return 0 (no blocking needed).
-        let word: u32 = 42;
-        let args = make_args(&word as *const u32 as u64, FUTEX_WAIT as u64, 42);
-        assert_eq!(
-            sys_futex(&args),
-            0,
-            "FUTEX_WAIT with matching value must return 0"
-        );
-    }
-
-    #[test]
-    fn test_futex_wait_mismatch() {
-        // FUTEX_WAIT with val not matching *uaddr must return EAGAIN.
-        let word: u32 = 42;
-        let args = make_args(&word as *const u32 as u64, FUTEX_WAIT as u64, 99);
-        assert_eq!(
-            sys_futex(&args),
-            EAGAIN,
-            "FUTEX_WAIT with mismatched value must return EAGAIN"
-        );
-    }
-
-    #[test]
-    fn test_futex_wake() {
-        // FUTEX_WAKE has no waiters in a single-threaded kernel; must return 0.
-        let word: u32 = 0;
-        let args = make_args(&word as *const u32 as u64, FUTEX_WAKE as u64, 1);
-        assert_eq!(sys_futex(&args), 0, "FUTEX_WAKE must return 0 (no waiters)");
-    }
-
-    #[test]
     fn test_futex_private_flag() {
-        // FUTEX_PRIVATE_FLAG (128) is stripped by FUTEX_CMD_MASK; the underlying
-        // command is still FUTEX_WAIT and must behave identically.
+        // FUTEX_PRIVATE_FLAG (128) is stripped by FUTEX_CMD_MASK; the dispatch
+        // reaches the FUTEX_WAIT arm and returns 0 (cfg(test) no-op).
         let word: u32 = 7;
         let op = (FUTEX_WAIT | FUTEX_PRIVATE_FLAG) as u64;
         let args = make_args(&word as *const u32 as u64, op, 7);
         assert_eq!(
             sys_futex(&args),
             0,
-            "FUTEX_WAIT|FUTEX_PRIVATE_FLAG with matching value must return 0"
+            "FUTEX_WAIT|FUTEX_PRIVATE_FLAG must dispatch to FUTEX_WAIT arm",
         );
     }
 
@@ -105,7 +144,27 @@ mod tests {
         assert_eq!(
             sys_futex(&args),
             ENOSYS,
-            "unknown futex op must return ENOSYS"
+            "unknown futex op must return ENOSYS",
         );
+    }
+
+    #[test]
+    fn set_robust_list_rejects_wrong_length() {
+        let args = SyscallArgs {
+            nr: 273, arg0: 0x1000, arg1: 32,
+            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            caller_rip: 0, caller_rflags: 0,
+        };
+        assert_eq!(sys_set_robust_list(&args), EINVAL);
+    }
+
+    #[test]
+    fn set_robust_list_accepts_size_24() {
+        let args = SyscallArgs {
+            nr: 273, arg0: 0x1000, arg1: 24,
+            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            caller_rip: 0, caller_rflags: 0,
+        };
+        assert_eq!(sys_set_robust_list(&args), 0);
     }
 }

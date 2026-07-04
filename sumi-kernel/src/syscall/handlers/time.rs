@@ -38,7 +38,9 @@ pub fn sys_nanosleep(args: &SyscallArgs) -> SyscallResult {
     }
 
     let total_ns = ((sec as u128) * 1_000_000_000 + nsec as u128).min(u64::MAX as u128) as u64;
+    crate::kprintln!("[nanosleep] start {}ms", total_ns / 1_000_000);
     crate::time::busy_wait_ns(total_ns);
+    crate::kprintln!("[nanosleep] done");
 
     // Write zero remainder — we never get interrupted in a single-threaded unikernel.
     if !rem.is_null() {

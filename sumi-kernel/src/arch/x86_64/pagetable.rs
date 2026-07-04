@@ -36,6 +36,23 @@ impl PageTableEntry {
     pub fn addr(&self) -> PhysicalAddr {
         PhysicalAddr::new(self.0 & ADDR_MASK)
     }
+
+    /// Read the raw entry value (all bits).
+    pub fn raw(&self) -> u64 {
+        self.0 as u64
+    }
+
+    /// Clear the PRESENT bit while preserving all other bits (physical address, flags).
+    /// Used to implement PROT_NONE: the entry stays in the page table so
+    /// `restore_present` can re-enable the mapping without re-walking.
+    pub fn clear_present(&mut self) {
+        self.0 &= !PRESENT;
+    }
+
+    /// Set the PRESENT bit. Used to restore a previously cleared mapping.
+    pub fn restore_present(&mut self) {
+        self.0 |= PRESENT;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +131,40 @@ impl PageTable {
         let child_addr = entry.addr();
         let child = unsafe { Self::from_paddr_mut(child_addr, map) };
         child.get_mut_present_level(vaddr, next, map)
+    }
+
+    /// Walk page table without allocating. Returns mutable ref to the PD entry regardless
+    /// of whether the PRESENT bit is set. Used to restore a previously cleared mapping.
+    /// Returns None only when the PML4/PDPT entry itself is absent (page was never mapped).
+    fn get_mut_unconditional(
+        &mut self,
+        vaddr: VirtualAddr,
+        map: &impl DirectMap,
+    ) -> Option<&mut PageTableEntry> {
+        self.get_mut_unconditional_level(vaddr, PageTableLevel::Pml4, map)
+    }
+
+    fn get_mut_unconditional_level(
+        &mut self,
+        vaddr: VirtualAddr,
+        level: PageTableLevel,
+        map: &impl DirectMap,
+    ) -> Option<&mut PageTableEntry> {
+        if level == PageTableLevel::Pd {
+            // Return the PD entry regardless of PRESENT bit.
+            return Some(&mut self.entries[index_for(level, vaddr)]);
+        }
+
+        // For PML4 and PDPT we still need the intermediate entries to exist.
+        let entry = &self.entries[index_for(level, vaddr)];
+        if !entry.is_present() {
+            return None;
+        }
+
+        let next = level.next()?;
+        let child_addr = entry.addr();
+        let child = unsafe { Self::from_paddr_mut(child_addr, map) };
+        child.get_mut_unconditional_level(vaddr, next, map)
     }
 
     fn get_level<DM: DirectMap>(
@@ -275,6 +326,34 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
             });
         }
         entry.set_paddr(paddr);
+        Ok(())
+    }
+
+    /// Clear the PRESENT bit of the 2MB page at `vaddr` without removing the entry.
+    /// The physical address and other flags are preserved so `restore_present_2mb` can
+    /// re-enable the mapping. Returns error if the page was never mapped.
+    pub fn clear_present_2mb(&self, vaddr: VirtualAddr) -> Result<()> {
+        let entry = self
+            .get_pml4()
+            .get_mut_if_present(vaddr, self.kalloc.direct_map())
+            .ok_or(MemoryError::NotMapped {
+                addr: vaddr.as_usize(),
+            })?;
+        entry.clear_present();
+        Ok(())
+    }
+
+    /// Restore the PRESENT bit of the 2MB page at `vaddr` that was previously cleared
+    /// by `clear_present_2mb`. Returns error if the intermediate tables are absent
+    /// (i.e. the page was never mapped at all, not merely hidden).
+    pub fn restore_present_2mb(&self, vaddr: VirtualAddr) -> Result<()> {
+        let entry = self
+            .get_pml4()
+            .get_mut_unconditional(vaddr, self.kalloc.direct_map())
+            .ok_or(MemoryError::NotMapped {
+                addr: vaddr.as_usize(),
+            })?;
+        entry.restore_present();
         Ok(())
     }
 
@@ -511,5 +590,82 @@ mod tests {
             pt.get_if_present(VADDR_A).unwrap().is_none(),
             "VADDR_A must be absent after unmap"
         );
+    }
+
+    #[test]
+    fn clear_present_hides_mapping() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+        let pdata = alloc_data_page(&kalloc);
+
+        pt.map_2mb(VADDR_A, pdata).expect("map");
+        pt.clear_present_2mb(VADDR_A).expect("clear_present");
+
+        // get_if_present walks only PRESENT entries, so it returns None now.
+        let result = pt.get_if_present(VADDR_A).expect("get_if_present");
+        assert!(
+            result.is_none(),
+            "cleared entry must not appear as present"
+        );
+    }
+
+    #[test]
+    fn restore_present_reveals_mapping() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+        let pdata = alloc_data_page(&kalloc);
+
+        pt.map_2mb(VADDR_A, pdata).expect("map");
+        pt.clear_present_2mb(VADDR_A).expect("clear_present");
+        pt.restore_present_2mb(VADDR_A).expect("restore_present");
+
+        let entry = pt.get_if_present(VADDR_A).expect("get_if_present");
+        assert!(entry.is_some(), "restored entry must be present again");
+        assert_eq!(
+            entry.unwrap().addr(),
+            pdata,
+            "physical address must be preserved through clear/restore"
+        );
+    }
+
+    #[test]
+    fn clear_present_on_unmapped_returns_not_mapped() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+
+        let result = pt.clear_present_2mb(VADDR_A);
+        assert!(
+            matches!(result, Err(MemoryError::NotMapped { addr }) if addr == VADDR_A.as_usize()),
+            "clear_present on never-mapped address must return NotMapped, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn restore_present_on_never_mapped_returns_not_mapped() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+
+        // No map at all — the PML4/PDPT entries don't exist either.
+        let result = pt.restore_present_2mb(VADDR_A);
+        assert!(
+            matches!(result, Err(MemoryError::NotMapped { .. })),
+            "restore_present on never-mapped address must return NotMapped, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn raw_returns_entry_bits() {
+        let (_dm, _pa, kalloc) = make_alloc(16);
+        let pt = make_page_table(&kalloc);
+        let pdata = alloc_data_page(&kalloc);
+
+        pt.map_2mb(VADDR_A, pdata).expect("map");
+        let entry = pt.get_if_present(VADDR_A).expect("get").unwrap();
+        // The raw value must have PRESENT (bit 0), WRITABLE (bit 1), USER (bit 2),
+        // HUGE_PAGE (bit 7) set, plus the physical address.
+        let raw = entry.raw();
+        assert_eq!(raw & 1, 1, "PRESENT must be set");
+        assert_eq!(raw & (1 << 7), 1 << 7, "HUGE_PAGE must be set");
+        assert_eq!(entry.addr(), pdata, "addr extracted from raw matches");
     }
 }

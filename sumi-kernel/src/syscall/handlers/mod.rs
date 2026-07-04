@@ -1,3 +1,4 @@
+pub mod clone;
 pub mod fs;
 pub mod io;
 pub mod memory;

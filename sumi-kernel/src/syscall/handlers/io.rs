@@ -218,6 +218,8 @@ pub fn sys_open(args: &SyscallArgs) -> SyscallResult {
         arg3: args.arg2,      // mode
         arg4: 0,
         arg5: 0,
+        caller_rip:    args.caller_rip,
+        caller_rflags: args.caller_rflags,
     };
     crate::syscall::handlers::fs::sys_openat(&openat_args)
 }

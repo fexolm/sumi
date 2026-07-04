@@ -542,6 +542,8 @@ pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
             arg3: 0,
             arg4: 0,
             arg5: 0,
+            caller_rip:    args.caller_rip,
+            caller_rflags: args.caller_rflags,
         };
         return sys_fstat(&fstat_args);
     }

@@ -122,6 +122,26 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 }
 
 #[inline]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8")  a4,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline]
 unsafe fn syscall6(
     nr: u64,
     a0: u64,
@@ -196,6 +216,8 @@ const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
+const SYS_CLONE:       u64 = 56;
+const SYS_SCHED_YIELD: u64 = 24;
 
 // ── flag constants ─────────────────────────────────────────────────────────
 
@@ -221,6 +243,14 @@ const CLOCK_MONOTONIC: u64 = 1;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
+
+const CLONE_VM:      u64 = 0x0000_0100;
+const CLONE_FS:      u64 = 0x0000_0200;
+const CLONE_FILES:   u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD:  u64 = 0x0001_0000;
+const CLONE_REQUIRED: u64 =
+    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -499,9 +529,35 @@ fn sys_prctl(opt: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
 }
 
 #[inline]
+fn sys_sched_yield() -> i64 {
+    unsafe { syscall0(SYS_SCHED_YIELD) }
+}
+
+#[inline]
+fn sys_clone(flags: u64, child_stack: u64, ptid: *mut i32,
+             ctid: *mut i32, tls: u64) -> i64 {
+    unsafe {
+        syscall5(SYS_CLONE, flags, child_stack,
+                 ptid as u64, ctid as u64, tls)
+    }
+}
+
+#[inline]
 fn exit(code: i32) -> ! {
     unsafe {
         let _ = syscall1(SYS_EXIT_GROUP, code as u64);
+    }
+    loop {}
+}
+
+/// Exit only the calling thread (raw `exit`, syscall 60) — as opposed to
+/// `exit()` above (`exit_group`, syscall 231), which tears down the whole
+/// VM. Used by tests that clone() worker threads and need each one to
+/// terminate individually while the main thread keeps running.
+#[inline]
+fn exit_thread(code: i32) -> ! {
+    unsafe {
+        let _ = syscall1(SYS_EXIT, code as u64);
     }
     loop {}
 }
