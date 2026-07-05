@@ -86,16 +86,25 @@ pub fn read_boot_info() -> Option<&'static str> {
 /// the first element is the program path, the rest are its arguments.
 /// Never returns.
 pub fn exec_user_program(cmdline: &str) -> ! {
-    let mut argv: alloc::vec::Vec<&str> = cmdline.split('\0').collect();
+    // An optional environment block follows a double-NUL separator (see
+    // `write_boot_info` in sumi-vm); an empty argv entry is impossible, so
+    // "\0\0" cannot occur inside the argv block.
+    let (argv_block, env_block) = match cmdline.split_once("\0\0") {
+        Some((a, e)) => (a, e),
+        None => (cmdline, ""),
+    };
+    let mut argv: Vec<&str> = argv_block.split('\0').collect();
     // A trailing/duplicated NUL would create empty argv entries; the path
     // itself can never be empty (the host writes it from a non-empty
     // Option<String>), so drop empties defensively rather than passing a
     // confusing empty argv[k] to the program.
     argv.retain(|a| !a.is_empty());
+    let mut envp: Vec<&str> = env_block.split('\0').collect();
+    envp.retain(|e| !e.is_empty());
     let path = argv.first().copied().unwrap_or("");
     kprintln!("[exec] loading {}", path);
 
-    match exec_user_program_inner(path, &argv) {
+    match exec_user_program_inner(path, &argv, &envp) {
         Ok(()) => {
             // exec_user_program_inner only returns Ok if jump_to_user somehow returned,
             // which should never happen.
@@ -112,7 +121,7 @@ pub fn exec_user_program(cmdline: &str) -> ! {
     }
 }
 
-fn exec_user_program_inner(path: &str, argv: &[&str]) -> Result<(), ExecError> {
+fn exec_user_program_inner(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), ExecError> {
     // 1. Read file from virtio-fs
     let file_data = read_file(path)?;
 
@@ -223,7 +232,7 @@ fn exec_user_program_inner(path: &str, argv: &[&str]) -> Result<(), ExecError> {
     };
 
     // 6. Set up stack (needs elf_info + interp_info for auxv)
-    let sp = setup_stack(argv, &elf_info, interp_info.as_ref())?;
+    let sp = setup_stack(argv, envp, &elf_info, interp_info.as_ref())?;
 
     // 7. Set brk state
     {
@@ -368,6 +377,7 @@ fn load_segments_at_base(file_data: &[u8], elf: &Elf, base: u64) -> Result<Virtu
 
 fn setup_stack(
     argv: &[&str],
+    envp: &[&str],
     elf_info: &ElfInfo,
     interp_info: Option<&InterpInfo>,
 ) -> Result<u64, ExecError> {
@@ -389,6 +399,7 @@ fn setup_stack(
     Ok(prepare_initial_stack(
         USER_STACK_TOP,
         argv,
+        envp,
         elf_info,
         interp_info,
     ))
@@ -397,23 +408,29 @@ fn setup_stack(
 fn prepare_initial_stack(
     stack_top: VirtualAddr,
     argv: &[&str],
+    envp: &[&str],
     info: &ElfInfo,
     interp_info: Option<&InterpInfo>,
 ) -> u64 {
     let mut sp = stack_top.as_u64();
 
-    // Write each argv string (NUL-terminated) at the stack top, recording
-    // its address for the pointer array below.
-    let mut argv_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(argv.len());
-    for arg in argv {
-        sp -= (arg.len() + 1) as u64;
-        argv_addrs.push(sp);
-        // SAFETY: Stack pages are mapped; writing the string + terminator.
-        unsafe {
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
-            *(sp as *mut u8).add(arg.len()) = 0;
+    // Write each argv/envp string (NUL-terminated) at the stack top,
+    // recording its address for the pointer arrays below.
+    let mut write_strings = |sp: &mut u64, items: &[&str]| -> Vec<u64> {
+        let mut addrs = Vec::with_capacity(items.len());
+        for item in items {
+            *sp -= (item.len() + 1) as u64;
+            addrs.push(*sp);
+            // SAFETY: Stack pages are mapped; writing the string + terminator.
+            unsafe {
+                core::ptr::copy_nonoverlapping(item.as_ptr(), *sp as *mut u8, item.len());
+                *(*sp as *mut u8).add(item.len()) = 0;
+            }
         }
-    }
+        addrs
+    };
+    let argv_addrs = write_strings(&mut sp, argv);
+    let envp_addrs = write_strings(&mut sp, envp);
 
     // Write 16 "random" bytes for AT_RANDOM (musl reads this for stack canary)
     sp = (sp - 16) & !0xF; // align to 16 bytes
@@ -436,6 +453,19 @@ fn prepare_initial_stack(
 
     // Align to 16 bytes
     sp &= !0xF;
+
+    // The SysV ABI requires (sp % 16 == 0) at process entry with argc at
+    // sp. Everything pushed from here down is 28 auxv qwords, the envp
+    // pointers + NULL, the argv pointers + NULL, and argc: a total of
+    // 31 + argv.len() + envp.len() qwords. When that total is odd, push
+    // one pad qword FIRST — it must sit above auxv, because the program
+    // walks argv/envp/auxv as contiguous arrays and a stray zero qword
+    // between them would read as an early terminator (empty envp or empty
+    // auxv); above auxv it is dead memory (auxv self-terminates at
+    // AT_NULL).
+    if (argv.len() + envp.len()).is_multiple_of(2) {
+        sp = push_u64(sp, 0);
+    }
 
     // Auxiliary vector (push pairs from bottom to top in memory)
     sp = push_auxv(sp, AT_NULL, 0);
@@ -461,16 +491,10 @@ fn prepare_initial_stack(
     sp = push_auxv(sp, AT_PHENT, info.phentsize);
     sp = push_auxv(sp, AT_PHDR, info.phdr_vaddr);
 
-    // envp NULL terminator
+    // envp NULL terminator + pointers.
     sp = push_u64(sp, 0);
-
-    // The SysV ABI requires (sp % 16 == 0) at process entry with argc at
-    // sp. Everything below this comment is argv.len() + 3 qwords (argv
-    // NULL + pointers + argc); together with the 28 auxv qwords and the
-    // envp terminator above, the total after the 16-byte alignment point
-    // is 32 + argv.len() qwords — even argv counts need one pad qword.
-    if argv.len().is_multiple_of(2) {
-        sp = push_u64(sp, 0);
+    for &addr in envp_addrs.iter().rev() {
+        sp = push_u64(sp, addr);
     }
 
     // argv NULL terminator + pointers (argv[n-1] .. argv[0], so argv[0]

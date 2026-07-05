@@ -231,6 +231,10 @@ pub struct VmCreateInfo {
     /// boot-info buffer — NUL cannot appear inside a path or argument, so
     /// no escaping is needed and the BootInfo layout is unchanged.
     pub run_args: Vec<String>,
+    /// Environment (`KEY=VAL`) for the guest program. Appended to the same
+    /// boot-info buffer after a double-NUL separator (an empty argv entry
+    /// is impossible, so "\0\0" cannot occur inside the argv block).
+    pub run_env: Vec<String>,
     pub gdb_port: Option<u16>,
     /// `--hostfwd` rules: forward a host TCP port to a guest TCP port
     /// through the network gateway (see `net::gateway`). Empty by default.
@@ -756,6 +760,12 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             for arg in &info.run_args {
                 cmdline.push('\0');
                 cmdline.push_str(arg);
+            }
+            if !info.run_env.is_empty() {
+                // Double-NUL separator, then NUL-joined environment.
+                cmdline.push('\0');
+                cmdline.push('\0');
+                cmdline.push_str(&info.run_env.join("\0"));
             }
         }
         let path_bytes: &[u8] = cmdline.as_bytes();

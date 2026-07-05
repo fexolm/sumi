@@ -12,7 +12,12 @@ use sumi_abi::{
     arch::layout::{PAGE_SIZE, PAGE_TABLE_SIZE},
 };
 
-const MAX_ALLOC: usize = 1 << 24;
+/// Sanity cap on a single allocation. Large enough for exec() to read a
+/// real-world server binary into one contiguous buffer (mysqld is ~62 MiB);
+/// the freelist simply grows by that many contiguous 2 MiB pages from the
+/// PageAllocator, so the only cost of a large cap is that a huge bogus
+/// request can reserve a big block instead of failing early.
+const MAX_ALLOC: usize = 1 << 28;
 const FREE_LIST_END: usize = 0;
 
 #[repr(C)]

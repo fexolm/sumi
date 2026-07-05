@@ -43,6 +43,11 @@ pub struct RunCommand {
     /// `--`: `sumi-vm run KERNEL --run /bin/prog -- --flag value`.
     #[arg(last = true, value_name = "GUEST_ARGS")]
     guest_args: Vec<String>,
+
+    /// Environment variable for the guest program (`KEY=VAL`). May be
+    /// repeated. The guest starts with an empty environment otherwise.
+    #[arg(long = "env", value_name = "KEY=VAL")]
+    guest_env: Vec<String>,
 }
 
 impl RunCommand {
@@ -67,6 +72,7 @@ impl RunCommand {
             share_dir: Some(self.share_dir),
             run_path: self.run_path,
             run_args: self.guest_args,
+            run_env: self.guest_env,
             gdb_port: self.gdb_port,
             hostfwd: self.hostfwd,
         };
