@@ -204,6 +204,22 @@ fn clear_present_hides_mapping() {
 }
 
 #[test]
+fn unmap_after_clear_present_returns_physical_address() {
+    let (_dm, _pa, kalloc) = make_alloc(16);
+    let pt = make_page_table(&kalloc);
+    let pdata = alloc_data_page(&kalloc);
+
+    pt.map_2mb(VADDR_A, pdata).expect("map");
+    pt.clear_present_2mb(VADDR_A).expect("clear_present");
+
+    let returned = pt
+        .unmap_2mb(VADDR_A)
+        .expect("hidden huge page should still unmap");
+    assert_eq!(returned, pdata);
+    kalloc.free(returned);
+}
+
+#[test]
 fn restore_present_reveals_mapping() {
     let (_dm, _pa, kalloc) = make_alloc(16);
     let pt = make_page_table(&kalloc);

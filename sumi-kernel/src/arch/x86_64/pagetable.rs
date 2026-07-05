@@ -376,14 +376,22 @@ impl<'i, DM: DirectMap> RootPageTable<'i, DM> {
     }
 
     /// Unmap the 2 MB page at vaddr. Returns the physical address that was mapped.
-    /// Returns error if not mapped. Issues INVLPG to invalidate the TLB entry.
+    ///
+    /// This also unmaps a hidden huge-page leaf whose PRESENT bit was cleared
+    /// by `clear_present_2mb` for `mprotect(PROT_NONE)`. Such a page is still
+    /// a real mapping and must be reclaimable by `munmap`.
     pub fn unmap_2mb(&self, vaddr: VirtualAddr) -> Result<PhysicalAddr> {
         let entry = self
             .get_pml4()
-            .get_mut_if_present(vaddr, self.kalloc.direct_map())
+            .get_mut_unconditional(vaddr, self.kalloc.direct_map())
             .ok_or(MemoryError::NotMapped {
                 addr: vaddr.as_usize(),
             })?;
+        if !entry.is_huge_page() {
+            return Err(MemoryError::NotMapped {
+                addr: vaddr.as_usize(),
+            });
+        }
         let paddr = entry.addr();
         entry.0 = 0;
         // SAFETY: Invalidating a TLB entry for a just-unmapped address is always safe.

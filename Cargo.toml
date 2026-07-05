@@ -2,7 +2,13 @@
 # Keep default-members minimal so `cargo build` (no flags) only builds the
 # host VM. The bare-metal kernel must be built with an explicit target.
 default-members = ["sumi-vm"]
-members = ["sumi-vm", "sumi-abi", "sumi-kernel", "sumi-integration-tests"]
+members = [
+    "sumi-vm",
+    "sumi-abi",
+    "sumi-kernel",
+    "sumi-integration-tests",
+    "sumi-benchmarks",
+]
 resolver = "3"
 
 [workspace.package]

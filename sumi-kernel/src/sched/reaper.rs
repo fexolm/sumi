@@ -48,12 +48,14 @@ pub fn reap_zombies() {
         let stack_phys = arc.kernel_stack_phys;
         let freeable = arc.kernel_stack_freeable;
         // Drop registry's Arc.
-        let _ = crate::sched::registry::THREAD_REGISTRY.lock().unregister(tid);
+        let _ = crate::sched::registry::THREAD_REGISTRY
+            .lock()
+            .unregister(tid);
         // Drop our Arc (may free the Thread if refcount reaches 0).
         drop(arc);
-        // Free kernel stack page if it was palloc-allocated.
+        // Free heap-allocated kernel stack for user clone children.
         if freeable {
-            let _ = crate::PAGE_ALLOCATOR.free(stack_phys);
+            crate::KERNEL_ALLOCATOR.free(stack_phys);
         }
         // i stays: swap_remove brought the tail here.
     }
@@ -65,8 +67,8 @@ pub fn reap_zombies() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::Ordering;
     use crate::sched::thread::ThreadState;
+    use core::sync::atomic::Ordering;
 
     static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 

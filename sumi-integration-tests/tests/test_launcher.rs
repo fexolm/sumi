@@ -96,3 +96,11 @@ fn tcp_hostfwd_echo() {
 fn tcp_echo_pair() {
     sumi_integration_tests::run_test_smp("rust_std/tcp_echo_pair", 1);
 }
+
+// Fresh Rust std threads under CPU-bound load, with no pool. Runs on 4 vCPUs
+// so stack mmap/munmap and scheduler paths overlap like the matmul
+// thread-per-task benchmark.
+#[test]
+fn thread_burst() {
+    sumi_integration_tests::run_test_smp("rust_std/thread_burst", 4);
+}

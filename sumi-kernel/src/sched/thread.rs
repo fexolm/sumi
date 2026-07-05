@@ -68,14 +68,14 @@ impl Default for FxsaveArea {
 /// go after `fxsave_area` and update the asm correspondingly.
 #[repr(C)]
 pub struct ThreadContext {
-    pub rsp: u64,    // 0x00
-    pub rbp: u64,    // 0x08
-    pub rbx: u64,    // 0x10
-    pub r12: u64,    // 0x18
-    pub r13: u64,    // 0x20
-    pub r14: u64,    // 0x28
-    pub r15: u64,    // 0x30
-    pub rflags: u64, // 0x38
+    pub rsp: u64,                // 0x00
+    pub rbp: u64,                // 0x08
+    pub rbx: u64,                // 0x10
+    pub r12: u64,                // 0x18
+    pub r13: u64,                // 0x20
+    pub r14: u64,                // 0x28
+    pub r15: u64,                // 0x30
+    pub rflags: u64,             // 0x38
     pub fxsave_area: FxsaveArea, // 0x40, 512 bytes, 16-aligned.
 }
 
@@ -149,7 +149,7 @@ pub struct Thread {
     pub kernel_stack_top: VirtualAddr,
     pub kernel_stack_phys: PhysicalAddr,
     pub kernel_stack_size: usize,
-    /// True if kernel_stack_phys was allocated from PAGE_ALLOCATOR and should
+    /// True if kernel_stack_phys was allocated from KERNEL_ALLOCATOR and should
     /// be freed by the reaper when this thread is destroyed.
     pub kernel_stack_freeable: bool,
 

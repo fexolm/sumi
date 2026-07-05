@@ -4,6 +4,7 @@ use crate::{
     layout::{KERNEL_CODE_PHYS, KERNEL_CODE_SIZE, MAX_PHYSICAL_ADDR},
 };
 
+pub const BASE_PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE: usize = 2 << 20;
 pub const HUGE_PAGE_SIZE_1G: usize = 1 << 30;
 

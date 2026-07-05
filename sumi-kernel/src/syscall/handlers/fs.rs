@@ -732,6 +732,15 @@ pub fn sys_readlink(_args: &SyscallArgs) -> SyscallResult {
     EINVAL // No symlinks in our fs
 }
 
+pub fn sys_fchmod(args: &SyscallArgs) -> SyscallResult {
+    let fd = args.arg0 as usize;
+    let table = crate::FD_TABLE.lock();
+    if table.get(fd).is_none() {
+        return EBADF;
+    }
+    0
+}
+
 pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
     let dirfd = args.arg0 as i32;
     let path = match read_user_path(args.arg1) {

@@ -1,5 +1,7 @@
 use sumi_abi::address::VirtualAddr;
-use sumi_abi::arch::layout::{DAX_SLOT_COUNT, DAX_WINDOW_BASE, DAX_WINDOW_SIZE, PAGE_SIZE};
+use sumi_abi::arch::layout::{
+    BASE_PAGE_SIZE, DAX_SLOT_COUNT, DAX_WINDOW_BASE, DAX_WINDOW_SIZE, PAGE_SIZE, USER_MMAP_BASE,
+};
 
 use crate::exec::{align_up_2mb, zero_page};
 use crate::fs::FdKind;
@@ -24,6 +26,11 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     let flags = args.arg3 as i32;
     let fd = args.arg4 as i32;
     let offset = args.arg5 as usize;
+    let mut mmap_guard = if flags & MAP_FIXED == 0 {
+        Some(crate::MEMORY_STATE.lock())
+    } else {
+        None
+    };
 
     if len == 0 {
         return EINVAL;
@@ -64,6 +71,22 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         return map_fixed_anon(addr_hint, len);
     }
 
+    if flags & MAP_FIXED == 0
+        && flags & MAP_ANONYMOUS != 0
+        && crate::USER_MMAP_ALLOCATOR.can_allocate_small(len)
+    {
+        let (vaddr, aligned_len) = match crate::USER_MMAP_ALLOCATOR.alloc(len) {
+            Ok(allocation) => allocation,
+            Err(_) => return ENOMEM,
+        };
+        crate::VMA_TABLE.lock().insert(Vma {
+            start: vaddr,
+            end: VirtualAddr::new(vaddr.as_usize() + aligned_len),
+            backing: MappingBacking::AnonymousSmall,
+        });
+        return vaddr.as_u64() as SyscallResult;
+    }
+
     // For non-file-backed MAP_FIXED (non-anonymous fallthrough), require 2MB alignment.
     if flags & MAP_FIXED != 0 && !(addr_hint as usize).is_multiple_of(PAGE_SIZE) {
         return EINVAL;
@@ -88,14 +111,21 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
     let (vaddr, saved_next) = if flags & MAP_FIXED != 0 {
         (VirtualAddr::new(addr_hint as usize), None)
     } else {
-        let mut mem = crate::MEMORY_STATE.lock();
-        if mem.mmap_next.as_usize() < aligned_len {
-            return ENOMEM;
+        let mmap_high = crate::USER_MMAP_ALLOCATOR
+            .lowest_arena_base()
+            .unwrap_or(USER_MMAP_BASE);
+        let base = match crate::VMA_TABLE.lock().find_free_downward_aligned(
+            mmap_high,
+            aligned_len,
+            PAGE_SIZE,
+        ) {
+            Some(base) => base,
+            None => return ENOMEM,
+        };
+        if let Some(mem) = mmap_guard.as_mut() {
+            mem.mmap_next = base;
         }
-        let old = mem.mmap_next;
-        let base = mem.mmap_next.as_usize() - aligned_len;
-        mem.mmap_next = VirtualAddr::new(base);
-        (VirtualAddr::new(base), Some(old))
+        (base, None)
     };
 
     // If MAP_FIXED, tear down any overlapping VMAs first.
@@ -328,6 +358,13 @@ pub fn sys_mprotect(args: &SyscallArgs) -> SyscallResult {
         return 0;
     }
 
+    // Small anonymous mmap slots are backed by shared 2 MiB arenas. Since we do
+    // not provide sub-2MiB guard-page protection on that fast path, mprotect is
+    // intentionally advisory there.
+    if crate::USER_MMAP_ALLOCATOR.contains(VirtualAddr::new(addr & !(BASE_PAGE_SIZE - 1))) {
+        return 0;
+    }
+
     // Align range to 2MB page boundaries — we manage pages at 2MB granularity.
     let aligned_start = addr & !(PAGE_SIZE - 1);
     let aligned_end = match addr.checked_add(len) {
@@ -364,6 +401,36 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
         Some(e) => e,
         None => return EINVAL,
     };
+    let small_start = addr & !(BASE_PAGE_SIZE - 1);
+    let small_end = match end.checked_add(BASE_PAGE_SIZE - 1) {
+        Some(v) => v & !(BASE_PAGE_SIZE - 1),
+        None => return EINVAL,
+    };
+
+    let small_vma = {
+        let table = crate::VMA_TABLE.lock();
+        table
+            .find(VirtualAddr::new(small_start))
+            .and_then(|vma| match vma.backing {
+                MappingBacking::AnonymousSmall => Some((vma.start, vma.end)),
+                _ => None,
+            })
+    };
+
+    if let Some((vma_start, vma_end)) = small_vma {
+        let removed_vma = if small_start <= vma_start.as_usize() && small_end >= vma_end.as_usize()
+        {
+            crate::VMA_TABLE.lock().remove(vma_start)
+        } else {
+            None
+        };
+        if let Some(vma) = removed_vma {
+            tear_down_vma(vma);
+        }
+        crate::TLB_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
+        return 0;
+    }
+
     let aligned_start = addr & !(PAGE_SIZE - 1);
     let aligned_end = match end.checked_add(PAGE_SIZE - 1) {
         Some(v) => v & !(PAGE_SIZE - 1),
@@ -385,7 +452,8 @@ pub fn sys_munmap(args: &SyscallArgs) -> SyscallResult {
         if req_start.as_usize() <= vma_start.as_usize() && req_end.as_usize() >= vma_end.as_usize()
         {
             // Full VMA unmap — remove and tear down.
-            if let Some(vma) = crate::VMA_TABLE.lock().remove(vma_start) {
+            let removed_vma = crate::VMA_TABLE.lock().remove(vma_start);
+            if let Some(vma) = removed_vma {
                 tear_down_vma(vma);
             }
         } else {
@@ -501,6 +569,12 @@ fn tear_down_vma(vma: Vma) {
     let aligned_end = vma.end.as_usize();
 
     match vma.backing {
+        MappingBacking::AnonymousSmall => {
+            crate::USER_MMAP_ALLOCATOR.free(
+                vma.start,
+                vma.end.as_usize().saturating_sub(vma.start.as_usize()),
+            );
+        }
         MappingBacking::Anonymous | MappingBacking::PrivateFile { .. } => {
             // Unmap and free physical pages.
             let mut vaddr = aligned_start;

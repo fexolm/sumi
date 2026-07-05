@@ -13,12 +13,15 @@ pub mod syscall;
 pub mod time;
 
 use arch::{KernelDirectMap, RootPageTable};
-use memory::alloc::{kmalloc::KernelAllocator, palloc::PageAllocator};
+use memory::alloc::{
+    kmalloc::KernelAllocator, mmap_alloc::UserMmapAllocator, palloc::PageAllocator,
+};
 use sumi_abi::address::VirtualAddr;
 use sumi_abi::arch::layout::{DIRECT_MAP_PML4, USER_MMAP_BASE};
 
 // Global kernel state
 pub static PAGE_ALLOCATOR: PageAllocator = PageAllocator::new();
+pub static USER_MMAP_ALLOCATOR: UserMmapAllocator = UserMmapAllocator::new();
 pub static KERNEL_DIRECT_MAP: KernelDirectMap = KernelDirectMap;
 pub static KERNEL_ALLOCATOR: KernelAllocator<KernelDirectMap> =
     KernelAllocator::new(&KERNEL_DIRECT_MAP, &PAGE_ALLOCATOR);

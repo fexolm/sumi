@@ -7,9 +7,9 @@
 //! trampoline that transitions a freshly-created thread into user mode for the
 //! first time.
 
+use crate::sched::thread::{Thread, Tid};
 use alloc::sync::Arc;
 use sumi_abi::address::{DirectMap, VirtualAddr};
-use crate::sched::thread::{Thread, Tid};
 
 /// Kernel-stack state needed to enter user mode for the first time.
 ///
@@ -53,11 +53,11 @@ pub struct InitialFrame {
     /// arg5 (r9) at the time of the parent's clone/clone3 syscall.
     pub arg5: u64,
     /// Return address for the child (= caller_rip = parent's rcx at syscall).
-    pub user_rip:    u64,
+    pub user_rip: u64,
     /// User RFLAGS to restore in the child (= parent's r11 at syscall).
     pub user_rflags: u64,
     /// Child user-space stack pointer (child_stack arg to clone/clone3).
-    pub user_rsp:    u64,
+    pub user_rsp: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<InitialFrame>() == 72);
@@ -103,17 +103,17 @@ pub fn clone_create_user_thread<DM: DirectMap>(
     use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
 
-    use sumi_abi::arch::layout::PAGE_SIZE;
+    use sumi_abi::arch::layout::KERNEL_STACK_SIZE;
 
-    use crate::sched::thread::{
-        FxsaveArea, RunLink, ThreadContext, ThreadState, WaitLink,
-    };
+    use crate::sched::thread::{FxsaveArea, RunLink, ThreadContext, ThreadState, WaitLink};
 
-    // 1. Allocate a fresh 2 MB page for the kernel stack.
-    let stack_phys = crate::PAGE_ALLOCATOR
-        .alloc(1)
+    // 1. Allocate a fresh compact kernel stack. User stacks are provided by
+    // pthread/mmap; kernel stacks only need enough room for syscall/trap frames
+    // and scheduler handoff state.
+    let stack_phys = crate::KERNEL_ALLOCATOR
+        .calloc(KERNEL_STACK_SIZE)
         .map_err(|_| CloneError::OutOfMemory)?;
-    let stack_top_virt = stack_phys.add(PAGE_SIZE).to_virtual(dm);
+    let stack_top_virt = stack_phys.add(KERNEL_STACK_SIZE).to_virtual(dm);
 
     // 2. Write the initial frame at the top of the kernel stack.
     //
@@ -133,12 +133,12 @@ pub fn clone_create_user_thread<DM: DirectMap>(
     //
     // Note: __switch_to_asm does `push qword ptr [rsi+0x38]; popfq` which
     // temporarily writes at ctx.rsp - 8 = top - 88 before popfq restores rsp.
-    // That address is well inside the 2 MB page.
+    // That address is well inside the allocated kernel stack.
     let top = stack_top_virt.as_usize();
-    debug_assert_eq!(top % PAGE_SIZE, 0, "kernel stack top must be page-aligned");
+    debug_assert_eq!(top % 16, 0, "kernel stack top must be 16-byte aligned");
 
-    // SAFETY: Fresh 2 MB page, exclusively owned by this thread builder.
-    // All slots are 8-aligned and lie within the same page.
+    // SAFETY: Fresh kernel stack allocation, exclusively owned by this thread
+    // builder. All slots are 8-aligned and lie within the stack.
     unsafe {
         let slot0 = (top - 80) as *mut u64; // ctx.rsp: trampoline addr
         let slot1 = (top - 72) as *mut u64; // arg0 (rdi)
@@ -149,7 +149,7 @@ pub fn clone_create_user_thread<DM: DirectMap>(
         let slot6 = (top - 32) as *mut u64; // arg5 (r9)
         let slot7 = (top - 24) as *mut u64; // user_rip
         let slot8 = (top - 16) as *mut u64; // user_rflags
-        let slot9 = (top -  8) as *mut u64; // user_rsp
+        let slot9 = (top - 8) as *mut u64; // user_rsp
 
         core::ptr::write(slot0, thread_entry_trampoline as *const () as u64);
         core::ptr::write(slot1, frame.arg0);
@@ -168,36 +168,36 @@ pub fn clone_create_user_thread<DM: DirectMap>(
     let t = Arc::new(Thread {
         tid,
         tgid,
-        state:     AtomicU32::new(ThreadState::New as u32),
+        state: AtomicU32::new(ThreadState::New as u32),
         exit_code: AtomicI32::new(0),
         ctx: UnsafeCell::new(ThreadContext {
             rsp,
-            rbp:        0,
-            rbx:        0,
-            r12:        0,
-            r13:        0,
-            r14:        0,
-            r15:        0,
-            rflags:     0x202, // reserved bit 1 + IF
+            rbp: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rflags: 0x202, // reserved bit 1 + IF
             fxsave_area: FxsaveArea::new(),
         }),
-        kernel_stack_top:  stack_top_virt,
+        kernel_stack_top: stack_top_virt,
         kernel_stack_phys: stack_phys,
-        kernel_stack_size: PAGE_SIZE,
+        kernel_stack_size: KERNEL_STACK_SIZE,
         kernel_stack_freeable: true,
         user_stack_base,
         user_stack_size,
-        fs_base:          AtomicU64::new(fs_base),
-        clear_child_tid:  AtomicU64::new(clear_child_tid),
+        fs_base: AtomicU64::new(fs_base),
+        clear_child_tid: AtomicU64::new(clear_child_tid),
         robust_list_head: AtomicU64::new(0),
-        cpu:              AtomicU32::new(u32::MAX),
-        on_cpu:           AtomicBool::new(false),
-        run_link:         RunLink::new(),
-        wait_link:        WaitLink::new(),
+        cpu: AtomicU32::new(u32::MAX),
+        on_cpu: AtomicBool::new(false),
+        run_link: RunLink::new(),
+        wait_link: WaitLink::new(),
         // entry_fn / entry_arg are kthread-only; user threads enter via
         // the trampoline and never read these fields.
-        entry_fn:         AtomicU64::new(0),
-        entry_arg:        AtomicU64::new(0),
+        entry_fn: AtomicU64::new(0),
+        entry_arg: AtomicU64::new(0),
     });
     Ok(t)
 }
@@ -230,17 +230,17 @@ unsafe extern "C" fn thread_entry_trampoline() -> ! {
         // Restore the parent's caller-saved argument registers. This is
         // required for glibc's clone3 child stub which reads rdx (thread fn)
         // and r8 (thread arg) without re-loading them from the child stack.
-        "pop rdi",               // slot1: arg0
-        "pop rsi",               // slot2: arg1
-        "pop rdx",               // slot3: arg2 — clone3 thread fn
-        "pop r10",               // slot4: arg3
-        "pop r8",                // slot5: arg4 — clone3 thread arg
-        "pop r9",                // slot6: arg5
+        "pop rdi", // slot1: arg0
+        "pop rsi", // slot2: arg1
+        "pop rdx", // slot3: arg2 — clone3 thread fn
+        "pop r10", // slot4: arg3
+        "pop r8",  // slot5: arg4 — clone3 thread arg
+        "pop r9",  // slot6: arg5
         // rsp → slot7 (user_rip).
         //
         // Use r11 as scratch for user_rip. r11 was clobbered by the syscall
         // instruction in the parent and holds no meaningful value in the child.
-        "mov r11, [rsp]",            // r11 = user_rip
+        "mov r11, [rsp]", // r11 = user_rip
         // Zero rax BEFORE popfq. xor modifies ZF/SF/PF/CF/OF, which would
         // override the user_rflags value we are about to restore via popfq.
         "xor eax, eax",
@@ -257,15 +257,15 @@ unsafe extern "C" fn thread_entry_trampoline() -> ! {
         // syscall_entry tail). Clear IF in the pushed copy before `popfq`,
         // complete the RSP switch, then `sti` — its shadow is real and
         // covers exactly the `jmp` that follows.
-        "push qword ptr [rsp + 8]",  // push user_rflags (slot8 = [rsp+8] before push)
+        "push qword ptr [rsp + 8]", // push user_rflags (slot8 = [rsp+8] before push)
         "and dword ptr [rsp], 0xFFFFFDFF", // clear IF (bit 9) in the pushed copy
-        "popfq",                     // restore user RFLAGS; IF stays 0
+        "popfq",                    // restore user RFLAGS; IF stays 0
         // Switch to user stack. user_rsp is at [rsp + 16]:
         //   rsp+0  = slot7 (user_rip)   — rsp is back here after push+popfq balanced
         //   rsp+8  = slot8 (user_rflags, already consumed)
         //   rsp+16 = slot9 (user_rsp)
-        "mov rsp, [rsp + 16]",       // rsp = user_rsp — safe, IF is still 0
-        "sti",                        // shadow covers the next instruction (`jmp r11`)
+        "mov rsp, [rsp + 16]", // rsp = user_rsp — safe, IF is still 0
+        "sti",                 // shadow covers the next instruction (`jmp r11`)
         // Jump to user code at the instruction after the parent's syscall.
         "jmp r11",
     )

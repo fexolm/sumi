@@ -1,0 +1,15 @@
+[package]
+name = "sumi-benchmarks"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bench]]
+name = "vm_compare"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[lints]
+workspace = true

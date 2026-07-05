@@ -71,6 +71,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         87 => handlers::fs::sys_unlink(args),
         88 => handlers::fs::sys_symlink(args),
         89 => handlers::fs::sys_readlink(args),
+        91 => handlers::fs::sys_fchmod(args),
         76 => handlers::fs::sys_truncate(args),
         77 => handlers::io::sys_ftruncate(args),
         217 => handlers::fs::sys_getdents64(args),
@@ -87,6 +88,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         27 => handlers::memory::sys_mincore(args),
         28 => handlers::memory::sys_madvise(args),
         39 => handlers::process::sys_getpid(args),
+        40 => errno::ENOSYS, // sendfile: std::fs::copy falls back to read/write
         60 => handlers::process::sys_exit(args),
         74 => handlers::io::sys_fsync(args),
         75 => handlers::io::sys_fdatasync(args),
@@ -160,6 +162,7 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         285 => handlers::io::sys_fallocate(args),
         288 => handlers::net::sys_accept4(args),
         291 => handlers::epoll::sys_epoll_create1(args),
+        326 => errno::ENOSYS, // copy_file_range: std::fs::copy falls back to read/write
         435 => handlers::clone::sys_clone3(args),
         nr => {
             crate::kprintln!("[syscall] unhandled nr={}", nr);
@@ -179,6 +182,13 @@ pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> SyscallResult {
         // handler performs the same check for the preemption return path.
         // No-op under test (see `PerCpu::reload_tlb_if_stale`'s host stand-in).
         cpu.reload_tlb_if_stale();
+
+        // A pthread_join fast path can observe that the child already exited
+        // and return without blocking, so no context switch happens on the
+        // joining thread. Reap here as well as after schedule() so clone/exit
+        // churn cannot accumulate unreclaimed kernel stacks until a later
+        // timer preemption happens to run.
+        crate::sched::reaper::reap_zombies();
 
         if cpu.need_resched.swap(false, Ordering::AcqRel) {
             let current = crate::sched::current_thread();

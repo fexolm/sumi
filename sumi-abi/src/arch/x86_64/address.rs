@@ -28,6 +28,7 @@ pub trait X64Vaddr {
     fn pml4_index(self) -> usize;
     fn pdpt_index(self) -> usize;
     fn pd_index(self) -> usize;
+    fn pt_index(self) -> usize;
 }
 
 pub const fn get_pml4_index(addr: VirtualAddr) -> usize {
@@ -42,6 +43,10 @@ pub const fn get_pd_index(addr: VirtualAddr) -> usize {
     (addr.as_usize() >> 21) & 0x1FF
 }
 
+pub const fn get_pt_index(addr: VirtualAddr) -> usize {
+    (addr.as_usize() >> 12) & 0x1FF
+}
+
 impl X64Vaddr for VirtualAddr {
     fn pml4_index(self) -> usize {
         get_pml4_index(self)
@@ -53,5 +58,9 @@ impl X64Vaddr for VirtualAddr {
 
     fn pd_index(self) -> usize {
         get_pd_index(self)
+    }
+
+    fn pt_index(self) -> usize {
+        get_pt_index(self)
     }
 }

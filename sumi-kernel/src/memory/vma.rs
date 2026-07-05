@@ -4,6 +4,7 @@ use sumi_abi::address::VirtualAddr;
 #[derive(Debug)]
 pub enum MappingBacking {
     Anonymous,
+    AnonymousSmall,
     Dax {
         dax_offset: usize,
         fuse_fh: u64,
@@ -55,6 +56,48 @@ impl VmaTable {
         self.vmas.iter().find(|vma| {
             vma.start.as_usize() <= addr.as_usize() && addr.as_usize() < vma.end.as_usize()
         })
+    }
+
+    /// Find the highest free range of `len` bytes below `high`.
+    ///
+    /// `mmap` grows downward, but Linux can reuse holes after `munmap`.
+    /// Scanning VMAs on each allocation is simple and good enough for sumi's
+    /// current single-process address space.
+    pub fn find_free_downward(&self, high: VirtualAddr, len: usize) -> Option<VirtualAddr> {
+        self.find_free_downward_aligned(high, len, len.next_power_of_two())
+    }
+
+    /// Find the highest free range of `len` bytes below `high`, with `start`
+    /// aligned down to `align`.
+    pub fn find_free_downward_aligned(
+        &self,
+        high: VirtualAddr,
+        len: usize,
+        align: usize,
+    ) -> Option<VirtualAddr> {
+        if len == 0 {
+            return None;
+        }
+        debug_assert!(align.is_power_of_two());
+
+        let mut candidate_end = high.as_usize() & !(align - 1);
+        loop {
+            let candidate_start = candidate_end.checked_sub(len)? & !(align - 1);
+            candidate_end = candidate_start.checked_add(len)?;
+            let mut overlapped = false;
+
+            for vma in &self.vmas {
+                if candidate_start < vma.end.as_usize() && candidate_end > vma.start.as_usize() {
+                    candidate_end = vma.start.as_usize() & !(align - 1);
+                    overlapped = true;
+                    break;
+                }
+            }
+
+            if !overlapped {
+                return Some(VirtualAddr::new(candidate_start));
+            }
+        }
     }
 
     /// Remove all VMAs that overlap with [start, end).

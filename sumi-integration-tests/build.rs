@@ -52,7 +52,7 @@ const MANUAL_GLIBC_TESTS: &[&str] = &["preempt_timer"];
 
 /// Source files in `data/rust_std/` whose `#[test]` is written manually in
 /// `tests/test_launcher.rs` (e.g. net tests pinned to a single vCPU).
-const MANUAL_RUST_STD_TESTS: &[&str] = &["tcp_echo_pair"];
+const MANUAL_RUST_STD_TESTS: &[&str] = &["tcp_echo_pair", "thread_burst"];
 
 const RUST_NO_STD_TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUST_STD_TARGET: &str = "x86_64-unknown-linux-musl";

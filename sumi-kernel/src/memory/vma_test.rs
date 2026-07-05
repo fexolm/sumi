@@ -163,3 +163,49 @@ fn vma_remove_overlapping_partial_overlap() {
         "removed VMA must not be findable"
     );
 }
+
+#[test]
+fn vma_find_free_downward_reuses_highest_hole() {
+    let mut table = VmaTable::new();
+    let high = 0x9000_0000;
+    let len = PAGE_SIZE;
+
+    table.insert(make_vma(high - len, high));
+    table.insert(make_vma(high - 3 * len, high - 2 * len));
+
+    let found = table
+        .find_free_downward(VirtualAddr::new(high), len)
+        .expect("free hole should exist");
+    assert_eq!(
+        found.as_usize(),
+        high - 2 * len,
+        "allocator should reuse the highest hole below high"
+    );
+}
+
+#[test]
+fn vma_find_free_downward_returns_top_when_empty() {
+    let table = VmaTable::new();
+    let high = 0xA000_0000;
+    let len = 2 * PAGE_SIZE;
+
+    let found = table
+        .find_free_downward(VirtualAddr::new(high), len)
+        .expect("empty table should have free space");
+    assert_eq!(found.as_usize(), high - len);
+}
+
+#[test]
+fn vma_find_free_downward_aligned_keeps_requested_alignment() {
+    let mut table = VmaTable::new();
+    let high = 0x8000_0000usize;
+    let len = PAGE_SIZE;
+    table.insert(make_vma(high - 0x10000, high));
+
+    let found = table
+        .find_free_downward_aligned(VirtualAddr::new(high), len, PAGE_SIZE)
+        .expect("aligned hole below unaligned VMA start");
+
+    assert_eq!(found.as_usize() % PAGE_SIZE, 0);
+    assert!(found.as_usize() + len <= high - 0x10000);
+}
