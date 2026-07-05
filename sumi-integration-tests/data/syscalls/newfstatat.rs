@@ -9,6 +9,15 @@ pub extern "C" fn sumi_main() -> i32 {
     let fd = sys_open(path, O_RDWR | O_CREAT | O_TRUNC, 0o644);
     check!(fd >= 0);
     check_eq!(sys_write(fd, b"newfstatat-payload"), 18);
+    let mut st_by_fd: Stat = unsafe { core::mem::zeroed() };
+    let r = sys_newfstatat(
+        fd,
+        b"\0",
+        &mut st_by_fd as *mut _ as *mut u8,
+        AT_EMPTY_PATH,
+    );
+    check_eq!(r, 0);
+    check_eq!(st_by_fd.st_size, 18);
     check_eq!(sys_close(fd), 0);
 
     // Stat-by-path with AT_FDCWD.

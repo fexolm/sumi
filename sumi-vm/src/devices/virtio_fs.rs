@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -147,6 +147,7 @@ impl VirtioFs {
             FUSE_LOOKUP => self.handle_lookup(header, req_data, writable_bufs, mem),
             FUSE_GETATTR => self.handle_getattr(header, writable_bufs, mem),
             FUSE_CREATE => self.handle_create(header, req_data, writable_bufs, mem),
+            FUSE_FSYNC => self.handle_fsync(header, req_data, writable_bufs, mem),
             FUSE_OPEN | FUSE_OPENDIR => self.handle_open(header, req_data, writable_bufs, mem),
             FUSE_READ => self.handle_read(header, req_data, writable_bufs, mem),
             FUSE_READDIR => self.handle_readdir(header, req_data, writable_bufs, mem),
@@ -404,7 +405,7 @@ impl VirtioFs {
 
         let child_path = parent_path.join(name);
 
-        let file = match open_file(&child_path, create_in.flags | 0o100) {
+        let file = match open_file(&child_path, create_in.flags | 0o100, create_in.mode) {
             // ensure O_CREAT
             Ok(f) => f,
             Err(e) => {
@@ -474,7 +475,7 @@ impl VirtioFs {
         let hdr_size = core::mem::size_of::<FuseInHeader>();
         let open_in = unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseOpenIn) };
 
-        let file = match open_file(&path, open_in.flags) {
+        let file = match open_file(&path, open_in.flags, 0) {
             Ok(f) => f,
             Err(e) => {
                 let errno = e.raw_os_error().unwrap_or(5);
@@ -741,6 +742,36 @@ impl VirtioFs {
         self.write_response(header.unique, &[], writable_bufs, mem)
     }
 
+    fn handle_fsync(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        if req_data.len() < hdr_size + core::mem::size_of::<FuseFsyncIn>() {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+        // SAFETY: bounds checked above; FuseFsyncIn is repr(C) plain data.
+        let fsync_in = unsafe { &*(req_data[hdr_size..].as_ptr() as *const FuseFsyncIn) };
+        let Some(Some(file)) = self.file_handles.get(fsync_in.fh as usize) else {
+            return self.write_error(header.unique, -9, writable_bufs, mem); // EBADF
+        };
+        let res = if fsync_in.fsync_flags & 1 != 0 {
+            file.sync_data()
+        } else {
+            file.sync_all()
+        };
+        match res {
+            Ok(()) => self.write_response(header.unique, &[], writable_bufs, mem),
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(5);
+                self.write_error(header.unique, -errno, writable_bufs, mem)
+            }
+        }
+    }
+
     fn handle_forget(&mut self, header: &FuseInHeader, _req_data: &[u8]) {
         let nodeid = header.nodeid as usize;
         if nodeid < self.nodes.len() && nodeid > 1 {
@@ -899,36 +930,38 @@ impl VirtioBackend for VirtioFs {
     }
 }
 
-fn open_file(path: &std::path::Path, flags: u32) -> std::io::Result<File> {
-    let access = flags & 3; // O_ACCMODE
-    let mut opts = OpenOptions::new();
+/// Open `path` with the guest's Linux open(2) flags passed through to the
+/// host kernel (both sides are Linux x86_64). A raw `libc::open` instead of
+/// `OpenOptions` because the latter cannot express every valid flag
+/// combination — most notably `O_RDONLY|O_CREAT` (create, then open
+/// read-only), which mysqld's datadir writability probe uses and
+/// `OpenOptions` rejects as `InvalidInput` with no OS errno (previously
+/// surfacing as a bogus EIO in the guest).
+fn open_file(path: &std::path::Path, flags: u32, mode: u32) -> std::io::Result<File> {
+    use std::os::fd::FromRawFd;
 
-    match access {
-        0 => {
-            opts.read(true);
-        }
-        1 => {
-            opts.write(true);
-        }
-        2 => {
-            opts.read(true).write(true);
-        }
-        _ => {
-            opts.read(true);
-        }
-    }
+    // Only forward flag bits that make sense for a host-side file open;
+    // everything else (O_NOCTTY, mysql's legacy junk bits, O_DIRECT, ...)
+    // is dropped. O_CLOEXEC is forced so guest files never leak into
+    // host child processes.
+    const ALLOWED: u32 = 0o3          // O_ACCMODE
+        | 0o100                        // O_CREAT
+        | 0o200                        // O_EXCL
+        | 0o1000                       // O_TRUNC
+        | 0o2000                       // O_APPEND
+        | 0o400000; // O_NOFOLLOW
+    let host_flags = (flags & ALLOWED) as i32 | libc::O_CLOEXEC;
 
-    if flags & 0o100 != 0 {
-        opts.create(true);
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `cpath` is a valid NUL-terminated path and `host_flags`/`mode`
+    // are plain integers; open(2) has no other preconditions.
+    let fd = unsafe { libc::open(cpath.as_ptr(), host_flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    if flags & 0o1000 != 0 {
-        opts.truncate(true);
-    }
-    if flags & 0o2000 != 0 {
-        opts.append(true);
-    }
-
-    opts.open(path)
+    // SAFETY: `fd` is a freshly opened descriptor exclusively owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn metadata_to_fuse_attr(meta: &std::fs::Metadata, ino: u64) -> FuseAttr {

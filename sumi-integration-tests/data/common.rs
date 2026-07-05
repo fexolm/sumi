@@ -91,6 +91,7 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
 const SYS_FSTAT: u64 = 5;
+const SYS_POLL: u64 = 7;
 const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
@@ -102,6 +103,7 @@ const SYS_PWRITE64: u64 = 18;
 const SYS_READV: u64 = 19;
 const SYS_WRITEV: u64 = 20;
 const SYS_ACCESS: u64 = 21;
+const SYS_PIPE: u64 = 22;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_NANOSLEEP: u64 = 35;
@@ -127,6 +129,7 @@ const SYS_CLOCK_GETRES: u64 = 229;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_PIPE2: u64 = 293;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_CLONE: u64 = 56;
@@ -150,6 +153,7 @@ const SEEK_CUR: u64 = 1;
 const SEEK_END: u64 = 2;
 
 const AT_FDCWD: i64 = -100;
+const AT_EMPTY_PATH: u64 = 0x1000;
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
@@ -189,6 +193,21 @@ fn sys_read(fd: i64, buf: &mut [u8]) -> i64 {
 #[inline]
 fn sys_close(fd: i64) -> i64 {
     unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+#[inline]
+fn sys_poll(fds: *mut PollFd, nfds: usize, timeout_ms: i64) -> i64 {
+    unsafe { syscall3(SYS_POLL, fds as u64, nfds as u64, timeout_ms as u64) }
+}
+
+#[inline]
+fn sys_pipe(fds: &mut [i32; 2]) -> i64 {
+    unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) }
+}
+
+#[inline]
+fn sys_pipe2(fds: &mut [i32; 2], flags: u64) -> i64 {
+    unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, flags) }
 }
 
 #[inline]
@@ -467,6 +486,13 @@ struct Timespec {
 struct Iovec {
     iov_base: *mut u8,
     iov_len: usize,
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 // Linux x86_64 stat layout (matches sumi-abi::stat::Stat).

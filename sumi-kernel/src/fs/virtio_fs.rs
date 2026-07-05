@@ -590,6 +590,26 @@ impl VirtioFsClient {
         let _ = self.submit_request_response(&req, req.len() as u32, &resp);
     }
 
+    /// FUSE_FSYNC: flush a file's dirty data (and metadata unless
+    /// `datasync`) to stable storage on the host.
+    pub fn fsync(&self, fh: u64, datasync: bool) -> Result<(), i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseFsyncIn>()];
+        self.write_fuse_header(&mut req, FUSE_FSYNC, 0);
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseFsyncIn,
+                FuseFsyncIn {
+                    fh,
+                    fsync_flags: datasync as u32,
+                    padding: 0,
+                },
+            );
+        }
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+        // submit_request_response surfaces a nonzero FUSE error as Err.
+        self.submit_request_response(&req, req.len() as u32, &resp)
+    }
+
     /// FUSE_READDIR: read directory entries into buf_phys. Returns bytes read.
     pub fn readdir(
         &self,

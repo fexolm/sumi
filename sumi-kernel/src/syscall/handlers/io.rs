@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::arch::KernelDirectMap;
 use crate::fs::{FdKind, FileDescriptor};
 use crate::syscall::errno::*;
@@ -7,6 +9,7 @@ use sumi_abi::address::VirtualAddr;
 /// O_NONBLOCK, shared by `sys_fcntl`'s F_SETFL handling and every read/write
 /// path (sockets and pipes) that needs to know a fd's nonblocking flag.
 const O_NONBLOCK: u32 = crate::net::socket::SOCK_NONBLOCK;
+const O_CLOEXEC: u32 = crate::net::socket::SOCK_CLOEXEC;
 
 fn console_write(data: &[u8]) -> usize {
     crate::console().write(data)
@@ -122,7 +125,7 @@ pub(crate) fn fs_transfer_chunked(
                 file_offset += n as u64;
                 remaining -= n;
             }
-            Err(e) if total > 0 => return Ok(total),
+            Err(_) if total > 0 => return Ok(total),
             Err(e) => return Err(e),
         }
     }
@@ -302,42 +305,48 @@ pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
 pub fn sys_poll(args: &SyscallArgs) -> SyscallResult {
     let fds_ptr = args.arg0 as *mut PollFd;
     let nfds = args.arg1 as usize;
-    let _timeout = args.arg2 as i32;
+    let timeout_ms = args.arg2 as i32;
 
     // Limit nfds to prevent excessive iteration
     if nfds > 256 {
         return EINVAL;
     }
+    if nfds > 0 && fds_ptr.is_null() {
+        return EFAULT;
+    }
 
-    let table = crate::FD_TABLE.lock();
-    let mut ready = 0i64;
+    let snapshot = poll_snapshot(fds_ptr, nfds);
+    let mut ready = poll_compute_ready(&snapshot, true);
 
-    for i in 0..nfds {
-        // SAFETY: User passed a valid pollfd array.
-        let pfd = unsafe { &mut *fds_ptr.add(i) };
-        pfd.revents = 0;
-
-        if pfd.fd < 0 {
-            continue;
-        }
-
-        match table.get(pfd.fd as usize) {
-            None => {
-                pfd.revents = POLLNVAL;
-                ready += 1;
+    if ready.is_empty() && timeout_ms != 0 && snapshot.iter().any(|e| e.target.needs_net()) {
+        let deadline = if timeout_ms < 0 {
+            None
+        } else {
+            Some(crate::time::monotonic_ns() + timeout_ms as u64 * 1_000_000)
+        };
+        let mut out = Vec::new();
+        crate::net::net_wait(deadline, 0, |g| {
+            let ev = poll_compute_net_ready(g, &snapshot);
+            if ev.is_empty() {
+                crate::net::Wait::Block
+            } else {
+                let n = ev.len() as i64;
+                out = ev;
+                crate::net::Wait::Ready(n)
             }
-            Some(_desc) => {
-                // All fd types are always ready in our synchronous model
-                let revents = pfd.events & (POLLIN | POLLOUT);
-                pfd.revents = revents;
-                if revents != 0 {
-                    ready += 1;
-                }
-            }
+        });
+        ready = out;
+    }
+
+    for &(idx, revents) in &ready {
+        // SAFETY: fds_ptr points to an nfds-element pollfd array, checked by
+        // the caller ABI; idx came from 0..nfds while building the snapshot.
+        unsafe {
+            (*fds_ptr.add(idx)).revents = revents;
         }
     }
 
-    ready
+    ready.len() as SyscallResult
 }
 
 #[repr(C)]
@@ -349,7 +358,120 @@ struct PollFd {
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+
+#[derive(Clone, Copy)]
+enum PollTarget {
+    Skip,
+    Invalid,
+    Always,
+    Socket(usize),
+    Pipe { id: usize, write_end: bool },
+}
+
+impl PollTarget {
+    fn needs_net(self) -> bool {
+        matches!(self, PollTarget::Socket(_) | PollTarget::Pipe { .. })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PollEntry {
+    idx: usize,
+    events: i16,
+    target: PollTarget,
+}
+
+fn poll_snapshot(fds_ptr: *mut PollFd, nfds: usize) -> Vec<PollEntry> {
+    let table = crate::FD_TABLE.lock();
+    let mut out = Vec::new();
+
+    for idx in 0..nfds {
+        // SAFETY: sys_poll checked the null/nfds case; the syscall ABI
+        // provides an nfds-element pollfd array.
+        let pfd = unsafe { &mut *fds_ptr.add(idx) };
+        pfd.revents = 0;
+
+        let target = if pfd.fd < 0 {
+            PollTarget::Skip
+        } else {
+            match table.get(pfd.fd as usize) {
+                None => PollTarget::Invalid,
+                Some(desc) => match desc.kind {
+                    FdKind::Socket { id } => PollTarget::Socket(id),
+                    FdKind::Pipe { id, write_end } => PollTarget::Pipe { id, write_end },
+                    FdKind::File { .. }
+                    | FdKind::Directory { .. }
+                    | FdKind::Console
+                    | FdKind::Epoll { .. } => PollTarget::Always,
+                },
+            }
+        };
+
+        out.push(PollEntry {
+            idx,
+            events: pfd.events,
+            target,
+        });
+    }
+
+    out
+}
+
+fn poll_mask(events: i16, readiness: u32) -> i16 {
+    let requested = events as u32;
+    let normal = readiness & requested & ((POLLIN | POLLOUT) as u32);
+    let exceptional = readiness & ((POLLERR | POLLHUP) as u32);
+    (normal | exceptional) as i16
+}
+
+fn poll_compute_ready(snapshot: &[PollEntry], poll_net: bool) -> Vec<(usize, i16)> {
+    if poll_net && snapshot.iter().any(|e| e.target.needs_net()) {
+        let mut g = crate::net::lock();
+        g.poll_and_wake();
+        poll_compute_net_ready(&g, snapshot)
+    } else {
+        poll_compute_static_ready(snapshot)
+    }
+}
+
+fn poll_compute_static_ready(snapshot: &[PollEntry]) -> Vec<(usize, i16)> {
+    snapshot
+        .iter()
+        .filter_map(|entry| match entry.target {
+            PollTarget::Skip | PollTarget::Socket(_) | PollTarget::Pipe { .. } => None,
+            PollTarget::Invalid => Some((entry.idx, POLLNVAL)),
+            PollTarget::Always => {
+                let revents = entry.events & (POLLIN | POLLOUT);
+                (revents != 0).then_some((entry.idx, revents))
+            }
+        })
+        .collect()
+}
+
+fn poll_compute_net_ready(g: &crate::net::NetState, snapshot: &[PollEntry]) -> Vec<(usize, i16)> {
+    let mut out = poll_compute_static_ready(snapshot);
+    for entry in snapshot {
+        let readiness = match entry.target {
+            PollTarget::Socket(id) => g
+                .socket_get(id)
+                .map(|obj| crate::net::socket::readiness(obj, &g.sockets)),
+            PollTarget::Pipe { id, write_end } => g
+                .pipe_get(id)
+                .map(|p| crate::net::pipe_readiness(p, write_end)),
+            PollTarget::Skip | PollTarget::Invalid | PollTarget::Always => None,
+        };
+        if let Some(mask) = readiness {
+            let revents = poll_mask(entry.events, mask);
+            if revents != 0 {
+                out.push((entry.idx, revents));
+            }
+        }
+    }
+    out
+}
 
 pub fn sys_lseek(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
@@ -584,7 +706,7 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
                         total += n as i64;
                         cur_offset += n as u64;
                     }
-                    Err(e) if total > 0 => break,
+                    Err(_) if total > 0 => break,
                     Err(e) => return e as SyscallResult,
                 }
             }
@@ -659,8 +781,7 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
                 }
                 // SAFETY: single-address-space model; iovec entries are
                 // valid per the syscall ABI.
-                let data =
-                    unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+                let data = unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
                 // Only the first chunk may legitimately block; once
                 // something has been written, treat further backpressure as
                 // the end of this gather (same rule sys_sendmsg applies).
@@ -720,7 +841,7 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
                         total += n as i64;
                         cur_offset += n as u64;
                     }
-                    Err(e) if total > 0 => break,
+                    Err(_) if total > 0 => break,
                     Err(e) => return e as SyscallResult,
                 }
             }
@@ -810,6 +931,9 @@ pub fn sys_pipe2(args: &SyscallArgs) -> SyscallResult {
 
     if fds_ptr == 0 {
         return EFAULT;
+    }
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return EINVAL;
     }
     // O_CLOEXEC is accepted and ignored — sumi has no exec() that would
     // observe close-on-exec, matching F_SETFD's existing no-op behavior.
@@ -925,4 +1049,35 @@ pub fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
     }
 
     new_fd as SyscallResult
+}
+
+/// `fsync(fd)` / `fdatasync(fd)`: flush a file's dirty state through
+/// virtio-fs to the host. Non-file kinds match Linux: EINVAL for fds that
+/// cannot be synced (sockets, pipes); Console is accepted as a no-op
+/// (matching a tty, where fsync succeeds).
+fn fsync_common(args: &SyscallArgs, datasync: bool) -> SyscallResult {
+    let fd_num = args.arg0 as usize;
+    let kind = {
+        let table = crate::FD_TABLE.lock();
+        match table.get(fd_num) {
+            Some(d) => d.kind,
+            None => return EBADF,
+        }
+    };
+    match kind {
+        FdKind::File { fuse_fh, .. } => match crate::fs().fsync(fuse_fh, datasync) {
+            Ok(()) => 0,
+            Err(e) => e as SyscallResult,
+        },
+        FdKind::Directory { .. } | FdKind::Console => 0,
+        FdKind::Socket { .. } | FdKind::Epoll { .. } | FdKind::Pipe { .. } => EINVAL,
+    }
+}
+
+pub fn sys_fsync(args: &SyscallArgs) -> SyscallResult {
+    fsync_common(args, false)
+}
+
+pub fn sys_fdatasync(args: &SyscallArgs) -> SyscallResult {
+    fsync_common(args, true)
 }

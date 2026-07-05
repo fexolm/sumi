@@ -45,13 +45,14 @@ const SIG_SETMASK: u64 = 2;
 /// mask.
 pub fn sys_rt_sigprocmask(args: &SyscallArgs) -> SyscallResult {
     let how = args.arg0;
+    let new_set = args.arg1 as *const u64;
     let old_set = args.arg2 as *mut u64;
     let sigsetsize = args.arg3;
 
-    if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK {
+    if sigsetsize != 8 {
         return EINVAL;
     }
-    if sigsetsize != 8 {
+    if !new_set.is_null() && how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK {
         return EINVAL;
     }
 
@@ -117,3 +118,43 @@ struct StackT {
 }
 
 const SS_DISABLE: i32 = 2;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sigprocmask_args(how: u64, new_set: u64, old_set: u64, sigsetsize: u64) -> SyscallArgs {
+        SyscallArgs {
+            nr: 14,
+            arg0: how,
+            arg1: new_set,
+            arg2: old_set,
+            arg3: sigsetsize,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
+        }
+    }
+
+    #[test]
+    fn sigprocmask_invalid_how_with_new_set_returns_einval() {
+        let set = 0u64;
+        let args = make_sigprocmask_args(!0, &set as *const u64 as u64, 0, 8);
+        assert_eq!(sys_rt_sigprocmask(&args), EINVAL);
+    }
+
+    #[test]
+    fn sigprocmask_null_new_set_ignores_how_but_writes_old_set() {
+        let mut old = 0xDEAD_BEEFu64;
+        let args = make_sigprocmask_args(!0, 0, &mut old as *mut u64 as u64, 8);
+        assert_eq!(sys_rt_sigprocmask(&args), 0);
+        assert_eq!(old, 0);
+    }
+
+    #[test]
+    fn sigprocmask_rejects_wrong_sigsetsize() {
+        let args = make_sigprocmask_args(SIG_BLOCK, 0, 0, 16);
+        assert_eq!(sys_rt_sigprocmask(&args), EINVAL);
+    }
+}

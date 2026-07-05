@@ -10,12 +10,24 @@ use sumi_abi::stat::{
 const O_CREAT: u32 = 0o100;
 
 /// Read a null-terminated path from user memory. Returns slice excluding the null.
-fn read_user_path(ptr: u64) -> Result<&'static [u8], SyscallResult> {
+/// Current working directory, absolute, no trailing slash (root = "/").
+/// A single global — sumi is a single-process kernel, so every thread
+/// shares one cwd, exactly like threads of one Linux process.
+static CWD: spin::Mutex<Option<alloc::string::String>> = spin::Mutex::new(None);
+
+fn cwd_bytes() -> alloc::vec::Vec<u8> {
+    match &*CWD.lock() {
+        Some(s) => s.as_bytes().to_vec(),
+        None => alloc::vec![b'/'],
+    }
+}
+
+fn read_user_path_inner(ptr: u64, allow_empty: bool) -> Result<alloc::vec::Vec<u8>, SyscallResult> {
     let path_ptr = ptr as *const u8;
     // SAFETY: Unikernel — single address space, user and kernel share memory.
     // The pointer comes from the syscall caller and the memory will not be
-    // unmapped or reclaimed during this call ('static is valid for the process lifetime).
-    unsafe {
+    // unmapped or reclaimed during this call.
+    let raw = unsafe {
         let mut len = 0;
         while core::ptr::read_volatile(path_ptr.add(len)) != 0 {
             len += 1;
@@ -23,8 +35,31 @@ fn read_user_path(ptr: u64) -> Result<&'static [u8], SyscallResult> {
                 return Err(-36); // ENAMETOOLONG
             }
         }
-        Ok(core::slice::from_raw_parts(path_ptr, len))
+        core::slice::from_raw_parts(path_ptr, len)
+    };
+    if raw.is_empty() {
+        return if allow_empty {
+            Ok(alloc::vec::Vec::new())
+        } else {
+            Err(-2) // ENOENT — Linux rejects the empty path
+        };
     }
+    if raw[0] == b'/' {
+        return Ok(raw.to_vec());
+    }
+    let mut abs = cwd_bytes();
+    if abs.last() != Some(&b'/') {
+        abs.push(b'/');
+    }
+    abs.extend_from_slice(raw);
+    Ok(abs)
+}
+
+/// Read a user path and make it absolute against the current working
+/// directory. `.`/`..` components are left intact — path resolution joins
+/// them on the host, where they behave normally.
+fn read_user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, SyscallResult> {
+    read_user_path_inner(ptr, false)
 }
 
 /// Convert a FUSE attr to Linux stat struct and write it to user memory.
@@ -97,7 +132,7 @@ pub fn sys_stat(args: &SyscallArgs) -> SyscallResult {
         Ok(p) => p,
         Err(e) => return e,
     };
-    do_stat_path(path, args.arg1)
+    do_stat_path(&path, args.arg1)
 }
 
 pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
@@ -236,7 +271,7 @@ pub fn sys_access(args: &SyscallArgs) -> SyscallResult {
         Ok(p) => p,
         Err(e) => return e,
     };
-    do_faccessat(AT_FDCWD, path)
+    do_faccessat(AT_FDCWD, &path)
 }
 
 /// `faccessat(dirfd, path, mode, flags)`. `flags` (AT_EACCESS,
@@ -249,7 +284,7 @@ pub fn sys_faccessat(args: &SyscallArgs) -> SyscallResult {
         Ok(p) => p,
         Err(e) => return e,
     };
-    do_faccessat(dirfd, path)
+    do_faccessat(dirfd, &path)
 }
 
 /// `faccessat2(dirfd, path, mode, flags)` — like `faccessat`, but flags are
@@ -268,7 +303,7 @@ pub fn sys_faccessat2(args: &SyscallArgs) -> SyscallResult {
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
         return EINVAL;
     }
-    do_faccessat(dirfd, path)
+    do_faccessat(dirfd, &path)
 }
 
 pub fn sys_getdents(_args: &SyscallArgs) -> SyscallResult {
@@ -403,21 +438,21 @@ pub fn sys_getcwd(args: &SyscallArgs) -> SyscallResult {
     let buf_addr = args.arg0;
     let size = args.arg1 as usize;
 
-    if size < 2 {
-        return EINVAL; // Need room for "/" + null
+    let cwd = cwd_bytes();
+    if size < cwd.len() + 1 {
+        return -34; // ERANGE
     }
 
-    // Unikernel: cwd is always "/"
+    // SAFETY: single address space; the caller supplies a writable buffer
+    // of `size` bytes, checked above to fit the cwd + NUL.
     unsafe {
-        let buf = buf_addr as *mut u8;
-        core::ptr::write_volatile(buf, b'/');
-        core::ptr::write_volatile(buf.add(1), 0);
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf_addr as *mut u8, cwd.len());
+        core::ptr::write_volatile((buf_addr as *mut u8).add(cwd.len()), 0);
     }
     buf_addr as SyscallResult
 }
 
 pub fn sys_chdir(args: &SyscallArgs) -> SyscallResult {
-    // Unikernel cwd is always root, but validate the path exists.
     let path = match read_user_path(args.arg0) {
         Ok(p) => p,
         Err(e) => return e,
@@ -425,13 +460,22 @@ pub fn sys_chdir(args: &SyscallArgs) -> SyscallResult {
 
     let fs = crate::fs();
 
-    let nodeid = match fs.resolve_path(path) {
+    let nodeid = match fs.resolve_path(&path) {
         Ok(id) => id,
         Err(e) => return e as SyscallResult,
     };
 
     forget_if_not_root(fs, nodeid);
-    0
+
+    // Store the (absolute) path as the new cwd so later relative paths
+    // resolve against it. `read_user_path` already absolutized it.
+    match core::str::from_utf8(&path) {
+        Ok(p) => {
+            *CWD.lock() = Some(alloc::string::String::from(p));
+            0
+        }
+        Err(_) => EINVAL,
+    }
 }
 
 pub fn sys_fchdir(_args: &SyscallArgs) -> SyscallResult {
@@ -461,7 +505,7 @@ pub fn sys_creat(args: &SyscallArgs) -> SyscallResult {
     let fs = crate::fs();
 
     // Resolve parent directory and file name
-    let (parent_path, filename) = match split_path(path) {
+    let (parent_path, filename) = match split_path(&path) {
         Some(v) => v,
         None => return EINVAL,
     };
@@ -531,11 +575,11 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
     // Check if this is a directory open (O_DIRECTORY = 0o200000)
     let is_dir_open = flags & 0o200000 != 0;
 
-    let nodeid = match fs.resolve_path(path) {
+    let nodeid = match fs.resolve_path(&path) {
         Ok(id) => id,
         Err(e) if e == -2 && flags & O_CREAT != 0 => {
             // File doesn't exist but O_CREAT is set — create it.
-            let (parent_path, filename) = match split_path(path) {
+            let (parent_path, filename) = match split_path(&path) {
                 Some(v) => v,
                 None => return EINVAL,
             };
@@ -620,7 +664,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
 
 pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
     let dirfd = args.arg0 as i32;
-    let path = match read_user_path(args.arg1) {
+    let path = match read_user_path_inner(args.arg1, true) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -647,7 +691,7 @@ pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
         return ENOSYS;
     }
 
-    do_stat_path(path, buf_addr)
+    do_stat_path(&path, buf_addr)
 }
 
 pub fn sys_unlinkat(_args: &SyscallArgs) -> SyscallResult {

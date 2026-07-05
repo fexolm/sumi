@@ -36,8 +36,8 @@ fn shutdown_vm(exit_code: i32) -> ! {
 }
 
 pub fn sys_exit(args: &SyscallArgs) -> SyscallResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::sched::{self, current_thread, reaper, registry, thread::ThreadState};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     let code = args.arg0 as i32;
     let me = current_thread();
@@ -62,7 +62,10 @@ pub fn sys_exit(args: &SyscallArgs) -> SyscallResult {
         Some(a) => a,
         None => {
             // Running thread not in registry is a hard invariant violation.
-            kprintln!("[exit] BUG: current thread tid={} not in registry", me.tid.0);
+            kprintln!(
+                "[exit] BUG: current thread tid={} not in registry",
+                me.tid.0
+            );
             shutdown_vm(1);
         }
     };
@@ -80,7 +83,8 @@ pub fn sys_exit(args: &SyscallArgs) -> SyscallResult {
     reaper::push_zombie(me_arc);
 
     // 5. Mark Exited so schedule's CAS doesn't re-enqueue us.
-    me.state.store(ThreadState::Exited as u32, Ordering::Release);
+    me.state
+        .store(ThreadState::Exited as u32, Ordering::Release);
 
     // 6. Final schedule — never returns to this thread.
     sched::schedule();
@@ -114,7 +118,9 @@ pub fn sys_getppid(_args: &SyscallArgs) -> SyscallResult {
 #[cfg(not(test))]
 fn set_fs_base_msr(addr: u64) {
     // SAFETY: ring 0, valid MSR, canonical value verified by the caller.
-    unsafe { crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, addr); }
+    unsafe {
+        crate::arch::x86_64::syscall::wrmsr(IA32_FS_BASE, addr);
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +154,9 @@ pub fn sys_arch_prctl(args: &SyscallArgs) -> SyscallResult {
                 .load(Ordering::Relaxed);
             // SAFETY: unikernel shares the address space; bad pointer
             // traps via #PF.
-            unsafe { *(addr as *mut u64) = v; }
+            unsafe {
+                *(addr as *mut u64) = v;
+            }
             0
         }
         _ => EINVAL,
@@ -274,6 +282,11 @@ pub fn sys_sysinfo(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
+/// `umask(mask)`: sumi has no permission model — accept and discard the
+/// new mask, reporting the conventional previous value.
+pub fn sys_umask(_args: &SyscallArgs) -> SyscallResult {
+    0o022
+}
 
 #[cfg(test)]
 mod tests {
@@ -282,9 +295,14 @@ mod tests {
     fn make_args(arg0: u64, arg1: u64) -> SyscallArgs {
         SyscallArgs {
             nr: 158,
-            arg0, arg1,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
-            caller_rip: 0, caller_rflags: 0,
+            arg0,
+            arg1,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         }
     }
 

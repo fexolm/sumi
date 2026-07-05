@@ -6,6 +6,7 @@ include!("../common.rs");
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SIGUSR1: u64 = 10;
+const EINVAL: i64 = -22;
 
 #[repr(C)]
 struct KernelSigaction {
@@ -57,5 +58,34 @@ pub extern "C" fn sumi_main() -> i32 {
     };
     check_eq!(r, 0);
     check_eq!(old_mask, 0);
+
+    // Linux ignores `how` when new_set is NULL, but still reports the old
+    // mask. glibc uses this shape to query the current mask.
+    old_mask = 0xDEAD_BEEF;
+    let r = unsafe {
+        syscall4(
+            SYS_RT_SIGPROCMASK,
+            !0,
+            0,
+            &mut old_mask as *mut _ as u64,
+            8,
+        )
+    };
+    check_eq!(r, 0);
+    check_eq!(old_mask, 0);
+
+    // mysqld deliberately probes invalid `how` with a non-NULL new_set and
+    // expects EINVAL.
+    let new_mask: u64 = 0;
+    let r = unsafe {
+        syscall4(
+            SYS_RT_SIGPROCMASK,
+            !0,
+            &new_mask as *const _ as u64,
+            0,
+            8,
+        )
+    };
+    check_eq!(r, EINVAL);
     pass!();
 }

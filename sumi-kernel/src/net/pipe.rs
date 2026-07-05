@@ -20,6 +20,10 @@ use super::wait::Wait;
 /// (16 * 4 KiB pages). A write that would grow the buffer past this either
 /// blocks or returns EAGAIN (nonblocking) instead of growing unbounded.
 pub const PIPE_CAPACITY: usize = 65536;
+/// Linux guarantees writes of at most PIPE_BUF bytes to a pipe are atomic.
+/// If fewer bytes are available, such a write must block (or EAGAIN for
+/// nonblocking fds) instead of partially appending data.
+pub const PIPE_BUF: usize = 4096;
 
 pub struct PipeState {
     pub buf: VecDeque<u8>,
@@ -62,6 +66,9 @@ fn try_write(p: &mut PipeState, data: &[u8]) -> Wait {
     if space == 0 {
         return Wait::Block;
     }
+    if data.len() <= PIPE_BUF && space < data.len() {
+        return Wait::Block;
+    }
     let n = data.len().min(space);
     p.buf.extend(data[..n].iter().copied());
     Wait::Ready(n as i64)
@@ -72,7 +79,7 @@ pub fn pipe_readiness(p: &PipeState, write_end: bool) -> u32 {
     if write_end {
         if p.readers == 0 {
             EPOLLERR
-        } else if p.buf.len() < PIPE_CAPACITY {
+        } else if PIPE_CAPACITY.saturating_sub(p.buf.len()) >= PIPE_BUF {
             EPOLLOUT
         } else {
             0
@@ -230,11 +237,19 @@ mod tests {
     }
 
     #[test]
-    fn write_short_fills_only_remaining_capacity() {
+    fn small_write_blocks_when_only_partial_space_is_available() {
         let mut p = PipeState::new();
         p.buf.extend(core::iter::repeat_n(0u8, PIPE_CAPACITY - 3));
-        // Only 3 bytes of space left — a 5-byte write is short.
-        assert_eq!(ready(try_write(&mut p, b"hello")), 3);
+        assert!(is_block(try_write(&mut p, b"hello")));
+        assert_eq!(p.buf.len(), PIPE_CAPACITY - 3);
+    }
+
+    #[test]
+    fn large_write_short_fills_remaining_capacity() {
+        let mut p = PipeState::new();
+        p.buf.extend(core::iter::repeat_n(0u8, PIPE_CAPACITY - 3));
+        let data = [0u8; PIPE_BUF + 1];
+        assert_eq!(ready(try_write(&mut p, &data)), 3);
         assert_eq!(p.buf.len(), PIPE_CAPACITY);
     }
 
@@ -280,6 +295,14 @@ mod tests {
     fn readiness_write_end_tracks_space_and_reader_hangup() {
         let mut p = PipeState::new();
         assert_eq!(pipe_readiness(&p, true), EPOLLOUT);
+        p.buf
+            .extend(core::iter::repeat_n(0u8, PIPE_CAPACITY - PIPE_BUF + 1));
+        assert_eq!(
+            pipe_readiness(&p, true),
+            0,
+            "less than PIPE_BUF free -> not writable"
+        );
+        p.buf.clear();
         p.buf.extend(core::iter::repeat_n(0u8, PIPE_CAPACITY));
         assert_eq!(pipe_readiness(&p, true), 0, "full buffer -> not writable");
         p.readers = 0;

@@ -10,6 +10,7 @@ pub const FUSE_OPEN: u32 = 14;
 pub const FUSE_READ: u32 = 15;
 pub const FUSE_WRITE: u32 = 16;
 pub const FUSE_RELEASE: u32 = 18;
+pub const FUSE_FSYNC: u32 = 20;
 pub const FUSE_CREATE: u32 = 35;
 pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 28;
@@ -234,4 +235,14 @@ pub struct FuseRemoveMappingIn {
 pub struct FuseRemoveMappingOne {
     pub moffset: u64,
     pub len: u64,
+}
+
+/// FUSE_FSYNC request body.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FuseFsyncIn {
+    pub fh: u64,
+    /// Bit 0 set = fdatasync (skip metadata).
+    pub fsync_flags: u32,
+    pub padding: u32,
 }
