@@ -7,6 +7,7 @@ pub mod drivers;
 pub mod exec;
 pub mod fs;
 pub mod memory;
+pub mod net;
 pub mod sched;
 pub mod syscall;
 pub mod time;
@@ -34,8 +35,7 @@ pub static RNG_SEED: spin::Once<[u8; 32]> = spin::Once::new();
 /// Global TLB generation counter. Bumped whenever a page-table change requires
 /// all CPUs to flush their TLBs (mprotect PROT_NONE, munmap). Each CPU checks
 /// this at syscall return and performs a CR3 reload if its local generation lags.
-pub static TLB_GENERATION: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static TLB_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Unified lock for all user-space memory bookkeeping.
 /// Previously split across three separate statics (BRK_BASE, BRK_CURRENT, MMAP_NEXT);

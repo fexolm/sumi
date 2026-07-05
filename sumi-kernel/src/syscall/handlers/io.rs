@@ -48,6 +48,21 @@ fn release_fuse_resources(desc: &FileDescriptor) {
             fs.forget(fuse_nodeid, 1);
         }
         FdKind::Console => {}
+        // Sockets/epoll instances have no FUSE handle; their teardown is
+        // routed directly through `net::close_socket`/`close_epoll` by the
+        // callers below instead of through this FUSE-specific helper.
+        FdKind::Socket { .. } | FdKind::Epoll { .. } => {}
+    }
+}
+
+fn count_remaining_refs(table: &crate::fs::FdTable, desc: &FileDescriptor) -> usize {
+    match desc.kind {
+        FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => {
+            table.count_fh_refs(fuse_fh)
+        }
+        FdKind::Socket { id } => table.count_socket_refs(id),
+        FdKind::Epoll { id } => table.count_epoll_refs(id),
+        FdKind::Console => 0,
     }
 }
 
@@ -218,7 +233,7 @@ pub fn sys_open(args: &SyscallArgs) -> SyscallResult {
         arg3: args.arg2,      // mode
         arg4: 0,
         arg5: 0,
-        caller_rip:    args.caller_rip,
+        caller_rip: args.caller_rip,
         caller_rflags: args.caller_rflags,
     };
     crate::syscall::handlers::fs::sys_openat(&openat_args)
@@ -230,24 +245,22 @@ pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
     let (old, remaining_refs) = {
         let mut table = crate::FD_TABLE.lock();
         let old = table.free(fd_num);
-        let refs = match &old {
-            Some(desc) => match desc.kind {
-                FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => {
-                    table.count_fh_refs(fuse_fh)
-                }
-                _ => 0,
-            },
-            None => 0,
-        };
+        let refs = old
+            .as_ref()
+            .map(|desc| count_remaining_refs(&table, desc))
+            .unwrap_or(0);
         (old, refs)
     };
 
     match old {
         None => EBADF,
         Some(desc) => {
-            // Only release FUSE resources if no other fd shares this handle.
-            if remaining_refs == 0 {
-                release_fuse_resources(&desc);
+            match desc.kind {
+                FdKind::Socket { id } if remaining_refs == 0 => crate::net::close_socket(id),
+                FdKind::Epoll { id } if remaining_refs == 0 => crate::net::close_epoll(id),
+                // Only release resources if no other fd shares this handle.
+                _ if remaining_refs == 0 => release_fuse_resources(&desc),
+                _ => {}
             }
             0
         }
@@ -612,23 +625,50 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     const F_SETFL: i32 = 4;
     const F_DUPFD: i32 = 0;
     const F_DUPFD_CLOEXEC: i32 = 1030;
+    const O_NONBLOCK: u32 = crate::net::socket::SOCK_NONBLOCK;
 
-    let table = crate::FD_TABLE.lock();
-    match table.get(fd_num) {
-        None => EBADF,
-        Some(desc) => match cmd {
-            F_GETFD => 0, // no close-on-exec in unikernel
-            F_SETFD => 0, // ignore
-            F_GETFL => desc.flags as SyscallResult,
-            F_SETFL => 0, // ignore
-            F_DUPFD | F_DUPFD_CLOEXEC => {
-                let new_desc = *desc;
-                drop(table);
+    match cmd {
+        F_SETFL => {
+            let socket_update = {
                 let mut table = crate::FD_TABLE.lock();
-                table.alloc(new_desc) as SyscallResult
+                let Some(desc) = table.get_mut(fd_num) else {
+                    return EBADF;
+                };
+                let nonblock = args.arg2 as u32 & O_NONBLOCK;
+                desc.flags = (desc.flags & !O_NONBLOCK) | nonblock;
+                match desc.kind {
+                    FdKind::Socket { id } => Some((id, nonblock != 0)),
+                    _ => None,
+                }
+            };
+
+            if let Some((id, nonblocking)) = socket_update {
+                let mut g = crate::net::lock();
+                let Some(obj) = g.socket_get_mut(id) else {
+                    return EBADF;
+                };
+                obj.nonblocking = nonblocking;
             }
-            _ => EINVAL,
-        },
+            0
+        }
+        _ => {
+            let table = crate::FD_TABLE.lock();
+            match table.get(fd_num) {
+                None => EBADF,
+                Some(desc) => match cmd {
+                    F_GETFD => 0, // no close-on-exec in unikernel
+                    F_SETFD => 0, // ignore
+                    F_GETFL => desc.flags as SyscallResult,
+                    F_DUPFD | F_DUPFD_CLOEXEC => {
+                        let new_desc = *desc;
+                        drop(table);
+                        let mut table = crate::FD_TABLE.lock();
+                        table.alloc(new_desc) as SyscallResult
+                    }
+                    _ => EINVAL,
+                },
+            }
+        }
     }
 }
 
@@ -675,23 +715,23 @@ pub fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
         let old_occupant = table.put(new_fd, desc);
 
         // Check if the evicted fd's handle is still referenced by other fds.
-        let refs = match &old_occupant {
-            Some(d) => match d.kind {
-                FdKind::File { fuse_fh, .. } | FdKind::Directory { fuse_fh, .. } => {
-                    table.count_fh_refs(fuse_fh)
-                }
-                _ => 0,
-            },
-            None => 0,
-        };
+        let refs = old_occupant
+            .as_ref()
+            .map(|desc| count_remaining_refs(&table, desc))
+            .unwrap_or(0);
         (old_occupant, refs)
     };
 
-    // Release FUSE resources for the evicted fd only if no other fd shares the handle.
-    if remaining_refs == 0
-        && let Some(ref evicted) = evicted
-    {
-        release_fuse_resources(evicted);
+    // Tear down whatever new_fd used to reference. Sockets/epoll instances
+    // always close; FUSE resources only release if no other fd shares the
+    // handle.
+    if let Some(ref evicted) = evicted {
+        match evicted.kind {
+            FdKind::Socket { id } if remaining_refs == 0 => crate::net::close_socket(id),
+            FdKind::Epoll { id } if remaining_refs == 0 => crate::net::close_epoll(id),
+            _ if remaining_refs == 0 => release_fuse_resources(evicted),
+            _ => {}
+        }
     }
 
     new_fd as SyscallResult

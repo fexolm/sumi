@@ -10,3 +10,4 @@ workspace = true
 sumi-abi = { path = "../sumi-abi" }
 spin = "0.10.0"
 goblin = { version = "0.10.5", default-features = false, features = ["elf32", "elf64", "endian_fd", "alloc"] }
+smoltcp = { version = "0.13", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }

@@ -37,7 +37,7 @@ const COMMON_FILE: &str = "common.rs";
 /// non-zero exit code, which `run_test` does not support). The build
 /// script must NOT auto-generate a `#[test]` for these — it would
 /// always fail with "expected 0".
-const MANUAL_SYSCALL_TESTS: &[&str] = &["exit_seven", "exit_group_kills_all"];
+const MANUAL_SYSCALL_TESTS: &[&str] = &["exit_seven", "exit_group_kills_all", "tcp_epoll_loopback"];
 
 /// Source files in `data/glibc/` whose `#[test]` is written manually
 /// in `tests/test_launcher.rs` (e.g. because they require multiple vCPUs

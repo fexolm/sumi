@@ -25,6 +25,10 @@ pub enum FdKind {
         fuse_nodeid: u64,
         offset: u64,
     },
+    /// A socket, indexing into `net::NetState::socktab`.
+    Socket { id: usize },
+    /// An epoll instance, indexing into `net::NetState::epolltab`.
+    Epoll { id: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +115,22 @@ impl FdTable {
                 _ => false,
             })
         }).count()
+    }
+
+    /// Count how many open fds reference the given socket table id.
+    pub fn count_socket_refs(&self, id: usize) -> usize {
+        self.fds
+            .iter()
+            .filter(|slot| matches!(slot, Some(d) if matches!(d.kind, FdKind::Socket { id: sid } if sid == id)))
+            .count()
+    }
+
+    /// Count how many open fds reference the given epoll table id.
+    pub fn count_epoll_refs(&self, id: usize) -> usize {
+        self.fds
+            .iter()
+            .filter(|slot| matches!(slot, Some(d) if matches!(d.kind, FdKind::Epoll { id: eid } if eid == id)))
+            .count()
     }
 }
 
@@ -220,5 +240,38 @@ mod tests {
         } else {
             panic!("expected File");
         }
+    }
+
+    #[test]
+    fn count_socket_and_epoll_refs_track_duplicate_descriptors() {
+        let mut table = make_table();
+        let socket_desc = FileDescriptor {
+            kind: FdKind::Socket { id: 7 },
+            flags: 0,
+        };
+        let epoll_desc = FileDescriptor {
+            kind: FdKind::Epoll { id: 3 },
+            flags: 0,
+        };
+
+        let s0 = table.alloc(socket_desc);
+        let s1 = table.alloc(socket_desc);
+        let e0 = table.alloc(epoll_desc);
+        let e1 = table.alloc(epoll_desc);
+
+        assert_eq!(table.count_socket_refs(7), 2);
+        assert_eq!(table.count_epoll_refs(3), 2);
+
+        table.free(s0);
+        table.free(e0);
+
+        assert_eq!(table.count_socket_refs(7), 1);
+        assert_eq!(table.count_epoll_refs(3), 1);
+
+        table.free(s1);
+        table.free(e1);
+
+        assert_eq!(table.count_socket_refs(7), 0);
+        assert_eq!(table.count_epoll_refs(3), 0);
     }
 }

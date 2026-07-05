@@ -5,8 +5,7 @@ use sumi_kernel::{
     arch::{halt_forever, syscall},
     exec,
     fs::virtio_fs::VirtioFsClient,
-    kprintln,
-    sched,
+    kprintln, sched,
 };
 
 struct GlobalKernelAlloc;
@@ -68,6 +67,11 @@ pub extern "C" fn _start() -> ! {
     // of which are globals that APs may eventually observe. KERNEL_READY
     // must be set only after all such state is published.
     let user_program_path = exec::read_boot_info();
+
+    // Build the Phase 1 loopback network stack. Must run after
+    // `read_boot_info()` (needs RNG_SEED for the TCP sequence-number seed)
+    // and before KERNEL_READY (APs must see a fully-initialized NET).
+    sumi_kernel::net::init();
 
     // Register the BSP main thread and idle thread before APs start. Runs
     // after PAGE_ALLOCATOR is usable (which it is from boot). Must run

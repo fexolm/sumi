@@ -48,6 +48,12 @@ extern "C" fn timer_interrupt() {
     // syscall postamble already does the same check, but a preempted
     // thread may run for a long time before its next syscall.
     cpu.reload_tlb_if_stale();
+    // Advance the net stack and wake any thread whose socket became ready.
+    // Safe to call with IF=0 here: `NET` is a plain (non-IRQ-safe) mutex,
+    // but the timer only ever fires from user mode or the idle `sti; hlt`
+    // (see the module doc comment) — never from inside a syscall handler
+    // that might be holding `NET` — so this can never deadlock.
+    crate::net::poll();
     // Relaxed store is sufficient: the ISR trampoline reads need_resched
     // immediately after decrementing preempt_count on the same CPU with
     // interrupts still disabled, so there is no ordering hazard here.
@@ -68,7 +74,7 @@ extern "C" fn ipi_interrupt() {
 /// return, the trampoline restores the frame and `iretq`s to user mode.
 #[unsafe(no_mangle)]
 extern "C" fn schedule_preempt() {
-    use crate::sched::{thread::ThreadState, percpu as pc};
+    use crate::sched::{percpu as pc, thread::ThreadState};
     use core::sync::atomic::Ordering;
 
     let cpu = pc::this_cpu();
@@ -78,7 +84,7 @@ extern "C" fn schedule_preempt() {
     cpu.need_resched.store(false, Ordering::Release);
 
     let current_ptr = cpu.current_thread.load(Ordering::Relaxed);
-    let idle_ptr    = cpu.idle_thread.load(Ordering::Relaxed);
+    let idle_ptr = cpu.idle_thread.load(Ordering::Relaxed);
 
     // Only push to the runqueue if we are not the idle thread.
     if !core::ptr::eq(current_ptr, idle_ptr) {
@@ -107,7 +113,10 @@ extern "C" fn schedule_preempt() {
 extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, rsp: u64) -> ! {
     crate::kprintln!(
         "[exception] vector={:#x} error_code={:#x} rip={:#x} rsp={:#x}",
-        vector, error_code, rip, rsp,
+        vector,
+        error_code,
+        rip,
+        rsp,
     );
     crate::arch::x86_64::hypercall::shutdown(1);
 }
@@ -124,7 +133,7 @@ extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, rsp: u64
 pub unsafe extern "C" fn isr_ud() {
     // SAFETY: CPU pushed RIP, CS, RFLAGS on the stack (no error code).
     naked_asm!(
-        "push 0",           // fake error code for uniformity
+        "push 0", // fake error code for uniformity
         "push rax",
         "push rcx",
         "push rdx",
@@ -139,7 +148,7 @@ pub unsafe extern "C" fn isr_ud() {
         // Pass args: rdi=vector, rsi=error_code, rdx=rip, rcx=rsp (original)
         "mov rdi, 0x06",
         "mov rsi, 0",
-        "mov rdx, [rsp + 80]",   // saved RIP (10 pushes * 8 = 80 bytes)
+        "mov rdx, [rsp + 80]", // saved RIP (10 pushes * 8 = 80 bytes)
         "mov rcx, rsp",
         "call exception_handler",
         // exception_handler calls shutdown and never returns; this is unreachable.
@@ -170,8 +179,8 @@ pub unsafe extern "C" fn isr_df() {
         "push r11",
         // 9 pushes = 72 bytes; error code at [rsp+72], RIP at [rsp+80]
         "mov rdi, 0x08",
-        "mov rsi, [rsp + 72]",   // error code
-        "mov rdx, [rsp + 80]",   // saved RIP
+        "mov rsi, [rsp + 72]", // error code
+        "mov rdx, [rsp + 80]", // saved RIP
         "mov rcx, rsp",
         "call exception_handler",
         "ud2",
@@ -198,8 +207,8 @@ pub unsafe extern "C" fn isr_gp() {
         "push r10",
         "push r11",
         "mov rdi, 0x0D",
-        "mov rsi, [rsp + 72]",   // error code
-        "mov rdx, [rsp + 80]",   // saved RIP
+        "mov rsi, [rsp + 72]", // error code
+        "mov rdx, [rsp + 80]", // saved RIP
         "mov rcx, rsp",
         "call exception_handler",
         "ud2",
@@ -226,8 +235,8 @@ pub unsafe extern "C" fn isr_pf() {
         "push r10",
         "push r11",
         "mov rdi, 0x0E",
-        "mov rsi, [rsp + 72]",   // error code
-        "mov rdx, [rsp + 80]",   // saved RIP
+        "mov rsi, [rsp + 72]", // error code
+        "mov rdx, [rsp + 80]", // saved RIP
         "mov rcx, rsp",
         "call exception_handler",
         "ud2",

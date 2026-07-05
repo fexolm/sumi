@@ -44,3 +44,15 @@ fn exit_group_kills_all() {
 fn preempt_timer() {
     sumi_integration_tests::run_test_smp("glibc/preempt_timer", 2);
 }
+
+// TCP + epoll loopback echo (Phase 1 networking, see
+// docs/networking-design.md). Pinned to a single vCPU: the net stack's
+// blocking/wakeup design relies on `poll_and_wake`'s poll-before-block step
+// delivering loopback traffic synchronously, which only avoids an actual
+// park on a single vCPU (see `net::wait::net_wait`'s doc comment). The
+// auto-generated #[test] is suppressed via build.rs `MANUAL_SYSCALL_TESTS`
+// because the default vCPU count comes from the host's core count, not 1.
+#[test]
+fn tcp_epoll_loopback() {
+    sumi_integration_tests::run_test_smp("syscalls/tcp_epoll_loopback", 1);
+}

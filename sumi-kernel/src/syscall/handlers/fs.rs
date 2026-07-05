@@ -136,6 +136,32 @@ pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
                     write_stat_to_user(&stat, buf_addr);
                     return 0;
                 }
+                FdKind::Socket { .. } | FdKind::Epoll { .. } => {
+                    // Minimal stat with socket mode; enough for glibc's
+                    // fstat-based isatty()/buffering checks.
+                    let stat = Stat {
+                        st_dev: 0,
+                        st_ino: 0,
+                        st_nlink: 1,
+                        st_mode: 0o140666, // S_IFSOCK | 0666
+                        st_uid: 0,
+                        st_gid: 0,
+                        __pad0: 0,
+                        st_rdev: 0,
+                        st_size: 0,
+                        st_blksize: 4096,
+                        st_blocks: 0,
+                        st_atime: 0,
+                        st_atime_nsec: 0,
+                        st_mtime: 0,
+                        st_mtime_nsec: 0,
+                        st_ctime: 0,
+                        st_ctime_nsec: 0,
+                        __unused: [0; 3],
+                    };
+                    write_stat_to_user(&stat, buf_addr);
+                    return 0;
+                }
             },
             None => return EBADF,
         }
@@ -542,7 +568,7 @@ pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
             arg3: 0,
             arg4: 0,
             arg5: 0,
-            caller_rip:    args.caller_rip,
+            caller_rip: args.caller_rip,
             caller_rflags: args.caller_rflags,
         };
         return sys_fstat(&fstat_args);
