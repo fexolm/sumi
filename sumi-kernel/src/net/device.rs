@@ -43,6 +43,16 @@ const IPV4_DST_OFF: usize = ETH_HDR_LEN + 16;
 const ARP_TARGET_PROTO_OFF: usize = ETH_HDR_LEN + 24;
 const LOOPBACK_NET: u8 = 127;
 
+struct LoopbackFrame {
+    len: usize,
+    data: [u8; RX_BUF_SIZE],
+}
+
+enum RxFrame {
+    External(Vec<u8>),
+    Loopback(LoopbackFrame),
+}
+
 /// Guest-side virtio-net driver. Owns two virtqueues (0 = RX, 1 = TX), a
 /// contiguous RX buffer pool, and a single reused TX buffer + descriptor
 /// (safe because `VirtioTxToken` borrows `&mut VirtioNetDevice` and
@@ -75,7 +85,7 @@ pub struct VirtioNetDevice {
     /// real gateway-bound traffic (10.0.2.0/24) is inert — those frames
     /// are silently discarded on the loop side and still genuinely
     /// delivered on the real virtqueue side.
-    loopback: VecDeque<Vec<u8>>,
+    loopback: VecDeque<LoopbackFrame>,
 }
 
 impl VirtioNetDevice {
@@ -303,19 +313,26 @@ impl VirtioNetDevice {
 /// `VirtioNetDevice` rings its RX doorbell here; `Loopback` needs nothing
 /// (transmit already delivers synchronously).
 pub trait PollDevice {
-    fn pre_poll(&mut self) {}
+    fn pull_external_rx(&mut self) {}
+    fn has_local_rx(&self) -> bool {
+        false
+    }
 }
 
 impl PollDevice for VirtioNetDevice {
-    fn pre_poll(&mut self) {
+    fn pull_external_rx(&mut self) {
         self.kick_rx();
+    }
+
+    fn has_local_rx(&self) -> bool {
+        !self.loopback.is_empty()
     }
 }
 
 impl PollDevice for smoltcp::phy::Loopback {}
 
 pub struct VirtioRxToken {
-    frame: Vec<u8>,
+    frame: RxFrame,
 }
 
 impl SmolRxToken for VirtioRxToken {
@@ -323,7 +340,10 @@ impl SmolRxToken for VirtioRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.frame)
+        match &self.frame {
+            RxFrame::External(frame) => f(frame),
+            RxFrame::Loopback(frame) => f(&frame.data[..frame.len]),
+        }
     }
 }
 
@@ -361,7 +381,12 @@ impl<'a> SmolTxToken for VirtioTxToken<'a> {
 
         // Self-loopback copy — see the `loopback` field doc comment.
         let local_only = dev.is_self_directed_frame(buf);
-        dev.loopback.push_back(buf.to_vec());
+        let mut frame = LoopbackFrame {
+            len: payload_len,
+            data: [0u8; RX_BUF_SIZE],
+        };
+        frame.data[..payload_len].copy_from_slice(buf);
+        dev.loopback.push_back(frame);
         if local_only {
             return result;
         }
@@ -404,7 +429,12 @@ impl Device for VirtioNetDevice {
         // entirely, so this never competes with real gateway traffic for
         // RX buffers.
         if let Some(frame) = self.loopback.pop_front() {
-            return Some((VirtioRxToken { frame }, VirtioTxToken { dev: self }));
+            return Some((
+                VirtioRxToken {
+                    frame: RxFrame::Loopback(frame),
+                },
+                VirtioTxToken { dev: self },
+            ));
         }
 
         let elem = self.rxq.complete()?;
@@ -438,7 +468,12 @@ impl Device for VirtioNetDevice {
         // out already.
         self.rxq.submit(id);
 
-        Some((VirtioRxToken { frame }, VirtioTxToken { dev: self }))
+        Some((
+            VirtioRxToken {
+                frame: RxFrame::External(frame),
+            },
+            VirtioTxToken { dev: self },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {

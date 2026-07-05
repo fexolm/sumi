@@ -14,6 +14,7 @@ use smoltcp::socket::tcp;
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 
 use super::stack::{TCP_RX, TCP_TX};
+use super::wait::WaitQueue;
 
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
@@ -41,10 +42,77 @@ pub struct SocketObject {
     pub handle: Option<SocketHandle>,
     /// Listener: the pool of listening smoltcp sockets.
     pub backlog: Vec<SocketHandle>,
+    /// Stream: fast in-kernel endpoint for local 127.0.0.1 connections.
+    pub loopback: Option<usize>,
+    /// Listener: accepted fast-loopback endpoints waiting for accept4().
+    pub pending_loopback: Vec<usize>,
     /// Bound local address, set by `bind()`.
     pub local: Option<IpEndpoint>,
     /// Listener: endpoint used to refill the backlog pool after accept.
     pub listen_ep: Option<IpListenEndpoint>,
+}
+
+pub struct LoopbackStream {
+    rx: Vec<u8>,
+    rx_start: usize,
+    read_waiters: WaitQueue,
+    pub peer: Option<usize>,
+    pub peer_closed: bool,
+}
+
+impl LoopbackStream {
+    pub fn new() -> Self {
+        Self {
+            rx: Vec::new(),
+            rx_start: 0,
+            read_waiters: WaitQueue::new(),
+            peer: None,
+            peer_closed: false,
+        }
+    }
+
+    pub fn available(&self) -> usize {
+        self.rx.len().saturating_sub(self.rx_start)
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.rx.extend_from_slice(data);
+    }
+
+    pub fn push_read_waiter(&mut self, t: &crate::sched::thread::Thread) {
+        self.read_waiters.push(t);
+    }
+
+    pub fn wake_readers(&mut self) {
+        self.read_waiters.wake_all();
+    }
+
+    pub fn pop_into(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.available());
+        if n == 0 {
+            return 0;
+        }
+
+        let end = self.rx_start + n;
+        buf[..n].copy_from_slice(&self.rx[self.rx_start..end]);
+        self.rx_start = end;
+
+        if self.rx_start == self.rx.len() {
+            self.rx.clear();
+            self.rx_start = 0;
+        } else if self.rx_start >= 64 * 1024 {
+            self.rx.drain(..self.rx_start);
+            self.rx_start = 0;
+        }
+
+        n
+    }
+}
+
+impl Default for LoopbackStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A freshly created (unconnected, unlisted) TCP socket with Phase 1's
@@ -71,16 +139,34 @@ pub(crate) fn peer_closed(state: tcp::State) -> bool {
 }
 
 /// Compute the epoll readiness mask for `obj` given the current socket set.
-pub fn readiness(obj: &SocketObject, sockets: &SocketSet) -> u32 {
+pub fn readiness(
+    obj: &SocketObject,
+    sockets: &SocketSet,
+    loopback: Option<&LoopbackStream>,
+) -> u32 {
     match obj.role {
         SockRole::Listener => {
-            let any_ready = obj
-                .backlog
-                .iter()
-                .any(|&h| sockets.get::<tcp::Socket>(h).state() != tcp::State::Listen);
+            let any_ready = !obj.pending_loopback.is_empty()
+                || obj
+                    .backlog
+                    .iter()
+                    .any(|&h| sockets.get::<tcp::Socket>(h).state() != tcp::State::Listen);
             if any_ready { EPOLLIN } else { 0 }
         }
         SockRole::Stream => {
+            if let Some(stream) = loopback {
+                let mut ev = 0;
+                if stream.available() > 0 || stream.peer_closed {
+                    ev |= EPOLLIN;
+                }
+                if stream.peer.is_some() {
+                    ev |= EPOLLOUT;
+                } else {
+                    ev |= EPOLLHUP;
+                }
+                return ev;
+            }
+
             let Some(h) = obj.handle else {
                 return EPOLLHUP;
             };
@@ -156,6 +242,8 @@ mod tests {
             role: SockRole::Stream,
             handle: Some(handle),
             backlog: Vec::new(),
+            loopback: None,
+            pending_loopback: Vec::new(),
             local: None,
             listen_ep: None,
         }
@@ -164,7 +252,7 @@ mod tests {
     #[test]
     fn established_is_writable_and_not_readable() {
         let (sockets, _lh, ch) = established_pair();
-        let ev = readiness(&stream_obj(ch), &sockets);
+        let ev = readiness(&stream_obj(ch), &sockets, None);
         assert_ne!(ev & EPOLLOUT, 0, "empty tx buffer -> writable");
         assert_eq!(
             ev & EPOLLIN,
@@ -182,7 +270,7 @@ mod tests {
         // EOF-readable and hung up.
         let mut sockets = SocketSet::new(Vec::new());
         let h = sockets.add(new_tcp());
-        let ev = readiness(&stream_obj(h), &sockets);
+        let ev = readiness(&stream_obj(h), &sockets, None);
         assert_ne!(ev & EPOLLIN, 0, "Closed -> readable (observes EOF)");
         assert_ne!(ev & EPOLLHUP, 0, "!is_active -> EPOLLHUP");
     }
@@ -201,10 +289,12 @@ mod tests {
             role: SockRole::Listener,
             handle: None,
             backlog: alloc::vec![h],
+            loopback: None,
+            pending_loopback: Vec::new(),
             local: Some(IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 3456)),
             listen_ep: Some(ep),
         };
-        assert_eq!(readiness(&obj, &sockets), 0);
+        assert_eq!(readiness(&obj, &sockets, None), 0);
     }
 
     #[test]
@@ -217,9 +307,11 @@ mod tests {
             role: SockRole::Listener,
             handle: None,
             backlog: alloc::vec![lh],
+            loopback: None,
+            pending_loopback: Vec::new(),
             local: None,
             listen_ep: None,
         };
-        assert_ne!(readiness(&obj, &sockets) & EPOLLIN, 0);
+        assert_ne!(readiness(&obj, &sockets, None) & EPOLLIN, 0);
     }
 }

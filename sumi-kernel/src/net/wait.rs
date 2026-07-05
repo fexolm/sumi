@@ -88,6 +88,11 @@ pub fn net_wait(
 ) -> i64 {
     loop {
         let mut g = super::lock();
+        if let Wait::Ready(v) = check(&mut g) {
+            drop(g);
+            return v;
+        }
+
         g.poll_and_wake();
         if let Wait::Ready(v) = check(&mut g) {
             drop(g);

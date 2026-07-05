@@ -67,6 +67,7 @@ pub struct NetStateInner<D> {
     pub sockets: SocketSet<'static>,
     pub device: D,
     pub socktab: Vec<Option<SocketObject>>,
+    pub looptab: Vec<Option<socket::LoopbackStream>>,
     pub epolltab: Vec<Option<EpollInstance>>,
     /// In-kernel pipes (`pipe`/`pipe2`), indexed the same way as `socktab`.
     /// Sharing this struct's lock and `waiters` queue with sockets is what
@@ -156,6 +157,7 @@ impl NetState {
             sockets,
             device,
             socktab: Vec::new(),
+            looptab: Vec::new(),
             epolltab: Vec::new(),
             pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
@@ -177,6 +179,7 @@ impl TestNetState {
             sockets,
             device,
             socktab: Vec::new(),
+            looptab: Vec::new(),
             epolltab: Vec::new(),
             pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
@@ -208,6 +211,55 @@ impl<D> NetStateInner<D> {
         self.socktab.get_mut(id)?.as_mut()
     }
 
+    pub fn loopback_get(&self, id: usize) -> Option<&socket::LoopbackStream> {
+        self.looptab.get(id)?.as_ref()
+    }
+
+    pub fn loopback_get_mut(&mut self, id: usize) -> Option<&mut socket::LoopbackStream> {
+        self.looptab.get_mut(id)?.as_mut()
+    }
+
+    fn loopback_alloc(&mut self, stream: socket::LoopbackStream) -> usize {
+        for (i, slot) in self.looptab.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(stream);
+                return i;
+            }
+        }
+        self.looptab.push(Some(stream));
+        self.looptab.len() - 1
+    }
+
+    pub fn loopback_pair(&mut self) -> (usize, usize) {
+        let a = self.loopback_alloc(socket::LoopbackStream::new());
+        let b = self.loopback_alloc(socket::LoopbackStream::new());
+        self.loopback_get_mut(a).expect("allocated above").peer = Some(b);
+        self.loopback_get_mut(b).expect("allocated above").peer = Some(a);
+        (a, b)
+    }
+
+    pub fn loopback_close(&mut self, id: usize) {
+        let Some(mut stream) = self.looptab.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        stream.wake_readers();
+        if let Some(peer) = stream.peer
+            && let Some(peer_stream) = self.loopback_get_mut(peer)
+        {
+            peer_stream.peer = None;
+            peer_stream.peer_closed = true;
+            peer_stream.wake_readers();
+            self.deadline_waiters = 0;
+            self.waiters.wake_all();
+        }
+    }
+
+    pub fn socket_readiness(&self, id: usize) -> Option<u32> {
+        let obj = self.socket_get(id)?;
+        let loopback = obj.loopback.and_then(|stream| self.loopback_get(stream));
+        Some(socket::readiness(obj, &self.sockets, loopback))
+    }
+
     /// Close a socket id gracefully: a live stream handle gets a FIN
     /// (`close()`) and is parked on `self.closing` until the conversation
     /// drains (reaped by `poll_and_wake`); un-accepted backlog connections
@@ -215,6 +267,12 @@ impl<D> NetStateInner<D> {
     /// already fully closed are removed immediately.
     pub fn socket_close(&mut self, id: usize) -> Option<SocketObject> {
         let obj = self.socktab.get_mut(id)?.take()?;
+        if let Some(stream) = obj.loopback {
+            self.loopback_close(stream);
+        }
+        for &stream in &obj.pending_loopback {
+            self.loopback_close(stream);
+        }
         if let Some(h) = obj.handle {
             let s = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(h);
             if s.is_active() {
@@ -243,6 +301,12 @@ impl<D> NetStateInner<D> {
     /// and/or listener backlog pool) from the socket set.
     pub fn socket_free(&mut self, id: usize) -> Option<SocketObject> {
         let obj = self.socktab.get_mut(id)?.take()?;
+        if let Some(stream) = obj.loopback {
+            self.loopback_close(stream);
+        }
+        for &stream in &obj.pending_loopback {
+            self.loopback_close(stream);
+        }
         if let Some(h) = obj.handle {
             self.sockets.remove(h);
         }
@@ -334,11 +398,11 @@ impl<D: Device + PollDevice> NetStateInner<D> {
     /// directly after mutating a socket (see e.g. `sys_listen`,
     /// `sys_connect`) rather than re-locking `NET` through `net::poll()`.
     ///
-    /// `device.pre_poll()` runs once per call, before the poll loop: for
-    /// `VirtioNetDevice` this rings the RX queue's doorbell exactly once
-    /// per `poll_and_wake` (not once per `receive()`), which is the RX
-    /// pull handshake Phase 2 relies on in place of a host->guest IRQ (see
-    /// `docs/networking-design.md`). `Loopback` needs nothing here.
+    /// External RX is pulled lazily: local self-loopback frames can often be
+    /// produced and consumed entirely inside the smoltcp poll loop, so
+    /// `VirtioNetDevice` rings the RX queue only after the local path has
+    /// gone idle. This preserves the Phase 2 pull handshake without charging
+    /// every 127.0.0.1 syscall for a pointless MMIO exit.
     ///
     /// Deviation from the original plan: `Interface::poll()` runs its
     /// ingress loop (drain whatever the device already has queued) BEFORE
@@ -355,12 +419,37 @@ impl<D: Device + PollDevice> NetStateInner<D> {
     pub(crate) fn poll_and_wake(&mut self) -> bool {
         let now = stack::now();
         let mut changed = false;
-        self.device.pre_poll();
+        let mut idle_polls = 0usize;
+        let mut pulled_external_rx = false;
+
         for _ in 0..NET_POLL_ITERS {
             if self.iface.poll(now, &mut self.device, &mut self.sockets)
                 == PollResult::SocketStateChanged
             {
                 changed = true;
+                idle_polls = 0;
+                continue;
+            }
+
+            if self.device.has_local_rx() {
+                idle_polls = 0;
+                continue;
+            }
+
+            if changed {
+                break;
+            }
+
+            if !pulled_external_rx {
+                self.device.pull_external_rx();
+                pulled_external_rx = true;
+                idle_polls = 0;
+                continue;
+            }
+
+            idle_polls += 1;
+            if changed || idle_polls >= 2 {
+                break;
             }
         }
         // Reap gracefully-closing handles (see `closing`) whose TCP
@@ -403,6 +492,8 @@ mod tests {
             role: SockRole::Listener,
             handle: None,
             backlog: Vec::new(),
+            loopback: None,
+            pending_loopback: Vec::new(),
             local: None,
             listen_ep: None,
         }
@@ -416,6 +507,8 @@ mod tests {
             role: SockRole::Stream,
             handle: Some(handle),
             backlog: Vec::new(),
+            loopback: None,
+            pending_loopback: Vec::new(),
             local: None,
             listen_ep: None,
         }
@@ -497,7 +590,7 @@ mod tests {
         );
 
         let listener_ref = st.socket_get(listener_id).unwrap();
-        assert_ne!(readiness(listener_ref, &st.sockets) & EPOLLIN, 0);
+        assert_ne!(readiness(listener_ref, &st.sockets, None) & EPOLLIN, 0);
         let accepted_handle = listener_ref.backlog[0];
 
         // 4. "accept": hand out the backlog member that left Listen, refill
@@ -509,7 +602,7 @@ mod tests {
         let server_id = st.socket_alloc(stream_obj(accepted_handle));
 
         assert_ne!(
-            readiness(st.socket_get(client_id).unwrap(), &st.sockets) & EPOLLOUT,
+            readiness(st.socket_get(client_id).unwrap(), &st.sockets, None) & EPOLLOUT,
             0
         );
 
@@ -524,7 +617,7 @@ mod tests {
         st.poll_and_wake();
 
         assert_ne!(
-            readiness(st.socket_get(server_id).unwrap(), &st.sockets) & EPOLLIN,
+            readiness(st.socket_get(server_id).unwrap(), &st.sockets, None) & EPOLLIN,
             0
         );
         let mut buf = [0u8; 64];
@@ -544,7 +637,7 @@ mod tests {
         st.poll_and_wake();
 
         assert_ne!(
-            readiness(st.socket_get(client_id).unwrap(), &st.sockets) & EPOLLIN,
+            readiness(st.socket_get(client_id).unwrap(), &st.sockets, None) & EPOLLIN,
             0
         );
         let mut buf2 = [0u8; 64];

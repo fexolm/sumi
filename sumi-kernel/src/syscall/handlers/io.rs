@@ -10,6 +10,36 @@ use sumi_abi::address::VirtualAddr;
 /// path (sockets and pipes) that needs to know a fd's nonblocking flag.
 const O_NONBLOCK: u32 = crate::net::socket::SOCK_NONBLOCK;
 const O_CLOEXEC: u32 = crate::net::socket::SOCK_CLOEXEC;
+const FS_SEQ_CACHE_MAX: usize = 8 * 1024 * 1024;
+const FS_SEQ_CACHE_SMALL_IO: usize = 256 * 1024;
+
+struct WriteCache {
+    fh: u64,
+    start: u64,
+    data: Vec<u8>,
+}
+
+struct ReadCache {
+    nodeid: u64,
+    start: u64,
+    data: Vec<u8>,
+}
+
+struct FileIoCache {
+    writes: Vec<WriteCache>,
+    reads: Vec<ReadCache>,
+}
+
+impl FileIoCache {
+    const fn new() -> Self {
+        Self {
+            writes: Vec::new(),
+            reads: Vec::new(),
+        }
+    }
+}
+
+static FILE_IO_CACHE: spin::Mutex<FileIoCache> = spin::Mutex::new(FileIoCache::new());
 
 fn console_write(data: &[u8]) -> usize {
     crate::console().write(data)
@@ -17,6 +47,181 @@ fn console_write(data: &[u8]) -> usize {
 
 fn console_read(buf: &mut [u8]) -> usize {
     crate::console().read(buf)
+}
+
+fn flush_write_cache_entry(entry: &mut WriteCache) -> Result<(), i32> {
+    let mut done = 0usize;
+    while done < entry.data.len() {
+        let vaddr = unsafe { entry.data.as_ptr().add(done) } as u64;
+        let count = (entry.data.len() - done).min(u32::MAX as usize) as u32;
+        match fs_transfer_chunked(
+            |off, pa, cnt| crate::fs().write(entry.fh, off, pa, cnt),
+            entry.start + done as u64,
+            vaddr,
+            count,
+        ) {
+            Ok(0) => return Err(EIO as i32),
+            Ok(n) => done += n as usize,
+            Err(e) => return Err(e),
+        }
+    }
+
+    entry.data.clear();
+    Ok(())
+}
+
+fn flush_write_cache(fh: u64) -> Result<(), i32> {
+    let mut cache = FILE_IO_CACHE.lock();
+    if let Some(idx) = cache.writes.iter().position(|entry| entry.fh == fh) {
+        let result = flush_write_cache_entry(&mut cache.writes[idx]);
+        if result.is_ok() {
+            cache.writes.remove(idx);
+        }
+        result
+    } else {
+        Ok(())
+    }
+}
+
+fn invalidate_read_cache_locked(cache: &mut FileIoCache, nodeid: u64) {
+    cache.reads.retain(|entry| entry.nodeid != nodeid);
+}
+
+pub(crate) fn invalidate_file_read_cache(nodeid: u64) {
+    invalidate_read_cache_locked(&mut FILE_IO_CACHE.lock(), nodeid);
+}
+
+fn flush_file_caches(fh: u64, nodeid: u64) -> Result<(), i32> {
+    let result = flush_write_cache(fh);
+    invalidate_file_read_cache(nodeid);
+    result
+}
+
+fn try_cached_file_write(
+    fh: u64,
+    nodeid: u64,
+    offset: u64,
+    buf_vaddr: u64,
+    count: u32,
+) -> Option<Result<u32, i32>> {
+    let count = count as usize;
+    if count == 0 {
+        return Some(Ok(0));
+    }
+    if count > FS_SEQ_CACHE_SMALL_IO {
+        return None;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, count) };
+    let mut cache = FILE_IO_CACHE.lock();
+    invalidate_read_cache_locked(&mut cache, nodeid);
+
+    if let Some(idx) = cache.writes.iter().position(|entry| entry.fh == fh) {
+        let entry = &mut cache.writes[idx];
+        let cache_start = entry.start;
+        let cache_end = cache_start + entry.data.len() as u64;
+        let write_end = offset + count as u64;
+
+        if offset >= cache_start && write_end <= cache_end {
+            let pos = (offset - cache_start) as usize;
+            entry.data[pos..pos + count].copy_from_slice(data);
+            return Some(Ok(count as u32));
+        }
+
+        if offset == cache_end && entry.data.len() + count <= FS_SEQ_CACHE_MAX {
+            entry.data.extend_from_slice(data);
+            return Some(Ok(count as u32));
+        }
+
+        if let Err(e) = flush_write_cache_entry(entry) {
+            return Some(Err(e));
+        }
+        cache.writes.remove(idx);
+    }
+
+    let mut cached = Vec::with_capacity(FS_SEQ_CACHE_MAX);
+    cached.extend_from_slice(data);
+    cache.writes.push(WriteCache {
+        fh,
+        start: offset,
+        data: cached,
+    });
+    Some(Ok(count as u32))
+}
+
+fn try_cached_file_read(
+    fh: u64,
+    nodeid: u64,
+    offset: u64,
+    buf_vaddr: u64,
+    count: u32,
+) -> Option<Result<u32, i32>> {
+    let count = count as usize;
+    if count == 0 {
+        return Some(Ok(0));
+    }
+    if count > FS_SEQ_CACHE_SMALL_IO {
+        return None;
+    }
+
+    if let Err(e) = flush_write_cache(fh) {
+        return Some(Err(e));
+    }
+
+    {
+        let cache = FILE_IO_CACHE.lock();
+        if let Some(entry) = cache.reads.iter().find(|entry| {
+            entry.nodeid == nodeid
+                && offset >= entry.start
+                && offset + count as u64 <= entry.start + entry.data.len() as u64
+        }) {
+            let pos = (offset - entry.start) as usize;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    entry.data.as_ptr().add(pos),
+                    buf_vaddr as *mut u8,
+                    count,
+                );
+            }
+            return Some(Ok(count as u32));
+        }
+    }
+
+    let mut data = Vec::with_capacity(FS_SEQ_CACHE_MAX);
+    let n = match fs_transfer_chunked(
+        |off, pa, cnt| crate::fs().read(fh, off, pa, cnt),
+        offset,
+        data.as_mut_ptr() as u64,
+        FS_SEQ_CACHE_MAX as u32,
+    ) {
+        Ok(n) => n as usize,
+        Err(e) => return Some(Err(e)),
+    };
+    // SAFETY: virtio-fs wrote exactly `n` initialized bytes into the
+    // allocation above. `u8` has no drop glue, so the unfilled capacity is
+    // harmless and remains outside the Vec length.
+    unsafe {
+        data.set_len(n);
+    }
+
+    let copied = count.min(n);
+    if copied > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buf_vaddr as *mut u8, copied);
+        }
+    }
+
+    let mut cache = FILE_IO_CACHE.lock();
+    cache.reads.retain(|entry| entry.nodeid != nodeid);
+    if !data.is_empty() {
+        cache.reads.push(ReadCache {
+            nodeid,
+            start: offset,
+            data,
+        });
+    }
+
+    Some(Ok(copied as u32))
 }
 
 /// Read an iovec entry (base, len) from user memory.
@@ -43,6 +248,7 @@ fn release_fuse_resources(desc: &FileDescriptor) {
             fuse_nodeid,
             ..
         } => {
+            let _ = flush_write_cache(fuse_fh);
             fs.release(fuse_fh);
             fs.forget(fuse_nodeid, 1);
         }
@@ -99,8 +305,38 @@ pub(crate) fn bytes_to_page_end(vaddr: u64) -> u32 {
     (PAGE_SIZE - offset) as u32
 }
 
+fn contiguous_transfer_len(
+    buf_vaddr: u64,
+    paddr: sumi_abi::address::PhysicalAddr,
+    remaining: u32,
+) -> u32 {
+    use sumi_abi::arch::layout::PAGE_SIZE;
+
+    let mut chunk = remaining.min(bytes_to_page_end(buf_vaddr));
+    let mut expected_paddr = paddr.add(chunk as usize);
+
+    while chunk < remaining {
+        let next_vaddr = buf_vaddr + chunk as u64;
+        debug_assert!((next_vaddr as usize).is_multiple_of(PAGE_SIZE));
+
+        let Some(next_paddr) = translate_vaddr(next_vaddr) else {
+            break;
+        };
+        if next_paddr != expected_paddr {
+            break;
+        }
+
+        let extend = (remaining - chunk).min(PAGE_SIZE as u32);
+        chunk += extend;
+        expected_paddr = expected_paddr.add(extend as usize);
+    }
+
+    chunk
+}
+
 /// Transfer data between a FUSE file handle and a user buffer, splitting at
-/// 2 MB page boundaries so each DMA uses the correct physical address.
+/// non-contiguous physical page boundaries so each DMA uses the correct
+/// physical address while preserving large contiguous transfers.
 /// `op` is called with (file_offset, physical_addr, chunk_size) for each chunk.
 pub(crate) fn fs_transfer_chunked(
     op: impl Fn(u64, sumi_abi::address::PhysicalAddr, u32) -> core::result::Result<u32, i32>,
@@ -115,7 +351,7 @@ pub(crate) fn fs_transfer_chunked(
             None if total > 0 => return Ok(total),
             None => return Err(EFAULT as i32),
         };
-        let chunk = remaining.min(bytes_to_page_end(buf_vaddr));
+        let chunk = contiguous_transfer_len(buf_vaddr, paddr, remaining);
         match op(file_offset, paddr, chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -166,8 +402,30 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
             console_read(buf) as SyscallResult
         }
         FdKind::File {
-            fuse_fh, offset, ..
+            fuse_fh,
+            fuse_nodeid,
+            offset,
+            ..
         } => {
+            if let Some(result) =
+                try_cached_file_read(fuse_fh, fuse_nodeid, offset, buf_vaddr, count)
+            {
+                return match result {
+                    Ok(n) => {
+                        let mut table = crate::FD_TABLE.lock();
+                        if let Some(desc) = table.get_mut(fd_num)
+                            && let FdKind::File { ref mut offset, .. } = desc.kind
+                        {
+                            *offset += n as u64;
+                        }
+                        n as SyscallResult
+                    }
+                    Err(e) => e as SyscallResult,
+                };
+            }
+            if let Err(e) = flush_write_cache(fuse_fh) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
             match fs_transfer_chunked(
                 |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
@@ -223,8 +481,37 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
             console_write(data) as SyscallResult
         }
         FdKind::File {
-            fuse_fh, offset, ..
+            fuse_fh,
+            fuse_nodeid,
+            offset,
+            ..
         } => {
+            if let Some(result) =
+                try_cached_file_write(fuse_fh, fuse_nodeid, offset, buf_vaddr, count as u32)
+            {
+                return match result {
+                    Ok(n) => {
+                        let mut table = crate::FD_TABLE.lock();
+                        if let Some(desc) = table.get_mut(fd_num)
+                            && let FdKind::File {
+                                ref mut offset,
+                                ref mut size,
+                                ..
+                            } = desc.kind
+                        {
+                            *offset += n as u64;
+                            if *offset > *size {
+                                *size = *offset;
+                            }
+                        }
+                        n as SyscallResult
+                    }
+                    Err(e) => e as SyscallResult,
+                };
+            }
+            if let Err(e) = flush_file_caches(fuse_fh, fuse_nodeid) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
             match fs_transfer_chunked(
                 |off, pa, cnt| fs.write(fuse_fh, off, pa, cnt),
@@ -455,9 +742,7 @@ fn poll_compute_net_ready(g: &crate::net::NetState, snapshot: &[PollEntry]) -> V
     let mut out = poll_compute_static_ready(snapshot);
     for entry in snapshot {
         let readiness = match entry.target {
-            PollTarget::Socket(id) => g
-                .socket_get(id)
-                .map(|obj| crate::net::socket::readiness(obj, &g.sockets)),
+            PollTarget::Socket(id) => g.socket_readiness(id),
             PollTarget::Pipe { id, write_end } => g
                 .pipe_get(id)
                 .map(|p| crate::net::pipe_readiness(p, write_end)),
@@ -558,6 +843,9 @@ pub fn sys_pread64(args: &SyscallArgs) -> SyscallResult {
 
     match kind {
         FdKind::File { fuse_fh, .. } => {
+            if let Err(e) = flush_write_cache(fuse_fh) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
             match fs_transfer_chunked(
                 |off, pa, cnt| fs.read(fuse_fh, off, pa, cnt),
@@ -588,7 +876,14 @@ pub fn sys_pwrite64(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
-        FdKind::File { fuse_fh, .. } => {
+        FdKind::File {
+            fuse_fh,
+            fuse_nodeid,
+            ..
+        } => {
+            if let Err(e) = flush_file_caches(fuse_fh, fuse_nodeid) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
             match fs_transfer_chunked(
                 |off, pa, cnt| fs.write(fuse_fh, off, pa, cnt),
@@ -683,6 +978,9 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
         FdKind::File {
             fuse_fh, offset, ..
         } => {
+            if let Err(e) = flush_write_cache(fuse_fh) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
 
             let mut total = 0i64;
@@ -816,8 +1114,14 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
             total as SyscallResult
         }
         FdKind::File {
-            fuse_fh, offset, ..
+            fuse_fh,
+            fuse_nodeid,
+            offset,
+            ..
         } => {
+            if let Err(e) = flush_file_caches(fuse_fh, fuse_nodeid) {
+                return e as SyscallResult;
+            }
             let fs = crate::fs();
 
             let mut total = 0i64;
@@ -974,16 +1278,24 @@ pub fn sys_fallocate(args: &SyscallArgs) -> SyscallResult {
         None => return EINVAL,
     };
 
-    let fuse_fh = {
+    let (fuse_fh, fuse_nodeid) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(desc) => match desc.kind {
-                FdKind::File { fuse_fh, .. } => fuse_fh,
+                FdKind::File {
+                    fuse_fh,
+                    fuse_nodeid,
+                    ..
+                } => (fuse_fh, fuse_nodeid),
                 _ => return EBADF,
             },
             None => return EBADF,
         }
     };
+
+    if let Err(e) = flush_file_caches(fuse_fh, fuse_nodeid) {
+        return e as SyscallResult;
+    }
 
     let fs = crate::fs();
     let zero_phys = crate::fs::virtio_fs::VirtioFsClient::v2p(ZERO_PAGE.as_ptr());
@@ -1029,6 +1341,10 @@ pub fn sys_ftruncate(args: &SyscallArgs) -> SyscallResult {
             None => return EBADF,
         }
     };
+
+    if let Err(e) = flush_file_caches(fuse_fh, fuse_nodeid) {
+        return e as SyscallResult;
+    }
 
     match crate::fs().setattr_size(fuse_nodeid, Some(fuse_fh), len as u64) {
         Ok(_) => {
@@ -1187,10 +1503,15 @@ fn fsync_common(args: &SyscallArgs, datasync: bool) -> SyscallResult {
         }
     };
     match kind {
-        FdKind::File { fuse_fh, .. } => match crate::fs().fsync(fuse_fh, datasync) {
-            Ok(()) => 0,
-            Err(e) => e as SyscallResult,
-        },
+        FdKind::File { fuse_fh, .. } => {
+            if let Err(e) = flush_write_cache(fuse_fh) {
+                return e as SyscallResult;
+            }
+            match crate::fs().fsync(fuse_fh, datasync) {
+                Ok(()) => 0,
+                Err(e) => e as SyscallResult,
+            }
+        }
         FdKind::Directory { .. } | FdKind::Console => 0,
         FdKind::Socket { .. } | FdKind::Epoll { .. } | FdKind::Pipe { .. } => EINVAL,
     }

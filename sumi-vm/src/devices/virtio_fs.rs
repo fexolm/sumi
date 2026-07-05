@@ -16,9 +16,11 @@ use super::virtio_mmio::{
     VirtioBackend, VirtqueueState, post_used, read_avail_head, read_avail_idx, read_desc,
 };
 
+const INLINE_FUSE_REQ: usize = 512;
+
 struct FuseNode {
     host_path: PathBuf,
-    _lookup_count: u64,
+    lookup_count: u64,
 }
 
 pub struct VirtioFs {
@@ -82,7 +84,7 @@ impl VirtioFs {
             // nodeid 1 = root
             Some(FuseNode {
                 host_path: share_dir.to_path_buf(),
-                _lookup_count: 1,
+                lookup_count: 1,
             }),
         ];
 
@@ -102,10 +104,19 @@ impl VirtioFs {
     }
 
     fn alloc_nodeid(&mut self, path: PathBuf) -> u64 {
+        for (nodeid, slot) in self.nodes.iter_mut().enumerate().skip(1) {
+            if let Some(node) = slot
+                && node.host_path == path
+            {
+                node.lookup_count = node.lookup_count.saturating_add(1);
+                return nodeid as u64;
+            }
+        }
+
         let nodeid = self.nodes.len() as u64;
         self.nodes.push(Some(FuseNode {
             host_path: path,
-            _lookup_count: 1,
+            lookup_count: 1,
         }));
         nodeid
     }
@@ -172,18 +183,29 @@ impl VirtioFs {
 
         // Read FUSE request from first readable buffer
         let (req_addr, req_len) = readable_bufs[0];
-        let mut req_data = vec![0u8; req_len as usize];
-        mem.read_slice(&mut req_data, GuestAddress(req_addr))
-            .unwrap();
+        let req_len = req_len as usize;
 
-        if req_data.len() < core::mem::size_of::<FuseInHeader>() {
+        if req_len < core::mem::size_of::<FuseInHeader>() {
             return 0;
         }
 
+        if req_len <= INLINE_FUSE_REQ {
+            let mut req_data = [0u8; INLINE_FUSE_REQ];
+            let req_data = &mut req_data[..req_len];
+            mem.read_slice(req_data, GuestAddress(req_addr)).unwrap();
+
+            // SAFETY: req_data is large enough for FuseInHeader, and the struct is repr(C).
+            let header = unsafe { &*(req_data.as_ptr() as *const FuseInHeader) };
+            return self.dispatch_fuse(header, req_data, readable_bufs, writable_bufs, mem);
+        }
+
+        let mut req_data = vec![0u8; req_len];
+        mem.read_slice(&mut req_data, GuestAddress(req_addr))
+            .unwrap();
+
         // SAFETY: req_data is large enough for FuseInHeader, and the struct is repr(C).
         let header = unsafe { &*(req_data.as_ptr() as *const FuseInHeader) };
-
-        self.dispatch_fuse(header, &req_data, &readable_bufs, &writable_bufs, mem)
+        self.dispatch_fuse(header, &req_data, readable_bufs, writable_bufs, mem)
     }
 
     fn dispatch_fuse(
@@ -1095,8 +1117,10 @@ impl VirtioFs {
 
     fn handle_forget(&mut self, header: &FuseInHeader, _req_data: &[u8]) {
         let nodeid = header.nodeid as usize;
-        if nodeid < self.nodes.len() && nodeid > 1 {
-            self.nodes[nodeid] = None;
+        if let Some(Some(node)) = self.nodes.get_mut(nodeid)
+            && nodeid > 1
+        {
+            node.lookup_count = node.lookup_count.saturating_sub(1);
         }
     }
 

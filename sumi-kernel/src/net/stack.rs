@@ -21,8 +21,8 @@ pub const EPHEMERAL_LO: u16 = 49152;
 pub const EPHEMERAL_HI: u16 = 65535;
 
 /// TCP socket buffer sizes.
-pub const TCP_RX: usize = 64 * 1024;
-pub const TCP_TX: usize = 64 * 1024;
+pub const TCP_RX: usize = 256 * 1024;
+pub const TCP_TX: usize = 256 * 1024;
 
 /// smoltcp monotonic clock shim: guest monotonic nanoseconds -> smoltcp
 /// microseconds. `Instant` is a signed microsecond count, which comfortably

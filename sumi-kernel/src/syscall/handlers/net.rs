@@ -7,6 +7,7 @@
 //! mirrors `sched::futex`'s block/wake protocol.
 
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -14,8 +15,35 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::fs::{FdKind, FileDescriptor};
 use crate::net::{self, Wait, net_wait, socket};
+use crate::sched::thread::ThreadState;
 use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
+
+enum AcceptedStream {
+    Tcp(SocketHandle, Option<IpEndpoint>),
+    Loopback(usize),
+}
+
+fn local_listener(g: &net::NetState, ep: IpEndpoint) -> Option<usize> {
+    let is_loopback = match ep.addr {
+        IpAddress::Ipv4(addr) => addr.octets()[0] == 127,
+        IpAddress::Ipv6(_) => false,
+    };
+    if !is_loopback {
+        return None;
+    }
+
+    g.socktab.iter().enumerate().find_map(|(id, slot)| {
+        let obj = slot.as_ref()?;
+        if matches!(obj.role, socket::SockRole::Listener)
+            && obj.local.is_some_and(|local| local.port == ep.port)
+        {
+            Some(id)
+        } else {
+            None
+        }
+    })
+}
 
 /// Resolve a socket fd to its `net::NetState::socktab` id. Runs entirely
 /// under `FD_TABLE`, which is dropped before the caller touches `NET`
@@ -81,6 +109,8 @@ pub fn sys_socket(args: &SyscallArgs) -> SyscallResult {
         role: socket::SockRole::Stream,
         handle: None,
         backlog: Vec::new(),
+        loopback: None,
+        pending_loopback: Vec::new(),
         local: None,
         listen_ep: None,
     });
@@ -179,7 +209,7 @@ pub fn sys_accept4(args: &SyscallArgs) -> SyscallResult {
     let addrlen_ptr = args.arg2;
     let uflags = args.arg3 as u32;
 
-    let mut accepted: Option<(SocketHandle, Option<IpEndpoint>)> = None;
+    let mut accepted: Option<AcceptedStream> = None;
 
     let check = |g: &mut net::NetState| -> Wait {
         let Some(obj) = g.socket_get(listener_id) else {
@@ -187,6 +217,12 @@ pub fn sys_accept4(args: &SyscallArgs) -> SyscallResult {
         };
         if !matches!(obj.role, socket::SockRole::Listener) {
             return Wait::Ready(EINVAL);
+        }
+        if !obj.pending_loopback.is_empty() {
+            let obj = g.socket_get_mut(listener_id).expect("checked above");
+            let stream = obj.pending_loopback.remove(0);
+            accepted = Some(AcceptedStream::Loopback(stream));
+            return Wait::Ready(0);
         }
         let pos = obj
             .backlog
@@ -218,7 +254,7 @@ pub fn sys_accept4(args: &SyscallArgs) -> SyscallResult {
             .push(refill_handle);
 
         let remote = g.sockets.get::<tcp::Socket>(handle).remote_endpoint();
-        accepted = Some((handle, remote));
+        accepted = Some(AcceptedStream::Tcp(handle, remote));
         Wait::Ready(0)
     };
 
@@ -226,19 +262,29 @@ pub fn sys_accept4(args: &SyscallArgs) -> SyscallResult {
     if r < 0 {
         return r;
     }
-    let Some((handle, remote)) = accepted else {
+    let Some(accepted) = accepted else {
         // Ready(0) is only ever returned alongside `accepted` being set.
         return EAGAIN;
     };
 
     let nonblocking = uflags & socket::SOCK_NONBLOCK != 0;
+    let (handle, loopback, remote) = match accepted {
+        AcceptedStream::Tcp(handle, remote) => (Some(handle), None, remote),
+        AcceptedStream::Loopback(stream) => (
+            None,
+            Some(stream),
+            Some(IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 0)),
+        ),
+    };
     let new_id = net::lock().socket_alloc(socket::SocketObject {
         domain: socket::AF_INET,
         typ: socket::SOCK_STREAM,
         nonblocking,
         role: socket::SockRole::Stream,
-        handle: Some(handle),
+        handle,
         backlog: Vec::new(),
+        loopback,
+        pending_loopback: Vec::new(),
         local: None,
         listen_ep: None,
     });
@@ -292,10 +338,24 @@ pub fn sys_connect(args: &SyscallArgs) -> SyscallResult {
         let Some(obj) = g.socket_get(id) else {
             return EBADF;
         };
-        if obj.handle.is_some() {
+        if obj.handle.is_some() || obj.loopback.is_some() {
             return EISCONN;
         }
         let nonblocking = obj.nonblocking;
+
+        if let Some(listener_id) = local_listener(&g, ep) {
+            let (client_stream, server_stream) = g.loopback_pair();
+            let obj = g.socket_get_mut(id).expect("checked above");
+            obj.loopback = Some(client_stream);
+            obj.role = socket::SockRole::Stream;
+            g.socket_get_mut(listener_id)
+                .expect("listener id came from socktab")
+                .pending_loopback
+                .push(server_stream);
+            g.wake_waiters();
+            return 0;
+        }
+
         let lport = g.alloc_ephemeral();
         let mut s = socket::new_tcp();
         match s.connect(g.iface.context(), ep, lport) {
@@ -318,6 +378,9 @@ pub fn sys_connect(args: &SyscallArgs) -> SyscallResult {
         let Some(obj) = g.socket_get(id) else {
             return Wait::Ready(EBADF);
         };
+        if obj.loopback.is_some() {
+            return Wait::Ready(0);
+        }
         let Some(h) = obj.handle else {
             return Wait::Ready(ENOTCONN);
         };
@@ -339,6 +402,26 @@ fn send_bytes(id: usize, data: &[u8], nonblocking: bool) -> i64 {
     if data.is_empty() {
         return 0;
     }
+
+    {
+        let mut g = net::lock();
+        let Some(obj) = g.socket_get(id) else {
+            return EBADF;
+        };
+        if let Some(stream_id) = obj.loopback {
+            let Some(peer_id) = g.loopback_get(stream_id).and_then(|stream| stream.peer) else {
+                return EPIPE;
+            };
+            let Some(peer) = g.loopback_get_mut(peer_id) else {
+                return EPIPE;
+            };
+            peer.push(data);
+            peer.wake_readers();
+            g.wake_waiters();
+            return data.len() as i64;
+        }
+    }
+
     let attempt = |g: &mut net::NetState| -> Wait {
         let Some(obj) = g.socket_get(id) else {
             return Wait::Ready(EBADF);
@@ -376,15 +459,64 @@ fn send_bytes(id: usize, data: &[u8], nonblocking: bool) -> i64 {
 
 /// Receive into `buf` from socket `id`, honoring `nonblocking`. Returns the
 /// number of bytes read (0 on EOF), or a negative errno.
+fn recv_loopback_bytes(id: usize, buf: &mut [u8], nonblocking: bool) -> Option<i64> {
+    loop {
+        let mut g = net::lock();
+        let Some(obj) = g.socket_get(id) else {
+            return Some(EBADF);
+        };
+        let stream_id = obj.loopback?;
+        let Some(stream) = g.loopback_get_mut(stream_id) else {
+            return Some(ENOTCONN);
+        };
+
+        let n = stream.pop_into(buf);
+        if n > 0 {
+            return Some(n as i64);
+        }
+        if stream.peer_closed {
+            return Some(0);
+        }
+        if nonblocking {
+            return Some(EAGAIN);
+        }
+
+        let me = crate::sched::current_thread();
+        stream.push_read_waiter(me);
+        me.state
+            .store(ThreadState::Blocked as u32, Ordering::Release);
+        drop(g);
+
+        crate::sched::schedule();
+    }
+}
+
 fn recv_bytes(id: usize, buf: &mut [u8], nonblocking: bool) -> i64 {
     if buf.is_empty() {
         return 0;
     }
+    if let Some(result) = recv_loopback_bytes(id, buf, nonblocking) {
+        return result;
+    }
+
     let mut attempt = |g: &mut net::NetState| -> Wait {
-        g.poll_and_wake();
         let Some(obj) = g.socket_get(id) else {
             return Wait::Ready(EBADF);
         };
+        if let Some(stream_id) = obj.loopback {
+            let Some(stream) = g.loopback_get_mut(stream_id) else {
+                return Wait::Ready(ENOTCONN);
+            };
+            let n = stream.pop_into(buf);
+            if n > 0 {
+                return Wait::Ready(n as i64);
+            }
+            return if stream.peer_closed {
+                Wait::Ready(0)
+            } else {
+                Wait::Block
+            };
+        }
         let Some(h) = obj.handle else {
             return Wait::Ready(ENOTCONN);
         };
@@ -407,7 +539,13 @@ fn recv_bytes(id: usize, buf: &mut [u8], nonblocking: bool) -> i64 {
         let mut g = net::lock();
         match attempt(&mut g) {
             Wait::Ready(v) => v,
-            Wait::Block => EAGAIN,
+            Wait::Block => {
+                g.poll_and_wake();
+                match attempt(&mut g) {
+                    Wait::Ready(v) => v,
+                    Wait::Block => EAGAIN,
+                }
+            }
         }
     } else {
         net_wait(None, 0, attempt)

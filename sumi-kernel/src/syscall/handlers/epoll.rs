@@ -175,9 +175,7 @@ fn compute_ready(
             break;
         }
         let readiness = match target {
-            EpollTarget::Socket(id) => g
-                .socket_get(id)
-                .map(|obj| socket::readiness(obj, &g.sockets)),
+            EpollTarget::Socket(id) => g.socket_readiness(id),
             EpollTarget::Pipe { id, write_end } => {
                 g.pipe_get(id).map(|p| net::pipe_readiness(p, write_end))
             }

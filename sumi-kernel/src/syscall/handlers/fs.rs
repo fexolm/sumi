@@ -8,6 +8,7 @@ use sumi_abi::stat::{
 };
 
 const O_CREAT: u32 = 0o100;
+const O_TRUNC: u32 = 0o1000;
 
 /// Read a null-terminated path from user memory. Returns slice excluding the null.
 /// Current working directory, absolute, no trailing slash (root = "/").
@@ -781,6 +782,7 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
                 }
             };
             forget_if_not_root(fs, parent_nodeid);
+            crate::syscall::handlers::io::invalidate_file_read_cache(entry.nodeid);
 
             let desc = FileDescriptor {
                 kind: FdKind::File {
@@ -828,9 +830,14 @@ pub fn sys_openat(args: &SyscallArgs) -> SyscallResult {
 
         // Capture file size at open time so mmap can bound DAX setup_mapping
         // to the actual file extent (avoids SIGBUS on past-EOF DAX accesses).
-        let size = match fs.getattr(nodeid) {
-            Ok(attr) => attr.attr.size,
-            Err(_) => 0,
+        let size = if flags & O_TRUNC != 0 {
+            crate::syscall::handlers::io::invalidate_file_read_cache(nodeid);
+            0
+        } else {
+            match fs.getattr(nodeid) {
+                Ok(attr) => attr.attr.size,
+                Err(_) => 0,
+            }
         };
 
         let desc = FileDescriptor {
