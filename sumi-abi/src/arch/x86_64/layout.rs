@@ -88,6 +88,10 @@ pub const VIRTIO_FS_MMIO: PhysicalAddr = VIRTIO_MMIO_BASE;
 pub const VIRTIO_CONSOLE_MMIO: PhysicalAddr =
     PhysicalAddr::new(VIRTIO_MMIO_BASE.as_u64() as usize + VIRTIO_MMIO_STRIDE);
 
+/// Device 2 = virtio-net.
+pub const VIRTIO_NET_MMIO: PhysicalAddr =
+    PhysicalAddr::new(VIRTIO_MMIO_BASE.as_u64() as usize + 2 * VIRTIO_MMIO_STRIDE);
+
 /// Base physical address of the DAX shared memory window.
 pub const DAX_WINDOW_BASE: PhysicalAddr = PhysicalAddr::new(0x20_0000_0000);
 

@@ -5,10 +5,12 @@
 //! lock (`NetState`), and exposes a plain `poll()` that advances the stack
 //! and wakes blocked threads whose sockets became ready.
 //!
-//! Phase 1 runs entirely over an in-guest Ethernet loopback device (no
-//! virtio-net, no host networking) to validate the socket + epoll syscall
-//! layer in isolation. `docs/networking-design.md` R2 covers the ARP-to-self
-//! loopback handshake this implies.
+//! `NetStateInner<D>` is generic over the device: production runs over
+//! `device::VirtioNetDevice` (`NetState`, Phase 2, real guest<->host
+//! networking through the host userspace gateway), while host unit tests
+//! run over smoltcp's own `Loopback` (`TestNetState`) to validate the
+//! socket + epoll syscall layer without KVM. `docs/networking-design.md` R2
+//! covers the ARP-to-self loopback handshake the test device implies.
 //!
 //! ## Locking (see the plan's "blocking / wakeup contract")
 //! Three locks exist: `FD_TABLE`, `NET` (this module's global), and the
@@ -25,6 +27,7 @@
 //! its bucket locks.
 
 mod abi;
+pub mod device;
 pub mod epoll;
 pub mod socket;
 pub mod stack;
@@ -33,7 +36,7 @@ pub mod wait;
 use alloc::vec::Vec;
 
 use smoltcp::iface::{Interface, PollResult, SocketSet};
-use smoltcp::phy::Loopback;
+use smoltcp::phy::Device;
 
 pub use abi::{EpollEvent, parse_sockaddr, read_epoll_event, write_epoll_event, write_sockaddr};
 pub use epoll::EpollInstance;
@@ -41,32 +44,54 @@ pub use socket::SocketObject;
 pub use stack::now;
 pub use wait::{Wait, net_wait};
 
-/// Loopback poll iterations per `poll_and_wake` call. `Loopback::transmit`
-/// enqueues one frame and `receive` drains one at a time, so a full TCP
-/// handshake (SYN, SYN-ACK, ACK, ...) needs several `iface.poll()` calls;
-/// looping until `PollResult::None` drives it to completion within one lock
-/// acquisition (see docs/networking-design.md R3).
+use device::{PollDevice, VirtioNetDevice};
+
+/// Device poll iterations per `poll_and_wake` call. A device only enqueues
+/// or drains one frame per `iface.poll()` call, so a full TCP handshake
+/// (SYN, SYN-ACK, ACK, ...) needs several calls; looping a fixed count
+/// drives it to completion within one lock acquisition (see
+/// docs/networking-design.md R3).
 const NET_POLL_ITERS: usize = 32;
 
-pub struct NetState {
+/// The global net state, generic over the device backing the smoltcp
+/// `Interface`. Production uses `VirtioNetDevice` (see the `NetState`
+/// alias below); host unit tests use smoltcp's own `Loopback` (see
+/// `TestNetState`) — the refactor from a hardcoded `Loopback` field to this
+/// generic struct must be behavior-preserving, which is exactly what the
+/// Phase 1 loopback unit tests (unchanged) prove.
+pub struct NetStateInner<D> {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
-    pub device: Loopback,
+    pub device: D,
     pub socktab: Vec<Option<SocketObject>>,
     pub epolltab: Vec<Option<EpollInstance>>,
     pub waiters: wait::WaitQueue,
     pub next_ephemeral: u16,
 }
 
+/// Production net state: virtio-net backed.
+pub type NetState = NetStateInner<VirtioNetDevice>;
+
+/// Host-test net state: smoltcp's in-guest `Loopback` device, no virtio.
+#[cfg(test)]
+pub type TestNetState = NetStateInner<smoltcp::phy::Loopback>;
+
 /// Global net state, published once by `init()`. A plain `spin::Mutex` is
 /// correct without IRQ-disable — see the module doc comment.
 static NET: spin::Once<spin::Mutex<NetState>> = spin::Once::new();
 
-/// Build the Phase 1 loopback stack and publish it. Must run after
-/// `exec::read_boot_info()` (so `RNG_SEED` is available for the TCP
-/// sequence-number seed) and before `KERNEL_READY` is published.
+/// Probe and build the Phase 2 virtio-net stack and publish it. Must run
+/// after `exec::read_boot_info()` (so `RNG_SEED` is available for the TCP
+/// sequence-number seed) and before `KERNEL_READY` is published. A no-op
+/// (with a log line) if virtio-net is absent — sockets syscalls then see
+/// `NET` uninitialized, same as if `init()` were never called.
 pub fn init() {
-    NET.call_once(|| spin::Mutex::new(NetState::new()));
+    match NetState::new() {
+        Some(st) => {
+            NET.call_once(|| spin::Mutex::new(st));
+        }
+        None => crate::kprintln!("[net] virtio-net absent"),
+    }
 }
 
 /// Timer-tick hook: advance the stack and wake anyone whose socket became
@@ -95,8 +120,30 @@ pub fn close_epoll(id: usize) {
 }
 
 impl NetState {
-    fn new() -> Self {
-        let (iface, device, sockets) = stack::build();
+    /// Probe the virtio-net device and build the Phase 2 stack around it.
+    /// `None` if the device is absent — `net::init()` then leaves `NET`
+    /// unpublished.
+    fn new() -> Option<Self> {
+        let mut device = VirtioNetDevice::init(&crate::KERNEL_ALLOCATOR)?;
+        let (iface, sockets) = stack::build_virtio(&mut device);
+        Some(Self {
+            iface,
+            sockets,
+            device,
+            socktab: Vec::new(),
+            epolltab: Vec::new(),
+            waiters: wait::WaitQueue::new(),
+            next_ephemeral: stack::EPHEMERAL_LO,
+        })
+    }
+}
+
+#[cfg(test)]
+impl TestNetState {
+    /// Host-test constructor: builds the Phase 1 loopback stack directly
+    /// (no scheduler, no boot sequence, no virtio probing).
+    pub fn new_loopback() -> Self {
+        let (iface, device, sockets) = stack::build_loopback();
         Self {
             iface,
             sockets,
@@ -107,14 +154,9 @@ impl NetState {
             next_ephemeral: stack::EPHEMERAL_LO,
         }
     }
+}
 
-    /// Host-test constructor: same as `new()`, but named for call-site
-    /// clarity in `#[cfg(test)]` code (no scheduler, no boot sequence).
-    #[cfg(test)]
-    pub fn new_loopback() -> Self {
-        Self::new()
-    }
-
+impl<D> NetStateInner<D> {
     /// Allocate the lowest free socket id, matching `FdTable::alloc`.
     pub fn socket_alloc(&mut self, o: SocketObject) -> usize {
         for (i, slot) in self.socktab.iter_mut().enumerate() {
@@ -186,7 +228,9 @@ impl NetState {
         };
         p
     }
+}
 
+impl<D: Device + PollDevice> NetStateInner<D> {
     /// Advance the stack and wake every waiter (level-triggered: each
     /// re-checks its own readiness on resume). Called before every
     /// blocking-or-not readiness check (`wait::net_wait`'s poll-before-block
@@ -198,6 +242,12 @@ impl NetState {
     /// syscall handlers (`syscall::handlers::net`, `::epoll`) call this
     /// directly after mutating a socket (see e.g. `sys_listen`,
     /// `sys_connect`) rather than re-locking `NET` through `net::poll()`.
+    ///
+    /// `device.pre_poll()` runs once per call, before the poll loop: for
+    /// `VirtioNetDevice` this rings the RX queue's doorbell exactly once
+    /// per `poll_and_wake` (not once per `receive()`), which is the RX
+    /// pull handshake Phase 2 relies on in place of a host->guest IRQ (see
+    /// `docs/networking-design.md`). `Loopback` needs nothing here.
     ///
     /// Deviation from the original plan: `Interface::poll()` runs its
     /// ingress loop (drain whatever the device already has queued) BEFORE
@@ -213,6 +263,7 @@ impl NetState {
     /// the steady state but reliably drains a full ARP + TCP handshake.
     pub(crate) fn poll_and_wake(&mut self) {
         let now = stack::now();
+        self.device.pre_poll();
         for _ in 0..NET_POLL_ITERS {
             let _: PollResult = self.iface.poll(now, &mut self.device, &mut self.sockets);
         }
@@ -255,7 +306,7 @@ mod tests {
 
     #[test]
     fn alloc_ephemeral_wraps_within_range() {
-        let mut st = NetState::new_loopback();
+        let mut st = TestNetState::new_loopback();
         st.next_ephemeral = stack::EPHEMERAL_HI;
         assert_eq!(st.alloc_ephemeral(), stack::EPHEMERAL_HI);
         assert_eq!(st.alloc_ephemeral(), stack::EPHEMERAL_LO);
@@ -265,7 +316,7 @@ mod tests {
 
     #[test]
     fn socket_alloc_reuses_freed_slots() {
-        let mut st = NetState::new_loopback();
+        let mut st = TestNetState::new_loopback();
         let id0 = st.socket_alloc(listener_obj());
         st.socket_free(id0);
         let id1 = st.socket_alloc(listener_obj());
@@ -274,7 +325,7 @@ mod tests {
 
     #[test]
     fn socket_free_removes_backlog_handles() {
-        let mut st = NetState::new_loopback();
+        let mut st = TestNetState::new_loopback();
         let h = st.sockets.add(new_tcp());
         let mut obj = listener_obj();
         obj.backlog.push(h);
@@ -290,7 +341,7 @@ mod tests {
     /// completion).
     #[test]
     fn end_to_end_listen_connect_echo() {
-        let mut st = NetState::new_loopback();
+        let mut st = TestNetState::new_loopback();
         let port = 3456u16;
         let listen_ep = IpListenEndpoint::from((IpAddress::v4(127, 0, 0, 1), port));
 

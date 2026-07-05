@@ -50,6 +50,47 @@ pub const VIRTIO_DEVICE_FS: u32 = 26;
 /// VirtIO device ID for console.
 pub const VIRTIO_DEVICE_CONSOLE: u32 = 3;
 
+/// VirtIO device ID for network cards.
+pub const VIRTIO_DEVICE_NET: u32 = 1;
+
+/// Device offers a permanent MAC address in config space (`VirtioNetHdr`'s
+/// wire format is independent of this bit; it only gates whether `mac` in
+/// the device config region is meaningful).
+pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+/// Device supports merging multiple RX buffers into one packet. Not offered
+/// by sumi's backend — the driver always uses one fixed-size RX buffer per
+/// packet, so the 12-byte `virtio_net_hdr` header is always exactly 12
+/// bytes (`num_buffers` is present but unused).
+pub const VIRTIO_NET_F_MRG_RXBUF: u64 = 1 << 15;
+/// Bit 32 of the feature space: negotiate the VirtIO 1.0+ ("modern") device
+/// model. Required so both sides agree the header is the fixed 12-byte
+/// `VirtioNetHdr` (legacy virtio-net without VERSION_1 can omit
+/// `num_buffers` when MRG_RXBUF is off, shrinking the header to 10 bytes).
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+/// Fixed size of the `virtio_net_hdr` prepended to every guest<->host
+/// Ethernet frame (VERSION_1 device model — see `VIRTIO_F_VERSION_1`).
+pub const VIRTIO_NET_HDR_LEN: usize = 12;
+
+/// `struct virtio_net_hdr` (virtio spec v1.2, section 5.1.6.1), VERSION_1
+/// layout (always 12 bytes, regardless of `VIRTIO_NET_F_MRG_RXBUF`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VirtioNetHdr {
+    pub flags: u8,
+    pub gso_type: u8,
+    pub hdr_len: u16,
+    pub gso_size: u16,
+    pub csum_start: u16,
+    pub csum_offset: u16,
+    pub num_buffers: u16,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<VirtioNetHdr>() == VIRTIO_NET_HDR_LEN,
+    "VirtioNetHdr must match the wire format's fixed 12-byte VERSION_1 header",
+);
+
 /// Vendor ID for sumi.
 pub const SUMI_VENDOR_ID: u32 = 0x554D4953;
 

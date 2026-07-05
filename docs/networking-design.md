@@ -237,22 +237,39 @@ syscall + smoltcp + scheduler-blocking layer in isolation.
   bidirectional echo, verifies the round-trip, and `pass!()`es. This is the
   "test program using TCP sockets and epoll" milestone.
 
-### Phase 2 — virtio-net driver + host TAP backend + IRQ injection
-Give the guest real external reachability.
-- Guest `VirtioNetDevice` implementing smoltcp's `Device` over RX/TX
-  virtqueues; enable interrupt-driven RX (clear `NO_INTERRUPT` on the RX
-  queue), add a net-device IRQ vector + handler that runs `net::poll`.
-- Host `VirtioNet` backend (`sumi-vm/src/devices/virtio_net.rs`) bridging L2
-  frames to a host **TAP** device; a host background thread does
-  epoll(tapfd)→inject guest IRQ (`KVM_IRQ_LINE`/MSI) so RX wakes the guest.
-  (Host→guest IRQ injection is new infra; today only the LAPIC timer and IPIs
-  exist.)
-- Config: guest static IP + gateway; document the host `tap0` setup. Net
-  integration tests gate on TAP availability the way current tests gate on
-  `/dev/kvm`. TAP needs `CAP_NET_ADMIN`; a user-mode/slirp backend is a
-  possible future no-privilege alternative.
-- **Deliverable:** a host TCP client connects to a guest echo server listening
-  on the guest IP and gets its bytes echoed.
+### Phase 2 — virtio-net driver + userspace host gateway (no root, no IRQ)
+Give the guest real external reachability. Two environment realities shaped
+this away from the original TAP+IRQ sketch:
+
+- **No `CAP_NET_ADMIN`** in the dev/CI environment (and `sudo` is
+  interactive), so a TAP device cannot be created autonomously. The host
+  backend is therefore a **userspace gateway** (the QEMU "user net"/slirp
+  model), which needs no privileges and works anywhere.
+- **No host→guest IRQ needed for correctness.** `timer_interrupt()` already
+  calls `net::poll()` every tick, so the guest drains the virtio-net **RX
+  queue on each timer tick** (and on every socket syscall). A blocked thread
+  is woken within one tick (~1 ms) when its data arrives. Interrupt-driven RX
+  (clearing `NO_INTERRUPT` + a device IRQ vector + KVM IRQ injection) is
+  deferred to a later latency optimization — it is not required to function.
+
+Components:
+- Guest `net/device.rs::VirtioNetDevice` implementing smoltcp's `Device` over
+  RX/TX virtqueues (reuse `drivers/virtio` mmio/virtqueue infra). Production
+  `NetState` uses it; host unit tests keep `Loopback`. Guest static IP
+  `10.0.2.15/24`, gateway `10.0.2.2`. `Device::transmit` enqueues a frame on
+  TX + notifies host; `Device::receive` pops from RX; both driven by
+  `net::poll`.
+- Host `sumi-vm/src/devices/virtio_net.rs`: virtio-net backend. On a TX
+  notify it drains guest frames into the gateway; it fills the RX queue from
+  the gateway.
+- Host gateway (`slirp`-lite, smoltcp on the host `std` side): answers ARP for
+  the gateway IP, and does bidirectional TCP port forwarding between real host
+  sockets and guest TCP endpoints. `--hostfwd tcp:HOSTIP:HOSTPORT-GUESTIP:GUESTPORT`
+  on `sumi-vm run`. This is what lets a real client (eventually the `mysql`
+  client) reach a guest server on a forwarded host port.
+- **Deliverable:** a host TCP client connects to a forwarded port and a guest
+  echo server round-trips its bytes (and/or the guest connects out to a host
+  peer), verified by an integration test that needs no root.
 
 ### Phase 3 — Broaden socket/syscall coverage for mysqld
 Driven by actually launching mysqld and fixing what it hits.

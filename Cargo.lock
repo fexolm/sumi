@@ -335,6 +335,8 @@ dependencies = [
  "cfg-if",
  "defmt 0.3.100",
  "heapless",
+ "libc",
+ "log",
  "managed",
 ]
 
@@ -390,6 +392,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "num_cpus",
+ "smoltcp",
  "sumi-abi",
  "thiserror",
  "vm-memory",

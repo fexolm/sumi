@@ -56,3 +56,15 @@ fn preempt_timer() {
 fn tcp_epoll_loopback() {
     sumi_integration_tests::run_test_smp("syscalls/tcp_epoll_loopback", 1);
 }
+
+// Virtio-net + userspace gateway echo (Phase 2a networking, see
+// docs/networking-design.md): the guest connects out to the host gateway's
+// echo peer over the real virtio-net transport (no loopback device
+// involved). Pinned to a single vCPU for the same reason as
+// `tcp_epoll_loopback` — the auto-generated #[test] is suppressed via
+// build.rs `MANUAL_SYSCALL_TESTS` because the default vCPU count comes from
+// the host's core count, not 1.
+#[test]
+fn tcp_virtio_echo() {
+    sumi_integration_tests::run_test_smp("syscalls/tcp_virtio_echo", 1);
+}

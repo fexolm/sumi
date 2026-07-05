@@ -10,6 +10,19 @@ pub trait VirtioBackend {
         queue: &VirtqueueState,
         mem: &GuestMemoryMmap<()>,
     );
+
+    /// 64-bit device feature bitmap. Defaults to "no features offered"
+    /// (matches every backend before virtio-net).
+    fn device_features(&self) -> u64 {
+        0
+    }
+
+    /// Read a 32-bit word from the device-specific config space at
+    /// `offset` (already relative to `VIRTIO_MMIO_CONFIG`). Defaults to
+    /// zero (no config space).
+    fn read_config(&self, _offset: usize) -> u32 {
+        0
+    }
 }
 
 #[derive(Default)]
@@ -120,13 +133,17 @@ impl VirtioMmioDevice {
             VIRTIO_MMIO_DEVICE_ID => self.backend.device_id(),
             VIRTIO_MMIO_VENDOR_ID => SUMI_VENDOR_ID,
             VIRTIO_MMIO_DEVICE_FEATURES => {
-                // No features for now
-                0
+                // device_features_sel selects the low (0) or high (1) 32
+                // bits of the 64-bit feature bitmap; mask to those two
+                // values so an out-of-spec selector can't shift by >= 64.
+                let shift = (self.device_features_sel & 1) * 32;
+                (self.backend.device_features() >> shift) as u32
             }
             VIRTIO_MMIO_QUEUE_NUM_MAX => QUEUE_SIZE as u32,
             VIRTIO_MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| q.ready as u32),
             VIRTIO_MMIO_STATUS => self.status,
             VIRTIO_MMIO_INTERRUPT_STATUS => 0,
+            _ if offset >= VIRTIO_MMIO_CONFIG => self.backend.read_config(offset - VIRTIO_MMIO_CONFIG),
             _ => 0,
         }
     }

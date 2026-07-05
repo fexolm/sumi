@@ -1,13 +1,19 @@
 pub mod virtio_console;
 pub mod virtio_fs;
 pub mod virtio_mmio;
+pub mod virtio_net;
 
-use sumi_abi::arch::layout::{VIRTIO_CONSOLE_MMIO, VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE};
+use std::sync::Arc;
+
+use sumi_abi::arch::layout::{
+    VIRTIO_CONSOLE_MMIO, VIRTIO_MMIO_BASE, VIRTIO_MMIO_STRIDE, VIRTIO_NET_MMIO,
+};
 use vm_memory::GuestMemoryMmap;
 
 use self::virtio_console::VirtioConsoleBackend;
 use self::virtio_fs::VirtioFs;
 use self::virtio_mmio::VirtioMmioDevice;
+use self::virtio_net::{GatewayChannel, VirtioNetBackend};
 
 pub struct DeviceRegistry {
     devices: Vec<(u64, VirtioMmioDevice)>,
@@ -19,7 +25,11 @@ unsafe impl Send for DeviceRegistry {}
 unsafe impl Sync for DeviceRegistry {}
 
 impl DeviceRegistry {
-    pub fn new(share_dir: Option<&std::path::Path>, dax_host_ptr: *mut u8) -> Self {
+    pub fn new(
+        share_dir: Option<&std::path::Path>,
+        dax_host_ptr: *mut u8,
+        net_chan: Arc<GatewayChannel>,
+    ) -> Self {
         let mut devices = Vec::new();
 
         if let Some(dir) = share_dir {
@@ -30,6 +40,12 @@ impl DeviceRegistry {
         // Console is always present
         let console_device = VirtioMmioDevice::new(Box::new(VirtioConsoleBackend::new()));
         devices.push((VIRTIO_CONSOLE_MMIO.as_u64(), console_device));
+
+        // Net is always present too — the guest driver simply finds no
+        // device there when the gateway has nothing to talk to.
+        let net_backend = VirtioNetBackend::new(net_chan, sumi_abi::net::GUEST_MAC);
+        let net_device = VirtioMmioDevice::new(Box::new(net_backend));
+        devices.push((VIRTIO_NET_MMIO.as_u64(), net_device));
 
         Self { devices }
     }

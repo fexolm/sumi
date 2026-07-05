@@ -310,6 +310,68 @@ fn status_write_and_read_round_trips() {
 
 // ── queue_sel isolation tests ─────────────────────────────────────────────
 
+// ── device_features / config-space wiring (added for virtio-net) ──────────
+
+struct FeatureBackend {
+    features: u64,
+    config: [u8; 8],
+}
+
+impl VirtioBackend for FeatureBackend {
+    fn device_id(&self) -> u32 {
+        1
+    }
+    fn num_queues(&self) -> usize {
+        2
+    }
+    fn process_queue(&mut self, _queue_idx: usize, _queue: &VirtqueueState, _mem: &GuestMemoryMmap<()>) {
+    }
+    fn device_features(&self) -> u64 {
+        self.features
+    }
+    fn read_config(&self, offset: usize) -> u32 {
+        match self.config.get(offset..offset + 4) {
+            Some(word) => u32::from_le_bytes(word.try_into().unwrap()),
+            None => 0,
+        }
+    }
+}
+
+#[test]
+fn device_features_sel_selects_low_and_high_32_bits() {
+    let backend = FeatureBackend {
+        features: 0x0000_0020_0000_0001,
+        config: [0; 8],
+    };
+    let mut device = VirtioMmioDevice::new(Box::new(backend));
+    let mem = make_mem();
+
+    device.mmio_write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0, &mem);
+    assert_eq!(device.mmio_read(VIRTIO_MMIO_DEVICE_FEATURES), 0x0000_0001);
+
+    device.mmio_write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1, &mem);
+    assert_eq!(device.mmio_read(VIRTIO_MMIO_DEVICE_FEATURES), 0x0000_0020);
+}
+
+#[test]
+fn default_device_features_is_zero() {
+    // MockBackend does not override device_features(); the trait default
+    // (0, "no features") must be what mmio_read reports.
+    let device = make_device(1);
+    assert_eq!(device.mmio_read(VIRTIO_MMIO_DEVICE_FEATURES), 0);
+}
+
+#[test]
+fn config_space_read_dispatches_to_backend_read_config() {
+    let backend = FeatureBackend {
+        features: 0,
+        config: [0x02, 0x00, 0x00, 0x00, 0x00, 0x15, 0, 0],
+    };
+    let device = VirtioMmioDevice::new(Box::new(backend));
+    assert_eq!(device.mmio_read(VIRTIO_MMIO_CONFIG), 0x0000_0002);
+    assert_eq!(device.mmio_read(VIRTIO_MMIO_CONFIG + 4), 0x0000_1500);
+}
+
 #[test]
 fn queue_sel_isolates_per_queue_settings() {
     let mut device = make_device(2);

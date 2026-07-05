@@ -7,7 +7,9 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::debug::{self, GdbServer, VCpuDebugReceiver};
 use crate::devices::DeviceRegistry;
+use crate::devices::virtio_net::GatewayChannel;
 use crate::error::{Error, Result};
+use crate::net::gateway::{self, GatewayHandle};
 use std::{
     fmt::{self, Display},
     fs::File,
@@ -267,6 +269,10 @@ pub struct SumiVm<Backend: VirtBackend + 'static> {
     gdb_port: Option<u16>,
     kernel_path: PathBuf,
     user_debug: Option<UserDebugInfo>,
+    /// The host userspace network gateway (see `net::gateway`). Always
+    /// present — the virtio-net device is always registered too, even when
+    /// no guest program uses it.
+    gateway: Option<GatewayHandle>,
 }
 
 /// No-op SIGUSR1 handler. Installed exactly once per process before
@@ -317,10 +323,13 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         backend.initialize_memory(&mem)?;
 
         let dax_host_ptr = backend.dax_host_ptr();
+        let net_chan = GatewayChannel::new();
         let devices = Arc::new(Mutex::new(DeviceRegistry::new(
             info.share_dir.as_deref(),
             dax_host_ptr,
+            Arc::clone(&net_chan),
         )));
+        let gateway = Some(gateway::spawn(net_chan));
 
         let mut vcpus = Vec::new();
         for _ in 0..info.vcpu_count {
@@ -360,16 +369,19 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             gdb_port: info.gdb_port,
             kernel_path: info.kernel_path.clone(),
             user_debug,
+            gateway,
         })
     }
 
-    pub fn run(self) -> Result<i32> {
+    pub fn run(mut self) -> Result<i32> {
         // Install the SIGUSR1 no-op handler unconditionally so it is
         // present in both the normal run path and the debug path (which
         // may call self.run() after detach).
         install_sigusr1_handler_once()?;
 
-        if let Some(port) = self.gdb_port {
+        let gateway = self.gateway.take();
+
+        let result = if let Some(port) = self.gdb_port {
             // Capture GDB launch info before moving fields out of self.
             let kernel_path = self.kernel_path.clone();
             let user_debug = self.user_debug.clone();
@@ -503,19 +515,26 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
                     }
                 }
             }
-            if let Some(e) = first_err {
-                return Err(e);
+            match first_err {
+                Some(e) => Err(e),
+                None => {
+                    // Return the guest exit code if HC_SHUTDOWN was called,
+                    // else 0 (BSP halted without a hypercall).
+                    let code = if hc_ctx.shutdown.load(Ordering::Acquire) {
+                        hc_ctx.exit_code.load(Ordering::Acquire)
+                    } else {
+                        0
+                    };
+                    Ok(code)
+                }
             }
+        };
 
-            // Return the guest exit code if HC_SHUTDOWN was called, else 0
-            // (BSP halted without a hypercall).
-            let code = if hc_ctx.shutdown.load(Ordering::Acquire) {
-                hc_ctx.exit_code.load(Ordering::Acquire)
-            } else {
-                0
-            };
-            Ok(code)
+        if let Some(g) = gateway {
+            g.shutdown();
         }
+
+        result
     }
 
     /// Look up the virtual address of a symbol in the kernel ELF's

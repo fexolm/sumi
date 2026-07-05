@@ -14,6 +14,7 @@ vm-memory = { version = "0.18", features = ["backend-mmap"] }
 goblin = { version = "0.10.5" }
 libc = "0.2"
 num_cpus = "1.16"
+smoltcp = { version = "0.13", features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = "0.14"

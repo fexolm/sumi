@@ -110,7 +110,7 @@ mod tests {
     /// handle becomes the "accepted" connection in place (smoltcp has no
     /// separate accept() socket — see the module doc comment).
     fn established_pair() -> (SocketSet<'static>, SocketHandle, SocketHandle) {
-        let (mut iface, mut device, mut sockets) = stack::build();
+        let (mut iface, mut device, mut sockets) = stack::build_loopback();
         let ep = IpListenEndpoint::from((IpAddress::v4(127, 0, 0, 1), 4242u16));
 
         let mut listener = new_tcp();
