@@ -70,7 +70,7 @@ fn flush_write_cache_entry(entry: &mut WriteCache) -> Result<(), i32> {
     Ok(())
 }
 
-fn flush_write_cache(fh: u64) -> Result<(), i32> {
+pub(crate) fn flush_write_cache(fh: u64) -> Result<(), i32> {
     let mut cache = FILE_IO_CACHE.lock();
     if let Some(idx) = cache.writes.iter().position(|entry| entry.fh == fh) {
         let result = flush_write_cache_entry(&mut cache.writes[idx]);
@@ -81,6 +81,15 @@ fn flush_write_cache(fh: u64) -> Result<(), i32> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn flush_all_write_caches() -> Result<(), i32> {
+    let mut cache = FILE_IO_CACHE.lock();
+    while !cache.writes.is_empty() {
+        flush_write_cache_entry(&mut cache.writes[0])?;
+        cache.writes.remove(0);
+    }
+    Ok(())
 }
 
 fn invalidate_read_cache_locked(cache: &mut FileIoCache, nodeid: u64) {

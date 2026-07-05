@@ -7,7 +7,7 @@ use crate::exec::{align_up_2mb, zero_page};
 use crate::fs::FdKind;
 use crate::memory::vma::{MappingBacking, Vma};
 use crate::syscall::errno::*;
-use crate::syscall::handlers::io::fs_transfer_chunked;
+use crate::syscall::handlers::io::{flush_write_cache, fs_transfer_chunked};
 use crate::syscall::{SyscallArgs, SyscallResult};
 
 mod memory_fixed_anon;
@@ -172,6 +172,10 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
         }
     };
 
+    if let Err(e) = flush_write_cache(fuse_fh) {
+        return e as SyscallResult;
+    }
+
     // Bytes of file content actually available from `file_page_offset`.
     // Used to (a) bound how many bytes private_copy_path reads via FUSE_READ,
     // and (b) decide whether DAX is safe — DAX must not extend past EOF or
@@ -241,6 +245,10 @@ pub fn sys_mmap(args: &SyscallArgs) -> SyscallResult {
 /// into an already-reserved address range). Does not modify VMA table — pages are
 /// tracked by the reservation VMA from the initial mmap.
 fn map_fixed_file(addr: u64, len: usize, fuse_fh: u64, offset: usize) -> SyscallResult {
+    if let Err(e) = flush_write_cache(fuse_fh) {
+        return e as SyscallResult;
+    }
+
     // Overflow check: addr + len must not wrap.
     let end_addr = match addr.checked_add(len as u64) {
         Some(e) => e,

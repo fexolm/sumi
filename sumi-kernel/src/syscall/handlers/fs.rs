@@ -133,6 +133,10 @@ fn forget_if_not_root(fs: &crate::fs::virtio_fs::VirtioFsClient, nodeid: u64) {
 
 /// Internal stat-by-path implementation shared by stat, lstat, newfstatat.
 fn do_stat_path(path: &[u8], buf_addr: u64) -> SyscallResult {
+    if let Err(e) = crate::syscall::handlers::io::flush_all_write_caches() {
+        return e as SyscallResult;
+    }
+
     let fs = crate::fs();
 
     let nodeid = match fs.resolve_path(path) {
@@ -167,13 +171,16 @@ pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
     let fd_num = args.arg0 as usize;
     let buf_addr = args.arg1;
 
-    let nodeid = {
+    let (nodeid, file_fh) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(d) => match d.kind {
-                FdKind::File { fuse_nodeid, .. } | FdKind::Directory { fuse_nodeid, .. } => {
-                    fuse_nodeid
-                }
+                FdKind::File {
+                    fuse_fh,
+                    fuse_nodeid,
+                    ..
+                } => (fuse_nodeid, Some(fuse_fh)),
+                FdKind::Directory { fuse_nodeid, .. } => (fuse_nodeid, None),
                 FdKind::Console => {
                     // Console fds: return a minimal stat with char device mode
                     let stat = Stat {
@@ -255,6 +262,12 @@ pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
             None => return EBADF,
         }
     };
+
+    if let Some(fh) = file_fh
+        && let Err(e) = crate::syscall::handlers::io::flush_write_cache(fh)
+    {
+        return e as SyscallResult;
+    }
 
     let fs = crate::fs();
 

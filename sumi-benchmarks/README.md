@@ -43,6 +43,52 @@ under another name in a single invocation. To save the guest run as a separate
 baseline too, run the VM command a second time with
 `-- --bench --save-baseline vm`.
 
+## Hostfwd TCP benchmark
+
+`vm_compare`'s `tcp_loopback/*` group is intentionally an in-process
+loopback benchmark. Inside `sumi-vm` it exercises the guest-local fast
+loopback path and is useful for scheduler/socket syscall regressions, but it
+does **not** measure the real host client -> host TCP socket -> userspace
+gateway -> virtio-net -> guest TCP server datapath.
+
+For that path, build the standalone hostfwd benchmark as a static ELF:
+
+```bash
+cargo build -p sumi-benchmarks --target x86_64-unknown-linux-musl --release --bin hostfwd_tcp
+cargo build -p sumi-kernel --target x86_64-unknown-none --release
+cargo build -p sumi-vm
+```
+
+Run a host-only TCP loopback baseline:
+
+```bash
+target/x86_64-unknown-linux-musl/release/hostfwd_tcp host-baseline \
+  --host-port 19101 \
+  --payload-bytes 4096 \
+  --warmup-rounds 32 \
+  --rounds 1000
+```
+
+Run the same client against a guest echo server through `--hostfwd`:
+
+```bash
+target/x86_64-unknown-linux-musl/release/hostfwd_tcp hostfwd \
+  --vm target/debug/sumi-vm \
+  --kernel target/x86_64-unknown-none/release/sumi-kernel \
+  --guest-bin "$PWD/target/x86_64-unknown-linux-musl/release/hostfwd_tcp" \
+  --host-port 19102 \
+  --guest-port 9102 \
+  --payload-bytes 4096 \
+  --warmup-rounds 32 \
+  --rounds 1000
+```
+
+This binary is both the host harness and the guest server. The guest side uses
+non-blocking sockets plus `epoll`, matching the currently covered hostfwd
+server path. `std::net::set_nonblocking()` is intentionally avoided because it
+uses an ioctl path that sumi does not support yet; the benchmark sets
+`O_NONBLOCK` with `fcntl`.
+
 Useful knobs:
 
 - `SUMI_BENCH_FIB_STEPS` controls sequential Fibonacci steps, one freshly
