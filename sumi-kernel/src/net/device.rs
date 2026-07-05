@@ -16,7 +16,9 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken as SmolRxToken, TxToken as SmolTxToken};
+use smoltcp::phy::{
+    Device, DeviceCapabilities, Medium, RxToken as SmolRxToken, TxToken as SmolTxToken,
+};
 use smoltcp::time::Instant;
 
 use sumi_abi::{
@@ -31,6 +33,15 @@ use crate::memory::alloc::kmalloc::KernelAllocator;
 const RX_COUNT: usize = 64;
 const RX_BUF_SIZE: usize = 2048;
 const TX_BUF_SIZE: usize = 2048;
+const ETH_HDR_LEN: usize = 14;
+const ETH_DST_OFF: usize = 0;
+const ETH_TYPE_OFF: usize = 12;
+const ETH_TYPE_IPV4: u16 = 0x0800;
+const ETH_TYPE_ARP: u16 = 0x0806;
+const ETH_BROADCAST: [u8; 6] = [0xff; 6];
+const IPV4_DST_OFF: usize = ETH_HDR_LEN + 16;
+const ARP_TARGET_PROTO_OFF: usize = ETH_HDR_LEN + 24;
+const LOOPBACK_NET: u8 = 127;
 
 /// Guest-side virtio-net driver. Owns two virtqueues (0 = RX, 1 = TX), a
 /// contiguous RX buffer pool, and a single reused TX buffer + descriptor
@@ -116,7 +127,11 @@ impl VirtioNetDevice {
             mmio::write32(mmio_base, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
             mmio::write32(mmio_base, VIRTIO_MMIO_DRIVER_FEATURES, accept as u32);
             mmio::write32(mmio_base, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
-            mmio::write32(mmio_base, VIRTIO_MMIO_DRIVER_FEATURES, (accept >> 32) as u32);
+            mmio::write32(
+                mmio_base,
+                VIRTIO_MMIO_DRIVER_FEATURES,
+                (accept >> 32) as u32,
+            );
 
             mmio::write32(
                 mmio_base,
@@ -230,6 +245,44 @@ impl VirtioNetDevice {
         self.mac
     }
 
+    fn is_local_ip(ip: [u8; 4]) -> bool {
+        ip[0] == LOOPBACK_NET || ip == sumi_abi::net::GUEST_IP
+    }
+
+    fn is_self_directed_frame(&self, frame: &[u8]) -> bool {
+        if frame.len() < ETH_HDR_LEN {
+            return false;
+        }
+
+        let dst = &frame[ETH_DST_OFF..ETH_DST_OFF + 6];
+        if dst == self.mac {
+            return true;
+        }
+
+        let eth_type = u16::from_be_bytes([frame[ETH_TYPE_OFF], frame[ETH_TYPE_OFF + 1]]);
+        match eth_type {
+            ETH_TYPE_IPV4 if frame.len() >= IPV4_DST_OFF + 4 => {
+                let dst_ip = [
+                    frame[IPV4_DST_OFF],
+                    frame[IPV4_DST_OFF + 1],
+                    frame[IPV4_DST_OFF + 2],
+                    frame[IPV4_DST_OFF + 3],
+                ];
+                Self::is_local_ip(dst_ip)
+            }
+            ETH_TYPE_ARP if dst == ETH_BROADCAST && frame.len() >= ARP_TARGET_PROTO_OFF + 4 => {
+                let target_ip = [
+                    frame[ARP_TARGET_PROTO_OFF],
+                    frame[ARP_TARGET_PROTO_OFF + 1],
+                    frame[ARP_TARGET_PROTO_OFF + 2],
+                    frame[ARP_TARGET_PROTO_OFF + 3],
+                ];
+                Self::is_local_ip(target_ip)
+            }
+            _ => false,
+        }
+    }
+
     fn to_virt(&self, paddr: u64) -> VirtualAddr {
         VirtualAddr::new(self.dm_offset + paddr as usize)
     }
@@ -307,7 +360,11 @@ impl<'a> SmolTxToken for VirtioTxToken<'a> {
         let result = f(buf);
 
         // Self-loopback copy — see the `loopback` field doc comment.
+        let local_only = dev.is_self_directed_frame(buf);
         dev.loopback.push_back(buf.to_vec());
+        if local_only {
+            return result;
+        }
 
         let total = (VIRTIO_NET_HDR_LEN + payload_len) as u32;
         let tx_buf_addr = dev.tx_buf.as_u64();

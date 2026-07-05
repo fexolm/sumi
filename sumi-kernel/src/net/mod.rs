@@ -54,7 +54,7 @@ use device::{PollDevice, VirtioNetDevice};
 /// (SYN, SYN-ACK, ACK, ...) needs several calls; looping a fixed count
 /// drives it to completion within one lock acquisition (see
 /// docs/networking-design.md R3).
-const NET_POLL_ITERS: usize = 32;
+const NET_POLL_ITERS: usize = 5;
 
 /// The global net state, generic over the device backing the smoltcp
 /// `Interface`. Production uses `VirtioNetDevice` (see the `NetState`
@@ -74,6 +74,7 @@ pub struct NetStateInner<D> {
     /// epoll readiness — see `net::pipe`'s module doc comment.
     pub pipetab: Vec<Option<pipe::PipeState>>,
     pub waiters: wait::WaitQueue,
+    pub deadline_waiters: usize,
     pub next_ephemeral: u16,
     /// Handles whose fd was closed while the TCP conversation was still
     /// draining: `close(2)` initiates a graceful FIN (`socket.close()`)
@@ -114,7 +115,9 @@ pub fn init() {
 /// ready. A no-op before `init()` has run.
 pub fn poll() {
     if let Some(m) = NET.get() {
-        m.lock().poll_and_wake();
+        if let Some(mut g) = m.try_lock() {
+            g.poll_and_wake();
+        }
     }
 }
 
@@ -156,6 +159,7 @@ impl NetState {
             epolltab: Vec::new(),
             pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
+            deadline_waiters: 0,
             next_ephemeral: stack::EPHEMERAL_LO,
             closing: Vec::new(),
         })
@@ -176,6 +180,7 @@ impl TestNetState {
             epolltab: Vec::new(),
             pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
+            deadline_waiters: 0,
             next_ephemeral: stack::EPHEMERAL_LO,
             closing: Vec::new(),
         }
@@ -312,6 +317,11 @@ impl<D> NetStateInner<D> {
 }
 
 impl<D: Device + PollDevice> NetStateInner<D> {
+    pub(crate) fn wake_waiters(&mut self) {
+        self.deadline_waiters = 0;
+        self.waiters.wake_all();
+    }
+
     /// Advance the stack and wake every waiter (level-triggered: each
     /// re-checks its own readiness on resume). Called before every
     /// blocking-or-not readiness check (`wait::net_wait`'s poll-before-block
@@ -342,16 +352,22 @@ impl<D: Device + PollDevice> NetStateInner<D> {
     /// request/reply round-trip completes. Looping a fixed `NET_POLL_ITERS`
     /// times unconditionally instead is a few no-op scans more expensive in
     /// the steady state but reliably drains a full ARP + TCP handshake.
-    pub(crate) fn poll_and_wake(&mut self) {
+    pub(crate) fn poll_and_wake(&mut self) -> bool {
         let now = stack::now();
+        let mut changed = false;
         self.device.pre_poll();
         for _ in 0..NET_POLL_ITERS {
-            let _: PollResult = self.iface.poll(now, &mut self.device, &mut self.sockets);
+            if self.iface.poll(now, &mut self.device, &mut self.sockets)
+                == PollResult::SocketStateChanged
+            {
+                changed = true;
+            }
         }
         // Reap gracefully-closing handles (see `closing`) whose TCP
         // conversation has fully drained. TIME-WAIT is left to smoltcp:
         // the state only becomes `Closed` once 2MSL (or the FIN handshake)
         // completes, so removal here is always safe.
+        let mut reaped = false;
         if !self.closing.is_empty() {
             let sockets = &mut self.sockets;
             self.closing.retain(|&h| {
@@ -359,11 +375,16 @@ impl<D: Device + PollDevice> NetStateInner<D> {
                     == smoltcp::socket::tcp::State::Closed;
                 if done {
                     sockets.remove(h);
+                    reaped = true;
                 }
                 !done
             });
         }
-        self.waiters.wake_all();
+        let should_wake = changed || reaped || self.deadline_waiters != 0;
+        if should_wake {
+            self.wake_waiters();
+        }
+        should_wake
     }
 }
 

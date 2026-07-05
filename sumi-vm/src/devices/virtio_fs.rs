@@ -1,8 +1,7 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 
 use libc;
@@ -10,7 +9,8 @@ use libc;
 use sumi_abi::arch::layout::DAX_WINDOW_SIZE;
 use sumi_abi::fuse::*;
 use sumi_abi::virtio::*;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::bitmap::BitmapSlice;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
 use super::virtio_mmio::{
     VirtioBackend, VirtqueueState, post_used, read_avail_head, read_avail_idx, read_desc,
@@ -32,6 +32,47 @@ pub struct VirtioFs {
 
 // SAFETY: VirtioFs is only accessed from a single thread (inside Mutex<DeviceRegistry>).
 unsafe impl Send for VirtioFs {}
+
+fn errno_from_io_error(err: std::io::Error) -> i32 {
+    err.raw_os_error().unwrap_or(5)
+}
+
+fn pread_guest<B: BitmapSlice>(
+    fd: RawFd,
+    buf: &mut VolatileSlice<'_, B>,
+    offset: u64,
+) -> Result<usize, i32> {
+    let guard = buf.ptr_guard_mut();
+    let ptr = guard.as_ptr().cast::<libc::c_void>();
+    // SAFETY: `fd` is a live host file descriptor and `ptr..+buf.len()` is
+    // the validated guest memory range represented by `VolatileSlice`.
+    let n = unsafe { libc::pread(fd, ptr, buf.len(), offset as libc::off_t) };
+    if n < 0 {
+        buf.bitmap().mark_dirty(0, buf.len());
+        Err(errno_from_io_error(std::io::Error::last_os_error()))
+    } else {
+        let n = n as usize;
+        buf.bitmap().mark_dirty(0, n);
+        Ok(n)
+    }
+}
+
+fn pwrite_guest<B: BitmapSlice>(
+    fd: RawFd,
+    buf: &VolatileSlice<'_, B>,
+    offset: u64,
+) -> Result<usize, i32> {
+    let guard = buf.ptr_guard();
+    let ptr = guard.as_ptr().cast::<libc::c_void>();
+    // SAFETY: `fd` is a live host file descriptor and `ptr..+buf.len()` is
+    // the validated guest memory range represented by `VolatileSlice`.
+    let n = unsafe { libc::pwrite(fd, ptr, buf.len(), offset as libc::off_t) };
+    if n < 0 {
+        Err(errno_from_io_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(n as usize)
+    }
+}
 
 impl VirtioFs {
     pub fn new(share_dir: &std::path::Path, dax_host_ptr: *mut u8) -> Self {
@@ -97,22 +138,33 @@ impl VirtioFs {
         head: u16,
         mem: &GuestMemoryMmap<()>,
     ) -> u32 {
-        let mut readable_bufs: Vec<(u64, u32)> = Vec::new();
-        let mut writable_bufs: Vec<(u64, u32)> = Vec::new();
+        let mut readable_bufs = [(0u64, 0u32); 4];
+        let mut writable_bufs = [(0u64, 0u32); 4];
+        let mut readable_len = 0usize;
+        let mut writable_len = 0usize;
 
         let mut idx = head;
         loop {
             let desc = read_desc(queue, idx, mem);
             if desc.flags & VIRTQ_DESC_F_WRITE != 0 {
-                writable_bufs.push((desc.addr, desc.len));
+                if writable_len < writable_bufs.len() {
+                    writable_bufs[writable_len] = (desc.addr, desc.len);
+                    writable_len += 1;
+                }
             } else {
-                readable_bufs.push((desc.addr, desc.len));
+                if readable_len < readable_bufs.len() {
+                    readable_bufs[readable_len] = (desc.addr, desc.len);
+                    readable_len += 1;
+                }
             }
             if desc.flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             idx = desc.next;
         }
+
+        let readable_bufs = &readable_bufs[..readable_len];
+        let writable_bufs = &writable_bufs[..writable_len];
 
         if readable_bufs.is_empty() {
             return 0;
@@ -784,33 +836,36 @@ impl VirtioFs {
             _ => return self.write_error(header.unique, -9, writable_bufs, mem),
         };
 
-        let size = read_in.size as usize;
-        let mut data = vec![0u8; size];
-
-        if file.seek(SeekFrom::Start(read_in.offset)).is_err() {
-            return self.write_error(header.unique, -5, writable_bufs, mem);
-        }
-
-        // Loop to fill the buffer completely (a single read() may return short).
-        let mut bytes_read = 0;
-        while bytes_read < size {
-            match file.read(&mut data[bytes_read..]) {
-                Ok(0) => break, // EOF
-                Ok(n) => bytes_read += n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    if bytes_read > 0 {
-                        break; // Return what we have
-                    }
-                    let errno = e.raw_os_error().unwrap_or(5);
-                    return self.write_error(header.unique, -errno, writable_bufs, mem);
-                }
-            }
-        }
-        data.truncate(bytes_read);
-
         // For read: writable_bufs[0] = FuseOutHeader, writable_bufs[1] = data buffer
         let out_hdr_size = core::mem::size_of::<FuseOutHeader>();
+        let mut bytes_read = 0usize;
+        if read_in.size > 0 && writable_bufs.len() > 1 {
+            let (data_addr, data_len) = writable_bufs[1];
+            let size = (read_in.size as usize).min(data_len as usize);
+            let fd = file.as_raw_fd();
+            match mem.get_slice(GuestAddress(data_addr), size) {
+                Ok(guest_buf) => {
+                    while bytes_read < size {
+                        let mut chunk = match guest_buf.offset(bytes_read) {
+                            Ok(slice) => slice,
+                            Err(_) => break,
+                        };
+                        match pread_guest(fd, &mut chunk, read_in.offset + bytes_read as u64) {
+                            Ok(0) => break,
+                            Ok(n) => bytes_read += n,
+                            Err(e) => {
+                                if bytes_read > 0 {
+                                    break;
+                                }
+                                return self.write_error(header.unique, -e, writable_bufs, mem);
+                            }
+                        }
+                    }
+                }
+                Err(_) => return self.write_error(header.unique, -14, writable_bufs, mem),
+            }
+        }
+
         let out_header = FuseOutHeader {
             len: (out_hdr_size + bytes_read) as u32,
             error: 0,
@@ -826,16 +881,7 @@ impl VirtioFs {
 
         let (hdr_addr, _) = writable_bufs[0];
         mem.write_slice(hdr_bytes, GuestAddress(hdr_addr)).unwrap();
-        let mut total = out_hdr_size as u32;
-
-        if bytes_read > 0 && writable_bufs.len() > 1 {
-            let (data_addr, _) = writable_bufs[1];
-            mem.write_slice(&data[..bytes_read], GuestAddress(data_addr))
-                .unwrap();
-            total += bytes_read as u32;
-        }
-
-        total
+        out_hdr_size as u32 + bytes_read as u32
     }
 
     fn handle_readdir(
@@ -958,27 +1004,33 @@ impl VirtioFs {
             _ => return self.write_error(header.unique, -9, writable_bufs, mem),
         };
 
-        let size = write_in.size as usize;
-        let mut data = vec![0u8; size];
-
-        // Write data is in the second readable buffer
-        if readable_bufs.len() > 1 {
+        let mut bytes_written = 0usize;
+        if write_in.size > 0 && readable_bufs.len() > 1 {
             let (data_addr, data_len) = readable_bufs[1];
-            let read_size = size.min(data_len as usize);
-            mem.read_slice(&mut data[..read_size], GuestAddress(data_addr))
-                .unwrap();
-        }
-
-        if file.seek(SeekFrom::Start(write_in.offset)).is_err() {
-            return self.write_error(header.unique, -5, writable_bufs, mem);
-        }
-        let bytes_written = match file.write(&data) {
-            Ok(n) => n,
-            Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(5);
-                return self.write_error(header.unique, -errno, writable_bufs, mem);
+            let size = (write_in.size as usize).min(data_len as usize);
+            let fd = file.as_raw_fd();
+            match mem.get_slice(GuestAddress(data_addr), size) {
+                Ok(guest_buf) => {
+                    while bytes_written < size {
+                        let chunk = match guest_buf.offset(bytes_written) {
+                            Ok(slice) => slice,
+                            Err(_) => break,
+                        };
+                        match pwrite_guest(fd, &chunk, write_in.offset + bytes_written as u64) {
+                            Ok(0) => break,
+                            Ok(n) => bytes_written += n,
+                            Err(e) => {
+                                if bytes_written > 0 {
+                                    break;
+                                }
+                                return self.write_error(header.unique, -e, writable_bufs, mem);
+                            }
+                        }
+                    }
+                }
+                Err(_) => return self.write_error(header.unique, -14, writable_bufs, mem),
             }
-        };
+        }
 
         let write_out = FuseWriteOut {
             size: bytes_written as u32,

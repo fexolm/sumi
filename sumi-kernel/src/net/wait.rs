@@ -101,6 +101,9 @@ pub fn net_wait(
         }
         let me = crate::sched::current_thread();
         g.waiters.push(me);
+        if deadline_ns.is_some() {
+            g.deadline_waiters = g.deadline_waiters.saturating_add(1);
+        }
         // Transition to Blocked *under the NET lock* so the waker (which
         // also holds this lock while calling wake_blocked) cannot race our
         // state transition — same discipline as sched::futex::wait.

@@ -117,7 +117,7 @@ pub(crate) fn pipe_read(id: usize, buf: &mut [u8], nonblocking: bool) -> i64 {
     match attempt(&mut g) {
         Wait::Ready(v) => {
             // Freed buffer space — wake any writer blocked on backpressure.
-            g.poll_and_wake();
+            g.wake_waiters();
             v
         }
         Wait::Block => {
@@ -147,7 +147,7 @@ pub(crate) fn pipe_write(id: usize, data: &[u8], nonblocking: bool) -> i64 {
     match attempt(&mut g) {
         Wait::Ready(v) => {
             // Made room / delivered bytes — wake any blocked reader.
-            g.poll_and_wake();
+            g.wake_waiters();
             v
         }
         Wait::Block => {
@@ -180,7 +180,7 @@ pub fn close_pipe(id: usize, write_end: bool) {
     if p.readers == 0 && p.writers == 0 {
         g.pipe_free(id);
     }
-    g.poll_and_wake();
+    g.wake_waiters();
 }
 
 #[cfg(test)]

@@ -48,12 +48,13 @@ extern "C" fn timer_interrupt() {
     // syscall postamble already does the same check, but a preempted
     // thread may run for a long time before its next syscall.
     cpu.reload_tlb_if_stale();
-    // Advance the net stack and wake any thread whose socket became ready.
-    // Safe to call with IF=0 here: `NET` is a plain (non-IRQ-safe) mutex,
-    // but the timer only ever fires from user mode or the idle `sti; hlt`
-    // (see the module doc comment) — never from inside a syscall handler
-    // that might be holding `NET` — so this can never deadlock.
-    crate::net::poll();
+    // Advance the net stack from one background poller. Socket syscalls
+    // still drive progress synchronously; this timer path is mainly for
+    // external RX and timeout waiters, so running it on every vCPU only
+    // contends on the single NET lock.
+    if cpu.cpu_id == 0 {
+        crate::net::poll();
+    }
     // Relaxed store is sufficient: the ISR trampoline reads need_resched
     // immediately after decrementing preempt_count on the same CPU with
     // interrupts still disabled, so there is no ordering hazard here.

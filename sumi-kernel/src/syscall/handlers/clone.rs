@@ -7,19 +7,18 @@ use crate::syscall::{SyscallArgs, SyscallResult};
 
 // Linux x86_64 clone() flag bits currently used by the pthread-style thread
 // shape supported by sumi.
-const CLONE_VM:             u64 = 0x0000_0100;
-const CLONE_FS:             u64 = 0x0000_0200;
-const CLONE_FILES:          u64 = 0x0000_0400;
-const CLONE_SIGHAND:        u64 = 0x0000_0800;
-const CLONE_THREAD:         u64 = 0x0001_0000;
-const CLONE_SETTLS:         u64 = 0x0008_0000;
-const CLONE_PARENT_SETTID:  u64 = 0x0010_0000;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 /// Required pthread-style flag set. Any missing bit → `EINVAL`.
-const REQUIRED: u64 =
-    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+const REQUIRED: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 
 /// Parent register state to restore in the child before user code runs.
 ///
@@ -34,26 +33,39 @@ struct ParentRegs {
     arg3: u64, // r10
     arg4: u64, // r8
     arg5: u64, // r9
-    caller_rip:    u64,
+    caller_rip: u64,
     caller_rflags: u64,
 }
 
-/// Direct map used to translate a new child thread's kernel-stack physical
-/// address into a writable virtual one (see `sched::clone::clone_create_user_thread`).
-/// Real: the production `KERNEL_ALLOCATOR`'s direct map, backed by KVM guest
-/// RAM. Host stand-in: a `TestDirectMap` sized to comfortably cover every
-/// `sys_clone`/`sys_clone3` call across this test binary, lazily created on
-/// first use and shared (`crate::PAGE_ALLOCATOR`, which `clone_create_user_thread`
-/// always allocates from, is itself a single process-wide bitmap).
+/// Allocator used for a new child thread's kernel stack.
+/// Real: the production `KERNEL_ALLOCATOR`, backed by KVM guest RAM. Host
+/// stand-in: a `KernelAllocator<TestDirectMap>` sized to comfortably cover
+/// every `sys_clone`/`sys_clone3` call across this test binary.
 #[cfg(not(test))]
-fn clone_thread_direct_map() -> &'static crate::arch::KernelDirectMap {
-    crate::KERNEL_ALLOCATOR.direct_map()
+fn clone_thread_allocator()
+-> &'static crate::memory::alloc::kmalloc::KernelAllocator<'static, crate::arch::KernelDirectMap> {
+    &crate::KERNEL_ALLOCATOR
 }
 
 #[cfg(test)]
-fn clone_thread_direct_map() -> &'static crate::memory::test_utils::TestDirectMap {
-    static TEST_DM: spin::Once<crate::memory::test_utils::TestDirectMap> = spin::Once::new();
-    TEST_DM.call_once(|| crate::memory::test_utils::TestDirectMap::new(32))
+fn clone_thread_allocator() -> &'static crate::memory::alloc::kmalloc::KernelAllocator<
+    'static,
+    crate::memory::test_utils::TestDirectMap,
+> {
+    use crate::memory::{
+        alloc::{kmalloc::KernelAllocator, palloc::PageAllocator},
+        test_utils::TestDirectMap,
+    };
+
+    static TEST_DM: spin::Once<TestDirectMap> = spin::Once::new();
+    static TEST_PA: spin::Once<PageAllocator> = spin::Once::new();
+    static TEST_ALLOC: spin::Once<KernelAllocator<'static, TestDirectMap>> = spin::Once::new();
+
+    TEST_ALLOC.call_once(|| {
+        let dm = TEST_DM.call_once(|| TestDirectMap::new(32));
+        let pa = TEST_PA.call_once(PageAllocator::new);
+        KernelAllocator::new(dm, pa)
+    })
 }
 
 /// Core clone implementation shared by `sys_clone` and `sys_clone3`.
@@ -72,12 +84,12 @@ fn do_clone(
     tls: u64,
     regs: ParentRegs,
 ) -> SyscallResult {
-    use core::sync::atomic::Ordering;
-    use sumi_abi::address::VirtualAddr;
     use crate::sched::{
-        clone::{clone_create_user_thread, CloneError, InitialFrame},
+        clone::{CloneError, InitialFrame, clone_create_user_thread},
         current_thread, registry,
     };
+    use core::sync::atomic::Ordering;
+    use sumi_abi::address::VirtualAddr;
 
     let parent = current_thread();
     let tid = registry::alloc_tid();
@@ -102,15 +114,20 @@ fn do_clone(
         arg3: regs.arg3,
         arg4: regs.arg4,
         arg5: regs.arg5,
-        user_rip:    regs.caller_rip,
+        user_rip: regs.caller_rip,
         user_rflags: regs.caller_rflags,
-        user_rsp:    child_stack_top,
+        user_rsp: child_stack_top,
     };
 
     let child = match clone_create_user_thread(
-        tid, tgid, frame, fs_base,
-        VirtualAddr::new(0), 0, clear_ctid,
-        clone_thread_direct_map(),
+        tid,
+        tgid,
+        frame,
+        fs_base,
+        VirtualAddr::new(0),
+        0,
+        clear_ctid,
+        clone_thread_allocator(),
     ) {
         Ok(t) => t,
         Err(CloneError::OutOfMemory) => return ENOMEM,
@@ -118,11 +135,15 @@ fn do_clone(
 
     if flags & CLONE_PARENT_SETTID != 0 && !ptid_ptr.is_null() {
         // SAFETY: same-address-space unikernel; bad pointer traps via #PF.
-        unsafe { ptid_ptr.write(tid.0 as i32); }
+        unsafe {
+            ptid_ptr.write(tid.0 as i32);
+        }
     }
     if flags & CLONE_CHILD_SETTID != 0 && !ctid_ptr.is_null() {
         // SAFETY: same as above.
-        unsafe { ctid_ptr.write(tid.0 as i32); }
+        unsafe {
+            ctid_ptr.write(tid.0 as i32);
+        }
     }
 
     child.state.store(
@@ -153,19 +174,28 @@ fn do_clone(
 /// first return from the syscall — that path is driven by
 /// `thread_entry_trampoline` (see `sched::clone`), NOT by this handler.
 pub fn sys_clone(args: &SyscallArgs) -> SyscallResult {
-    let flags     = args.arg0;
+    let flags = args.arg0;
     let child_rsp = args.arg1;
-    let ptid_ptr  = args.arg2 as *mut i32;
-    let ctid_ptr  = args.arg3 as *mut i32;
-    let tls       = args.arg4;
+    let ptid_ptr = args.arg2 as *mut i32;
+    let ctid_ptr = args.arg3 as *mut i32;
+    let tls = args.arg4;
 
-    if flags & REQUIRED != REQUIRED { return EINVAL; }
-    if child_rsp == 0 { return EINVAL; }
+    if flags & REQUIRED != REQUIRED {
+        return EINVAL;
+    }
+    if child_rsp == 0 {
+        return EINVAL;
+    }
 
     let regs = ParentRegs {
-        arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
-        arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
-        caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
+        arg0: args.arg0,
+        arg1: args.arg1,
+        arg2: args.arg2,
+        arg3: args.arg3,
+        arg4: args.arg4,
+        arg5: args.arg5,
+        caller_rip: args.caller_rip,
+        caller_rflags: args.caller_rflags,
     };
     do_clone(flags, child_rsp, ptid_ptr, ctid_ptr, tls, regs)
 }
@@ -174,14 +204,14 @@ pub fn sys_clone(args: &SyscallArgs) -> SyscallResult {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CloneArgs {
-    flags:       u64, // +  0
-    pidfd:       u64, // +  8
-    child_tid:   u64, // + 16
-    parent_tid:  u64, // + 24
+    flags: u64,       // +  0
+    pidfd: u64,       // +  8
+    child_tid: u64,   // + 16
+    parent_tid: u64,  // + 24
     exit_signal: u64, // + 32
-    stack:       u64, // + 40  (stack BASE for clone3, not top)
-    stack_size:  u64, // + 48
-    tls:         u64, // + 56
+    stack: u64,       // + 40  (stack BASE for clone3, not top)
+    stack_size: u64,  // + 48
+    tls: u64,         // + 56
 }
 const CLONE_ARGS_SIZE_VER0: usize = 64;
 const _: () = assert!(core::mem::size_of::<CloneArgs>() == CLONE_ARGS_SIZE_VER0);
@@ -191,11 +221,15 @@ const _: () = assert!(core::mem::size_of::<CloneArgs>() == CLONE_ARGS_SIZE_VER0)
 /// the user passes a larger size.
 pub fn sys_clone3(args: &SyscallArgs) -> SyscallResult {
     let ca_ptr = args.arg0 as *const CloneArgs;
-    let size   = args.arg1 as usize;
+    let size = args.arg1 as usize;
 
-    if ca_ptr.is_null() { return EINVAL; }
+    if ca_ptr.is_null() {
+        return EINVAL;
+    }
     // Linux rejects sizes smaller than the v0 struct.
-    if size < CLONE_ARGS_SIZE_VER0 { return EINVAL; }
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return EINVAL;
+    }
 
     // SAFETY: unikernel shares address space; bad pointer traps via #PF.
     // Read unaligned to be defensive — clone3 ABI doesn't guarantee
@@ -213,19 +247,28 @@ pub fn sys_clone3(args: &SyscallArgs) -> SyscallResult {
         return EINVAL;
     }
 
-    if ca.flags & REQUIRED != REQUIRED { return EINVAL; }
-    if stack_top == 0 { return EINVAL; }
+    if ca.flags & REQUIRED != REQUIRED {
+        return EINVAL;
+    }
+    if stack_top == 0 {
+        return EINVAL;
+    }
 
     let ptid_ptr = ca.parent_tid as *mut i32;
-    let ctid_ptr = ca.child_tid  as *mut i32;
+    let ctid_ptr = ca.child_tid as *mut i32;
 
     // For clone3, the parent's syscall argument registers are in args.arg0-arg5.
     // These include rdx (thread fn) and r8 (thread arg) that glibc's
     // clone3 child stub expects to find restored when the child runs.
     let regs = ParentRegs {
-        arg0: args.arg0, arg1: args.arg1, arg2: args.arg2,
-        arg3: args.arg3, arg4: args.arg4, arg5: args.arg5,
-        caller_rip: args.caller_rip, caller_rflags: args.caller_rflags,
+        arg0: args.arg0,
+        arg1: args.arg1,
+        arg2: args.arg2,
+        arg3: args.arg3,
+        arg4: args.arg4,
+        arg5: args.arg5,
+        caller_rip: args.caller_rip,
+        caller_rflags: args.caller_rflags,
     };
     do_clone(ca.flags, stack_top, ptid_ptr, ctid_ptr, ca.tls, regs)
 }
@@ -250,7 +293,10 @@ mod tests {
 
     #[test]
     fn missing_clone_vm_returns_einval() {
-        let a = args(CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD, 0x1000);
+        let a = args(
+            CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
+            0x1000,
+        );
         assert_eq!(sys_clone(&a), EINVAL);
     }
 
@@ -298,12 +344,16 @@ mod tests {
         assert!(sys_clone(&a) > 1);
     }
 
-    fn clone3_args_struct(
-        flags: u64, stack: u64, stack_size: u64, exit_signal: u64,
-    ) -> CloneArgs {
+    fn clone3_args_struct(flags: u64, stack: u64, stack_size: u64, exit_signal: u64) -> CloneArgs {
         CloneArgs {
-            flags, pidfd: 0, child_tid: 0, parent_tid: 0,
-            exit_signal, stack, stack_size, tls: 0,
+            flags,
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal,
+            stack,
+            stack_size,
+            tls: 0,
         }
     }
 
@@ -312,7 +362,10 @@ mod tests {
             nr: 435,
             arg0: ca as *const CloneArgs as u64,
             arg1: size,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
             caller_rip: 0xdead_beef,
             caller_rflags: 0x202,
         }
@@ -328,9 +381,15 @@ mod tests {
     #[test]
     fn clone3_null_args_returns_einval() {
         let args = SyscallArgs {
-            nr: 435, arg0: 0, arg1: 64,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
-            caller_rip: 0, caller_rflags: 0,
+            nr: 435,
+            arg0: 0,
+            arg1: 64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         };
         assert_eq!(sys_clone3(&args), EINVAL);
     }

@@ -84,7 +84,7 @@ pub enum CloneError {
 /// `crate::KERNEL_ALLOCATOR`) so this function is directly host-testable
 /// with `crate::memory::test_utils::TestDirectMap` — same seam as
 /// `RootPageTable`/`KernelAllocator`. Production calls it with
-/// `crate::KERNEL_ALLOCATOR.direct_map()`.
+/// `crate::KERNEL_ALLOCATOR`.
 // Each parameter is an independent, already-validated piece of the new
 // Thread's state (the caller — `do_clone` — is where they'd naturally
 // group, but it validates and forwards them one at a time); no subset of
@@ -98,7 +98,7 @@ pub fn clone_create_user_thread<DM: DirectMap>(
     user_stack_base: VirtualAddr,
     user_stack_size: usize,
     clear_child_tid: u64,
-    dm: &DM,
+    kalloc: &crate::memory::alloc::kmalloc::KernelAllocator<'_, DM>,
 ) -> Result<Arc<Thread>, CloneError> {
     use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
@@ -110,10 +110,12 @@ pub fn clone_create_user_thread<DM: DirectMap>(
     // 1. Allocate a fresh compact kernel stack. User stacks are provided by
     // pthread/mmap; kernel stacks only need enough room for syscall/trap frames
     // and scheduler handoff state.
-    let stack_phys = crate::KERNEL_ALLOCATOR
+    let stack_phys = kalloc
         .calloc(KERNEL_STACK_SIZE)
         .map_err(|_| CloneError::OutOfMemory)?;
-    let stack_top_virt = stack_phys.add(KERNEL_STACK_SIZE).to_virtual(dm);
+    let stack_top_virt = stack_phys
+        .add(KERNEL_STACK_SIZE)
+        .to_virtual(kalloc.direct_map());
 
     // 2. Write the initial frame at the top of the kernel stack.
     //
