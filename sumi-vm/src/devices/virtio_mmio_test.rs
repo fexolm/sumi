@@ -324,7 +324,12 @@ impl VirtioBackend for FeatureBackend {
     fn num_queues(&self) -> usize {
         2
     }
-    fn process_queue(&mut self, _queue_idx: usize, _queue: &VirtqueueState, _mem: &GuestMemoryMmap<()>) {
+    fn process_queue(
+        &mut self,
+        _queue_idx: usize,
+        _queue: &VirtqueueState,
+        _mem: &GuestMemoryMmap<()>,
+    ) {
     }
     fn device_features(&self) -> u64 {
         self.features

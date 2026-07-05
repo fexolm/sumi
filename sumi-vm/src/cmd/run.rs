@@ -36,7 +36,10 @@ pub struct RunCommand {
     /// Forward a host TCP port to a guest TCP port through the network
     /// gateway: `tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT` (e.g.
     /// `tcp:127.0.0.1:3307-10.0.2.15:3306`). May be repeated.
-    #[arg(long = "hostfwd", value_name = "tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT")]
+    #[arg(
+        long = "hostfwd",
+        value_name = "tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT"
+    )]
     hostfwd: Vec<HostForward>,
 
     /// Arguments passed to the guest program (its argv[1..]), given after

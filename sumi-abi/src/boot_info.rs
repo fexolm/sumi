@@ -26,6 +26,6 @@ pub struct BootInfo {
     pub rng_seed: [u8; 32],   // offset 48
     // v3 fields
     /// Total number of vCPUs created by the host. Always in 1..=MAX_VCPUS.
-    pub num_cpus: u32,        // offset 80
-    pub _pad1: u32,           // offset 84 — keep 8-byte alignment
+    pub num_cpus: u32, // offset 80
+    pub _pad1: u32, // offset 84 — keep 8-byte alignment
 }

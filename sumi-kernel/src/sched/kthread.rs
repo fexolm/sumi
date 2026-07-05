@@ -29,8 +29,11 @@ fn build_kthread_arc(
     stack_top_virt: VirtualAddr,
     stack_size: usize,
 ) -> Thread {
-    debug_assert_eq!(stack_top_virt.as_usize() % 16, 0,
-        "stack top must be 16-aligned");
+    debug_assert_eq!(
+        stack_top_virt.as_usize() % 16,
+        0,
+        "stack top must be 16-aligned"
+    );
 
     // Place the trampoline return-address slot at a 16-aligned address.
     // After `ret` pops 8 bytes, the trampoline executes with
@@ -46,32 +49,37 @@ fn build_kthread_arc(
     Thread {
         tid,
         tgid: tid,
-        state:     AtomicU32::new(ThreadState::Runnable as u32),
+        state: AtomicU32::new(ThreadState::Runnable as u32),
         exit_code: AtomicI32::new(0),
         ctx: UnsafeCell::new(ThreadContext {
             rsp: slot,
-            rbp: 0, rbx: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+            rbp: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
             // EFLAGS: bit 1 (reserved, always 1) | bit 9 (IF=1). __switch_to_asm
             // forces IF back to 0 for a thread's first switch-in regardless
             // of this value; this only matters for the reserved bit.
             rflags: 0x202,
             fxsave_area: FxsaveArea::new(),
         }),
-        kernel_stack_top:  stack_top_virt,
+        kernel_stack_top: stack_top_virt,
         kernel_stack_phys: stack_phys,
         kernel_stack_size: stack_size,
         kernel_stack_freeable: false,
         user_stack_base: VirtualAddr::new(0),
         user_stack_size: 0,
-        fs_base:          AtomicU64::new(0),
-        clear_child_tid:  AtomicU64::new(0),
+        fs_base: AtomicU64::new(0),
+        clear_child_tid: AtomicU64::new(0),
         robust_list_head: AtomicU64::new(0),
-        cpu:              AtomicU32::new(u32::MAX),
-        on_cpu:           AtomicBool::new(false),
-        run_link:         RunLink::new(),
-        wait_link:        WaitLink::new(),
-        entry_fn:         AtomicU64::new(entry_fn as *const () as u64),
-        entry_arg:        AtomicU64::new(arg),
+        cpu: AtomicU32::new(u32::MAX),
+        on_cpu: AtomicBool::new(false),
+        run_link: RunLink::new(),
+        wait_link: WaitLink::new(),
+        entry_fn: AtomicU64::new(entry_fn as *const () as u64),
+        entry_arg: AtomicU64::new(arg),
     }
 }
 
@@ -90,15 +98,21 @@ pub(super) fn build_current_main_thread<DM: DirectMap>(dm: &DM) -> Arc<Thread> {
     use sumi_abi::arch::layout::{KERNEL_STACK, KERNEL_STACK_SIZE};
 
     Arc::new(Thread {
-        tid:  Tid(1),
+        tid: Tid(1),
         tgid: Tid(1),
-        state:     AtomicU32::new(ThreadState::Running as u32),
+        state: AtomicU32::new(ThreadState::Running as u32),
         exit_code: AtomicI32::new(0),
         // ctx will be populated by the first __switch_to_asm save.
         ctx: UnsafeCell::new(ThreadContext {
-            rsp: 0, rbp: 0, rbx: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
-            rflags: 0, fxsave_area: FxsaveArea::new(),
+            rsp: 0,
+            rbp: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rflags: 0,
+            fxsave_area: FxsaveArea::new(),
         }),
         // KERNEL_STACK is the *top* of the BSP boot stack (post align-up).
         // The stack spans [KERNEL_STACK - KERNEL_STACK_SIZE, KERNEL_STACK).
@@ -115,21 +129,21 @@ pub(super) fn build_current_main_thread<DM: DirectMap>(dm: &DM) -> Arc<Thread> {
         // which abandons the BSP boot stack before dropping to user mode.
         // Any future code that runs kernel work on the BSP boot stack while
         // expecting to take a syscall later will silently corrupt itself.
-        kernel_stack_top:  KERNEL_STACK.to_virtual(dm),
+        kernel_stack_top: KERNEL_STACK.to_virtual(dm),
         kernel_stack_phys: PhysicalAddr::new(KERNEL_STACK.as_usize() - KERNEL_STACK_SIZE),
         kernel_stack_size: KERNEL_STACK_SIZE,
         kernel_stack_freeable: false,
         user_stack_base: VirtualAddr::new(0),
         user_stack_size: 0,
-        fs_base:          AtomicU64::new(0),
-        clear_child_tid:  AtomicU64::new(0),
+        fs_base: AtomicU64::new(0),
+        clear_child_tid: AtomicU64::new(0),
         robust_list_head: AtomicU64::new(0),
-        cpu:              AtomicU32::new(0), // BSP is always cpu 0
-        on_cpu:           AtomicBool::new(true), // already executing
-        run_link:         RunLink::new(),
-        wait_link:        WaitLink::new(),
-        entry_fn:         AtomicU64::new(0),
-        entry_arg:        AtomicU64::new(0),
+        cpu: AtomicU32::new(0),        // BSP is always cpu 0
+        on_cpu: AtomicBool::new(true), // already executing
+        run_link: RunLink::new(),
+        wait_link: WaitLink::new(),
+        entry_fn: AtomicU64::new(0),
+        entry_arg: AtomicU64::new(0),
     })
 }
 
@@ -186,24 +200,30 @@ pub(super) fn build_idle_thread_for_ap_reusing_boot_stack(cpu_id: u32) -> Arc<Th
     // cpu_id < MAX_VCPUS (checked by ap_main_rust). Pointer arithmetic
     // avoids indexing the static array directly, which would trigger a
     // bounds-check in debug builds for a raw addr-of.
-    let base = core::ptr::addr_of!(AP_BOOT_STACKS) as u64
-        + (cpu_id as u64) * AP_BOOT_STACK_SIZE as u64;
+    let base =
+        core::ptr::addr_of!(AP_BOOT_STACKS) as u64 + (cpu_id as u64) * AP_BOOT_STACK_SIZE as u64;
     let stack_top_virt: u64 = base + AP_BOOT_STACK_SIZE as u64;
 
     let tid = super::registry::alloc_tid();
     Arc::new(Thread {
         tid,
         tgid: tid,
-        state:     AtomicU32::new(ThreadState::Runnable as u32),
+        state: AtomicU32::new(ThreadState::Runnable as u32),
         exit_code: AtomicI32::new(0),
         // rsp = 0: the AP is live on this stack; schedule() will save
         // the real RSP on first switch-away.
         ctx: UnsafeCell::new(ThreadContext {
-            rsp: 0, rbp: 0, rbx: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
-            rflags: 0x202, fxsave_area: FxsaveArea::new(),
+            rsp: 0,
+            rbp: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rflags: 0x202,
+            fxsave_area: FxsaveArea::new(),
         }),
-        kernel_stack_top:  VirtualAddr::new(stack_top_virt as usize),
+        kernel_stack_top: VirtualAddr::new(stack_top_virt as usize),
         // AP boot stacks are not physical-memory objects tracked by palloc;
         // use zero as the physical address sentinel.
         kernel_stack_phys: PhysicalAddr::new(0),
@@ -211,15 +231,15 @@ pub(super) fn build_idle_thread_for_ap_reusing_boot_stack(cpu_id: u32) -> Arc<Th
         kernel_stack_freeable: false,
         user_stack_base: VirtualAddr::new(0),
         user_stack_size: 0,
-        fs_base:          AtomicU64::new(0),
-        clear_child_tid:  AtomicU64::new(0),
+        fs_base: AtomicU64::new(0),
+        clear_child_tid: AtomicU64::new(0),
         robust_list_head: AtomicU64::new(0),
-        cpu:              AtomicU32::new(cpu_id),
-        on_cpu:           AtomicBool::new(true), // already executing
-        run_link:         RunLink::new(),
-        wait_link:        WaitLink::new(),
-        entry_fn:         AtomicU64::new(0),
-        entry_arg:        AtomicU64::new(0),
+        cpu: AtomicU32::new(cpu_id),
+        on_cpu: AtomicBool::new(true), // already executing
+        run_link: RunLink::new(),
+        wait_link: WaitLink::new(),
+        entry_fn: AtomicU64::new(0),
+        entry_arg: AtomicU64::new(0),
     })
 }
 

@@ -82,7 +82,11 @@ fn backend_device_features_offers_mac_and_version_1_only() {
     let feat = backend.device_features();
     assert_ne!(feat & VIRTIO_NET_F_MAC, 0);
     assert_ne!(feat & VIRTIO_F_VERSION_1, 0);
-    assert_eq!(feat & VIRTIO_NET_F_MRG_RXBUF, 0, "MRG_RXBUF must not be offered");
+    assert_eq!(
+        feat & VIRTIO_NET_F_MRG_RXBUF,
+        0,
+        "MRG_RXBUF must not be offered"
+    );
 }
 
 #[test]
@@ -166,8 +170,11 @@ fn process_rx_fills_posted_buffer_with_header_and_frame() {
     assert_eq!(u16::from_le_bytes([hdr[10], hdr[11]]), 1);
 
     let mut payload = [0u8; 5];
-    mem.read_slice(&mut payload, GuestAddress(DATA_BASE + VIRTIO_NET_HDR_LEN as u64))
-        .unwrap();
+    mem.read_slice(
+        &mut payload,
+        GuestAddress(DATA_BASE + VIRTIO_NET_HDR_LEN as u64),
+    )
+    .unwrap();
     assert_eq!(&payload, b"world");
 
     assert!(chan.host_to_guest.lock().unwrap().is_empty());
@@ -203,11 +210,22 @@ fn process_rx_truncates_frame_larger_than_descriptor() {
         .push_back(vec![0xAAu8; 100]);
 
     // Descriptor only has room for 12 (header) + 10 bytes of payload.
-    write_desc(&mem, 0, DATA_BASE, (VIRTIO_NET_HDR_LEN + 10) as u32, VIRTQ_DESC_F_WRITE, 0);
+    write_desc(
+        &mem,
+        0,
+        DATA_BASE,
+        (VIRTIO_NET_HDR_LEN + 10) as u32,
+        VIRTQ_DESC_F_WRITE,
+        0,
+    );
     avail_push(&mem, 0, 0);
 
     backend.process_queue(0, &queue, &mem);
 
     let (_, len) = used_entry(&mem, 0);
-    assert_eq!(len, (VIRTIO_NET_HDR_LEN + 10) as u32, "must truncate defensively, not overflow the descriptor");
+    assert_eq!(
+        len,
+        (VIRTIO_NET_HDR_LEN + 10) as u32,
+        "must truncate defensively, not overflow the descriptor"
+    );
 }

@@ -72,13 +72,13 @@ impl PerCpu {
             cpu_id: 0,
             _pad0: 0,
             current_thread: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            idle_thread:     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            need_resched:    core::sync::atomic::AtomicBool::new(false),
-            is_idle:         core::sync::atomic::AtomicBool::new(false),
-            _pad1:           [0u8; 6],
-            runqueue:        super::runqueue::RunQueue::new(),
-            tlb_generation:  core::sync::atomic::AtomicU64::new(0),
-            preempt_count:   core::cell::UnsafeCell::new(0),
+            idle_thread: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            need_resched: core::sync::atomic::AtomicBool::new(false),
+            is_idle: core::sync::atomic::AtomicBool::new(false),
+            _pad1: [0u8; 6],
+            runqueue: super::runqueue::RunQueue::new(),
+            tlb_generation: core::sync::atomic::AtomicU64::new(0),
+            preempt_count: core::cell::UnsafeCell::new(0),
         }
     }
 
@@ -133,8 +133,7 @@ impl SyscallStackBuf {
 
 /// One `PerCpu` per vCPU. BSP uses index 0.
 #[cfg(not(test))]
-pub(crate) static mut PER_CPU: [PerCpu; MAX_VCPUS] =
-    [const { PerCpu::zeroed() }; MAX_VCPUS];
+pub(crate) static mut PER_CPU: [PerCpu; MAX_VCPUS] = [const { PerCpu::zeroed() }; MAX_VCPUS];
 
 /// Dedicated 64 KiB interrupt stack (TSS IST1) per vCPU. Indexed by
 /// `cpu_id`. Kept here rather than in `arch::x86_64::syscall` because AP
@@ -231,7 +230,9 @@ fn publish_this_cpu(pc_ptr: *mut PerCpu) {
     const IA32_GS_BASE: u32 = 0xC000_0101;
     // SAFETY: ring 0, valid MSR, value is the linear address of a `'static`
     // `PerCpu` just initialised by `init_for_cpu`.
-    unsafe { crate::arch::x86_64::syscall::wrmsr(IA32_GS_BASE, pc_ptr as u64); }
+    unsafe {
+        crate::arch::x86_64::syscall::wrmsr(IA32_GS_BASE, pc_ptr as u64);
+    }
 }
 
 #[cfg(test)]
@@ -270,13 +271,13 @@ pub fn init_for_cpu(cpu_id: u32) {
                 cpu_id,
                 _pad0: 0,
                 current_thread: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                idle_thread:     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                need_resched:    core::sync::atomic::AtomicBool::new(false),
-                is_idle:         core::sync::atomic::AtomicBool::new(false),
-                _pad1:           [0u8; 6],
-                runqueue:        super::runqueue::RunQueue::new(),
-                tlb_generation:  core::sync::atomic::AtomicU64::new(0),
-                preempt_count:   core::cell::UnsafeCell::new(0),
+                idle_thread: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                need_resched: core::sync::atomic::AtomicBool::new(false),
+                is_idle: core::sync::atomic::AtomicBool::new(false),
+                _pad1: [0u8; 6],
+                runqueue: super::runqueue::RunQueue::new(),
+                tlb_generation: core::sync::atomic::AtomicU64::new(0),
+                preempt_count: core::cell::UnsafeCell::new(0),
             },
         );
     }
@@ -320,7 +321,11 @@ pub fn get(cpu_id: u32) -> Option<&'static PerCpu> {
     let pc = &per_cpu_array()[cpu_id as usize];
     // `self_ptr` is null until `init_for_cpu` runs on that slot; used as
     // the "not yet ready" sentinel.
-    if pc.self_ptr.is_null() { None } else { Some(pc) }
+    if pc.self_ptr.is_null() {
+        None
+    } else {
+        Some(pc)
+    }
 }
 
 // ---- Compile-time layout invariants (the asm depends on these) ----

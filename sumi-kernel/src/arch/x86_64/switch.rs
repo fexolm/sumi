@@ -72,8 +72,7 @@ pub unsafe extern "C" fn __switch_to_asm(
         "mov [rdi + 0x30], r15",
         "pushfq",
         "pop qword ptr [rdi + 0x38]",
-        "fxsave [rdi + 0x40]",   // Save prev's legacy x87/MMX/SSE state.
-
+        "fxsave [rdi + 0x40]", // Save prev's legacy x87/MMX/SSE state.
         // Restore next callee-saved from *next_ctx (rsi).
         "mov rsp, [rsi + 0x00]",
         "mov rbp, [rsi + 0x08]",
@@ -89,25 +88,22 @@ pub unsafe extern "C" fn __switch_to_asm(
         "push qword ptr [rsi + 0x38]",
         "and dword ptr [rsp], 0xFFFFFDFF", // Clear IF (bit 9) in the pushed copy; see doc comment.
         "popfq",
-        "fxrstor [rsi + 0x40]",   // Restore next's legacy x87/MMX/SSE state.
-
+        "fxrstor [rsi + 0x40]", // Restore next's legacy x87/MMX/SSE state.
         // prev's context (GP + FPU) is now fully saved and we've
         // switched onto next's stack, so it is safe for another CPU to run
         // or reap prev. rcx = prev_on_cpu (4th SysV arg); nothing above
         // touches rcx. A plain store is enough for release semantics: x86
         // stores are never reordered with later stores (TSO).
         "mov byte ptr [rcx], 0",
-
         // Load IA32_FS_BASE = rdx (next_fs_base, 3rd SysV arg).
         // wrmsr takes MSR in ECX, value in EDX:EAX. We destructively read rdx.
         // rax/rcx/rdx are caller-saved per SysV AMD64; clobbering is legal at
         // a function-call boundary (rcx's prev_on_cpu value is no longer
         // needed after the store above).
-        "mov rax, rdx",           // rax = fs_base (low 32 used by wrmsr)
-        "shr rdx, 32",            // edx = high 32 of original fs_base
-        "mov ecx, 0xc0000100",    // IA32_FS_BASE
+        "mov rax, rdx",        // rax = fs_base (low 32 used by wrmsr)
+        "shr rdx, 32",         // edx = high 32 of original fs_base
+        "mov ecx, 0xc0000100", // IA32_FS_BASE
         "wrmsr",
-
         // Transfer execution: the return address on next's stack is either
         // the instruction after the `call __switch_to_asm` in schedule()
         // (for a previously-switched-away thread) or `kthread_trampoline`

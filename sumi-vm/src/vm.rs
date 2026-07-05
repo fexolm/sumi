@@ -16,8 +16,8 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
     sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -449,8 +449,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             // pthread_kill with a stale u64::MAX tid.
             let tid_published_count = Arc::new(AtomicUsize::new(0));
 
-            let mut handles: Vec<thread::JoinHandle<Result<()>>> =
-                Vec::with_capacity(vcpu_count);
+            let mut handles: Vec<thread::JoinHandle<Result<()>>> = Vec::with_capacity(vcpu_count);
 
             for (cpu_id, mut cpu) in self.vcpus.into_iter().enumerate() {
                 let tid_slot = cpu.host_tid_slot();

@@ -9,7 +9,6 @@ const STAR_VALUE: u64 = 0x0008u64 << 32;
 // Clear IF (bit 9) and DF (bit 10)
 const SFMASK_VALUE: u64 = 0x600;
 
-
 pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
     let eax: u32;
     let edx: u32;

@@ -32,7 +32,9 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address,
+};
 
 use crate::devices::virtio_net::GatewayChannel;
 
@@ -87,7 +89,9 @@ impl FromStr for HostForward {
             reason,
         };
 
-        let rest = s.strip_prefix("tcp:").ok_or_else(|| fail("must start with \"tcp:\""))?;
+        let rest = s
+            .strip_prefix("tcp:")
+            .ok_or_else(|| fail("must start with \"tcp:\""))?;
         let (host_part, guest_part) = rest
             .split_once('-')
             .ok_or_else(|| fail("missing '-' between host and guest endpoints"))?;
@@ -98,10 +102,18 @@ impl FromStr for HostForward {
             .rsplit_once(':')
             .ok_or_else(|| fail("guest endpoint must be IP:PORT"))?;
 
-        let host_ip: Ipv4Addr = host_ip_str.parse().map_err(|_| fail("invalid host IPv4 address"))?;
-        let host_port: u16 = host_port_str.parse().map_err(|_| fail("invalid host port"))?;
-        let guest_ip: Ipv4Addr = guest_ip_str.parse().map_err(|_| fail("invalid guest IPv4 address"))?;
-        let guest_port: u16 = guest_port_str.parse().map_err(|_| fail("invalid guest port"))?;
+        let host_ip: Ipv4Addr = host_ip_str
+            .parse()
+            .map_err(|_| fail("invalid host IPv4 address"))?;
+        let host_port: u16 = host_port_str
+            .parse()
+            .map_err(|_| fail("invalid host port"))?;
+        let guest_ip: Ipv4Addr = guest_ip_str
+            .parse()
+            .map_err(|_| fail("invalid guest IPv4 address"))?;
+        let guest_port: u16 = guest_port_str
+            .parse()
+            .map_err(|_| fail("invalid guest port"))?;
 
         if host_port == 0 || guest_port == 0 {
             return Err(fail("port must be nonzero"));
@@ -535,13 +547,19 @@ mod tests {
 
     #[test]
     fn rejects_missing_scheme() {
-        let err = "127.0.0.1:80-10.0.2.15:80".parse::<HostForward>().unwrap_err();
+        let err = "127.0.0.1:80-10.0.2.15:80"
+            .parse::<HostForward>()
+            .unwrap_err();
         assert!(err.to_string().contains("tcp:"));
     }
 
     #[test]
     fn rejects_missing_dash() {
-        assert!("tcp:127.0.0.1:80_10.0.2.15:80".parse::<HostForward>().is_err());
+        assert!(
+            "tcp:127.0.0.1:80_10.0.2.15:80"
+                .parse::<HostForward>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -552,18 +570,34 @@ mod tests {
 
     #[test]
     fn rejects_invalid_ip() {
-        assert!("tcp:not-an-ip:80-10.0.2.15:80".parse::<HostForward>().is_err());
+        assert!(
+            "tcp:not-an-ip:80-10.0.2.15:80"
+                .parse::<HostForward>()
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_non_numeric_port() {
-        assert!("tcp:127.0.0.1:abc-10.0.2.15:80".parse::<HostForward>().is_err());
+        assert!(
+            "tcp:127.0.0.1:abc-10.0.2.15:80"
+                .parse::<HostForward>()
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_zero_ports() {
-        assert!("tcp:127.0.0.1:0-10.0.2.15:80".parse::<HostForward>().is_err());
-        assert!("tcp:127.0.0.1:80-10.0.2.15:0".parse::<HostForward>().is_err());
+        assert!(
+            "tcp:127.0.0.1:0-10.0.2.15:80"
+                .parse::<HostForward>()
+                .is_err()
+        );
+        assert!(
+            "tcp:127.0.0.1:80-10.0.2.15:0"
+                .parse::<HostForward>()
+                .is_err()
+        );
     }
 
     #[test]

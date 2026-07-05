@@ -174,8 +174,8 @@ pub fn run_test(name: &str) {
 /// accepted by the gateway and then reset when its inward smoltcp connect
 /// finds no guest listener yet.
 fn try_echo_once(host_port: u16, payload: &[u8]) -> Result<(), String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", host_port))
-        .map_err(|e| format!("connect: {e}"))?;
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", host_port)).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;

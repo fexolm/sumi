@@ -13,7 +13,9 @@ use crate::KERNEL_DIRECT_MAP;
 
 #[inline(always)]
 fn raw_hypercall(offset: usize, arg: u64) {
-    let vaddr = HYPERCALL_MMIO_BASE.add(offset).to_virtual(&KERNEL_DIRECT_MAP);
+    let vaddr = HYPERCALL_MMIO_BASE
+        .add(offset)
+        .to_virtual(&KERNEL_DIRECT_MAP);
     // SAFETY: HYPERCALL_MMIO_BASE is a fixed physical address inside
     // the direct map (set up by sumi-vm with 1 GiB huge pages
     // covering the full 128 TB physical range). The page is

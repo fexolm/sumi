@@ -18,7 +18,7 @@ struct RunQueueInner {
 
 pub struct RunQueue {
     inner: spin::Mutex<RunQueueInner>,
-    load:  AtomicUsize,
+    load: AtomicUsize,
 }
 
 // SAFETY: RunQueue is logically owned by one PerCpu but can be pushed to by

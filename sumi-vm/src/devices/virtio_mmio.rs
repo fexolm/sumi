@@ -143,7 +143,9 @@ impl VirtioMmioDevice {
             VIRTIO_MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| q.ready as u32),
             VIRTIO_MMIO_STATUS => self.status,
             VIRTIO_MMIO_INTERRUPT_STATUS => 0,
-            _ if offset >= VIRTIO_MMIO_CONFIG => self.backend.read_config(offset - VIRTIO_MMIO_CONFIG),
+            _ if offset >= VIRTIO_MMIO_CONFIG => {
+                self.backend.read_config(offset - VIRTIO_MMIO_CONFIG)
+            }
             _ => 0,
         }
     }

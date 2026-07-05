@@ -21,7 +21,7 @@ use crate::debug::{DebugCommand, DebugEvent, RegisterFile, StopReason, VCpuDebug
 use crate::devices::DeviceRegistry;
 use crate::{
     error::Result,
-    vm::{HypercallControl, HypercallContext, VCpu, VirtBackend, VmCreateInfo},
+    vm::{HypercallContext, HypercallControl, VCpu, VirtBackend, VmCreateInfo},
 };
 
 use crate::error::Error;
@@ -603,7 +603,9 @@ impl VCpu for KvmVCpu {
                             HypercallControl::Continue => continue,
                             HypercallControl::Stop => {
                                 // Tell GDB the program exited.
-                                dbg.event_tx.send(DebugEvent::Stopped(StopReason::Exited)).ok();
+                                dbg.event_tx
+                                    .send(DebugEvent::Stopped(StopReason::Exited))
+                                    .ok();
                                 return Ok(());
                             }
                         }

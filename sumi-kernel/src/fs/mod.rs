@@ -145,10 +145,12 @@ impl FdTable {
     pub fn count_pipe_refs(&self, id: usize, write_end: bool) -> usize {
         self.fds
             .iter()
-            .filter(|slot| matches!(slot, Some(d) if matches!(
-                d.kind,
-                FdKind::Pipe { id: pid, write_end: pwe } if pid == id && pwe == write_end
-            )))
+            .filter(|slot| {
+                matches!(slot, Some(d) if matches!(
+                    d.kind,
+                    FdKind::Pipe { id: pid, write_end: pwe } if pid == id && pwe == write_end
+                ))
+            })
             .count()
     }
 }

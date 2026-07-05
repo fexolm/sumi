@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use super::thread::{Thread, Tid};
 
 pub struct ThreadRegistry {
-    by_tid:   BTreeMap<u32, Arc<Thread>>,
+    by_tid: BTreeMap<u32, Arc<Thread>>,
     next_tid: u32,
 }
 
@@ -23,7 +23,7 @@ impl Default for ThreadRegistry {
 impl ThreadRegistry {
     pub const fn new() -> Self {
         Self {
-            by_tid:   BTreeMap::new(),
+            by_tid: BTreeMap::new(),
             // next_tid starts at 2: 0 is reserved, 1 is the BSP main thread
             // (registered separately via `register_main`).
             next_tid: 2,
@@ -63,8 +63,7 @@ impl ThreadRegistry {
     }
 }
 
-pub static THREAD_REGISTRY: spin::Mutex<ThreadRegistry> =
-    spin::Mutex::new(ThreadRegistry::new());
+pub static THREAD_REGISTRY: spin::Mutex<ThreadRegistry> = spin::Mutex::new(ThreadRegistry::new());
 
 /// Count of live *user* threads: the BSP main thread plus every `clone()`/
 /// `clone3()` child, incremented at creation and decremented by `sys_exit`.
@@ -72,8 +71,7 @@ pub static THREAD_REGISTRY: spin::Mutex<ThreadRegistry> =
 /// counts idle threads and zombies still awaiting the reaper — counting
 /// those make the "last thread exits" check in `sys_exit` impossible to
 /// express with `alive_count()`.
-pub static LIVE_USER_THREADS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static LIVE_USER_THREADS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Allocate a fresh TID from the global registry.
 pub fn alloc_tid() -> Tid {

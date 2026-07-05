@@ -432,12 +432,7 @@ impl VirtioFsClient {
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseRenameIn>() + 512];
         debug_assert!(req_len <= req.len());
 
-        self.write_fuse_header_with_len(
-            &mut req,
-            req_len as u32,
-            FUSE_RENAME,
-            old_parent_nodeid,
-        );
+        self.write_fuse_header_with_len(&mut req, req_len as u32, FUSE_RENAME, old_parent_nodeid);
         unsafe {
             core::ptr::write_volatile(
                 req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseRenameIn,
@@ -481,12 +476,7 @@ impl VirtioFsClient {
     }
 
     /// FUSE_MKDIR: create one directory entry below a parent directory.
-    pub fn mkdir(
-        &self,
-        parent_nodeid: u64,
-        name: &[u8],
-        mode: u32,
-    ) -> Result<FuseEntryOut, i32> {
+    pub fn mkdir(&self, parent_nodeid: u64, name: &[u8], mode: u32) -> Result<FuseEntryOut, i32> {
         let mkdir_in_size = size_of::<FuseMkdirIn>();
         let req_len = size_of::<FuseInHeader>() + mkdir_in_size + name.len() + 1;
         let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseMkdirIn>() + 256];

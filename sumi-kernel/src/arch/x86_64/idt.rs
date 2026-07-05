@@ -21,7 +21,7 @@ use core::arch::asm;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IdtEntry {
-    low:  u64,
+    low: u64,
     high: u64,
 }
 
@@ -39,8 +39,8 @@ impl IdtEntry {
     /// Gate type 0xE = 64-bit interrupt gate (clears IF on entry).
     /// Selector 0x08 = kernel code segment.
     const fn interrupt_gate(handler: u64, ist: u8, dpl: u8) -> Self {
-        let offset_low  = handler & 0xFFFF;
-        let offset_mid  = (handler >> 16) & 0xFFFF;
+        let offset_low = handler & 0xFFFF;
+        let offset_mid = (handler >> 16) & 0xFFFF;
         let offset_high = handler >> 32;
 
         // Low 64 bits:
@@ -72,7 +72,7 @@ impl IdtEntry {
 #[repr(C, packed)]
 struct Idtr {
     limit: u16,
-    base:  u64,
+    base: u64,
 }
 
 /// 256-entry IDT. Static so it lives for the kernel's lifetime and both
@@ -95,12 +95,12 @@ pub fn init_and_load() {
     // SAFETY: Called exactly once from the BSP before APs start or
     // before KERNEL_READY is published. No other CPU touches IDT[] here.
     unsafe {
-        IDT[0x06] = IdtEntry::interrupt_gate(isr_ud    as *const () as u64, 0, 0);
-        IDT[0x08] = IdtEntry::interrupt_gate(isr_df    as *const () as u64, 1, 0);
-        IDT[0x0D] = IdtEntry::interrupt_gate(isr_gp    as *const () as u64, 0, 0);
-        IDT[0x0E] = IdtEntry::interrupt_gate(isr_pf    as *const () as u64, 0, 0);
+        IDT[0x06] = IdtEntry::interrupt_gate(isr_ud as *const () as u64, 0, 0);
+        IDT[0x08] = IdtEntry::interrupt_gate(isr_df as *const () as u64, 1, 0);
+        IDT[0x0D] = IdtEntry::interrupt_gate(isr_gp as *const () as u64, 0, 0);
+        IDT[0x0E] = IdtEntry::interrupt_gate(isr_pf as *const () as u64, 0, 0);
         IDT[0x40] = IdtEntry::interrupt_gate(isr_timer as *const () as u64, 1, 0);
-        IDT[0x41] = IdtEntry::interrupt_gate(isr_ipi   as *const () as u64, 1, 0);
+        IDT[0x41] = IdtEntry::interrupt_gate(isr_ipi as *const () as u64, 1, 0);
     }
     load();
 }

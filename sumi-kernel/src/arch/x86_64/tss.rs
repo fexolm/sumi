@@ -16,7 +16,7 @@
 
 use core::arch::asm;
 
-use crate::sched::percpu::{MAX_VCPUS, SYSCALL_STACKS, SYSCALL_STACK_SIZE};
+use crate::sched::percpu::{MAX_VCPUS, SYSCALL_STACK_SIZE, SYSCALL_STACKS};
 
 /// x86-64 TSS. Only RSP0 and IST1..7 fields are meaningful here;
 /// sumi stays in ring 0 throughout so the ring-transition RSP fields
@@ -62,7 +62,7 @@ struct Gdt([u64; 5]);
 #[repr(C, packed)]
 struct Gdtr {
     limit: u16,
-    base:  u64,
+    base: u64,
 }
 
 /// Per-CPU GDT storage.
@@ -86,7 +86,7 @@ pub fn init_and_load(cpu_id: u32) {
         // IST1 so they always have a valid stack even if the interrupted
         // thread's kernel stack is nearly full.
         let stack_base = core::ptr::addr_of!(SYSCALL_STACKS[idx]) as u64;
-        let stack_top  = stack_base + SYSCALL_STACK_SIZE as u64;
+        let stack_top = stack_base + SYSCALL_STACK_SIZE as u64;
 
         // Populate TSS: set IST1 (array index 0) and IOPB offset.
         let tss_ptr = core::ptr::addr_of_mut!(TSS[idx]);
@@ -95,7 +95,7 @@ pub fn init_and_load(cpu_id: u32) {
 
         // Build the 16-byte TSS descriptor.
         // See Intel SDM Vol.3A §7.2.2 for the encoding.
-        let base  = tss_ptr as u64;
+        let base = tss_ptr as u64;
         let limit = (core::mem::size_of::<Tss>() - 1) as u64;
 
         // Low 64 bits:
@@ -119,15 +119,15 @@ pub fn init_and_load(cpu_id: u32) {
 
         // Populate GDT.
         let gdt_ptr = core::ptr::addr_of_mut!(GDT[idx]);
-        (*gdt_ptr).0[0] = 0;                          // null
-        (*gdt_ptr).0[1] = 0x00AF_9A00_0000_FFFF;      // code64
-        (*gdt_ptr).0[2] = 0x00CF_9200_0000_FFFF;      // data
+        (*gdt_ptr).0[0] = 0; // null
+        (*gdt_ptr).0[1] = 0x00AF_9A00_0000_FFFF; // code64
+        (*gdt_ptr).0[2] = 0x00CF_9200_0000_FFFF; // data
         (*gdt_ptr).0[3] = tss_low;
         (*gdt_ptr).0[4] = tss_high;
 
         let gdtr = Gdtr {
             limit: (5 * 8 - 1) as u16,
-            base:  gdt_ptr as u64,
+            base: gdt_ptr as u64,
         };
 
         // SAFETY: gdtr points at a valid 5-entry GDT with a correct TSS

@@ -323,10 +323,7 @@ pub fn sys_get_mempolicy(args: &SyscallArgs) -> SyscallResult {
         // `maxnode` bits. Report node 0 and clear any extra words.
         unsafe {
             for i in 0..words {
-                core::ptr::write_unaligned(
-                    nodemask.add(i),
-                    if i == 0 { 1 } else { 0 },
-                );
+                core::ptr::write_unaligned(nodemask.add(i), if i == 0 { 1 } else { 0 });
             }
         }
     }

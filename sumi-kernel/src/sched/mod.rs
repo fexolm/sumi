@@ -89,7 +89,10 @@ pub fn schedule() {
     let cpu = percpu::this_cpu();
 
     let prev_ptr = cpu.current_thread.load(Ordering::Relaxed);
-    debug_assert!(!prev_ptr.is_null(), "schedule() called before init_phase3_bsp/ap");
+    debug_assert!(
+        !prev_ptr.is_null(),
+        "schedule() called before init_phase3_bsp/ap"
+    );
 
     // Consume the reschedule request BEFORE we pop, so any wake that
     // races with us either (a) lands in the runqueue before pop (and
@@ -137,7 +140,8 @@ pub fn schedule() {
     // touch it until __switch_to_asm clears it again (on next's own future
     // switch-away).
     next.on_cpu.store(true, Ordering::Release);
-    next.state.store(ThreadState::Running as u32, Ordering::Release);
+    next.state
+        .store(ThreadState::Running as u32, Ordering::Release);
     next.cpu.store(cpu.cpu_id, Ordering::Relaxed);
     cpu.current_thread.store(next_ptr, Ordering::Release);
 
@@ -219,9 +223,7 @@ pub fn wake_blocked(t: &Thread) {
     // Only kick a remote CPU: kicking ourselves is a no-op at best and
     // wasteful at worst. The idle flag check is still needed to avoid
     // sending an IPI when the target is already in the runqueue path.
-    if target.cpu_id != percpu::this_cpu().cpu_id
-        && target.is_idle.load(Ordering::Acquire)
-    {
+    if target.cpu_id != percpu::this_cpu().cpu_id && target.is_idle.load(Ordering::Acquire) {
         kick_cpu(target.cpu_id);
     }
 }
@@ -265,7 +267,8 @@ pub fn init_phase3_bsp() {
     cpu.idle_thread.store(idle_ptr, Ordering::Release);
 
     main.cpu.store(cpu.cpu_id, Ordering::Relaxed);
-    main.state.store(ThreadState::Running as u32, Ordering::Release);
+    main.state
+        .store(ThreadState::Running as u32, Ordering::Release);
 }
 
 /// Initialise scheduler state for an AP and enter the idle loop.
@@ -286,7 +289,8 @@ pub fn init_phase3_ap(cpu_id: u32) -> ! {
     cpu.current_thread.store(idle_ptr, Ordering::Release);
     cpu.idle_thread.store(idle_ptr, Ordering::Release);
     idle.cpu.store(cpu.cpu_id, Ordering::Relaxed);
-    idle.state.store(ThreadState::Running as u32, Ordering::Release);
+    idle.state
+        .store(ThreadState::Running as u32, Ordering::Release);
 
     // Enter idle directly — we're already on the AP boot stack.
     idle_loop()
@@ -312,12 +316,16 @@ pub(crate) fn try_steal_work() -> bool {
         if id == my_id {
             continue;
         }
-        let Some(peer) = percpu::get(id) else { continue };
+        let Some(peer) = percpu::get(id) else {
+            continue;
+        };
         // Quick hint check before taking the lock.
         if peer.runqueue.load() == 0 {
             continue;
         }
-        let Some(stolen_ptr) = peer.runqueue.pop() else { continue };
+        let Some(stolen_ptr) = peer.runqueue.pop() else {
+            continue;
+        };
         // SAFETY: stolen_ptr came from a live runqueue entry; the backing
         // Thread lives in THREAD_REGISTRY for the kernel's lifetime.
         let stolen = unsafe { &*stolen_ptr };
@@ -354,7 +362,9 @@ pub fn idle_loop() -> ! {
         // the designated `sti; hlt` wait point.
         //
         // SAFETY: ring 0, no memory access, no stack use.
-        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
 
         let cpu = percpu::this_cpu();
         cpu.is_idle.store(true, Ordering::Release);
@@ -377,7 +387,9 @@ pub fn idle_loop() -> ! {
         // SIGUSR1 (from HC_KICK_CPU) wakes it.
         //
         // SAFETY: ring 0, no memory access, no stack use.
-        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("sti; hlt", options(nomem, nostack));
+        }
         cpu.is_idle.store(false, Ordering::Release);
         // Loop back to re-check the runqueue (which re-asserts `cli`).
     }

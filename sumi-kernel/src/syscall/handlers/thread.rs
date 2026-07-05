@@ -46,9 +46,9 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     let uaddr = args.arg0 as *const u32;
-    let op    = args.arg1 as i32;
-    let val   = args.arg2 as u32;
-    let cmd   = op & FUTEX_CMD_MASK;
+    let op = args.arg1 as i32;
+    let val = args.arg2 as u32;
+    let cmd = op & FUTEX_CMD_MASK;
 
     if uaddr.is_null() {
         return EFAULT;
@@ -59,11 +59,7 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
             return EINVAL;
         }
         let cur = unsafe { AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire) };
-        if cur != val {
-            EAGAIN
-        } else {
-            ETIMEDOUT
-        }
+        if cur != val { EAGAIN } else { ETIMEDOUT }
     };
 
     match cmd {
@@ -226,9 +222,15 @@ mod tests {
     #[test]
     fn set_robust_list_rejects_wrong_length() {
         let args = SyscallArgs {
-            nr: 273, arg0: 0x1000, arg1: 32,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
-            caller_rip: 0, caller_rflags: 0,
+            nr: 273,
+            arg0: 0x1000,
+            arg1: 32,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         };
         assert_eq!(sys_set_robust_list(&args), EINVAL);
     }
@@ -239,13 +241,20 @@ mod tests {
             Box::leak(Box::new(crate::sched::thread::Thread::new_test(9002)));
         crate::sched::percpu::install_test_thread(0, t);
         let args = SyscallArgs {
-            nr: 273, arg0: 0x1000, arg1: 24,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
-            caller_rip: 0, caller_rflags: 0,
+            nr: 273,
+            arg0: 0x1000,
+            arg1: 24,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
         };
         assert_eq!(sys_set_robust_list(&args), 0);
         assert_eq!(
-            t.robust_list_head.load(core::sync::atomic::Ordering::Relaxed),
+            t.robust_list_head
+                .load(core::sync::atomic::Ordering::Relaxed),
             0x1000,
         );
     }

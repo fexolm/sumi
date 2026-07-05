@@ -52,8 +52,7 @@ impl Default for FutexBucket {
 // pointer. The intrusive list is always mutated under `lock`.
 unsafe impl Sync for FutexBucket {}
 
-static BUCKETS: [FutexBucket; FUTEX_BUCKETS] =
-    [const { FutexBucket::new() }; FUTEX_BUCKETS];
+static BUCKETS: [FutexBucket; FUTEX_BUCKETS] = [const { FutexBucket::new() }; FUTEX_BUCKETS];
 
 /// Knuth multiplicative hash on (uaddr >> 2). The shift discards the two
 /// low bits that are always zero for an aligned u32.
@@ -90,9 +89,7 @@ pub fn wait(uaddr: *const u32, expected: u32) -> i64 {
     // aligned u32 addresses by construction. We do NOT validate
     // alignment here — a misaligned user pointer is UB.
     // TODO: align-check the user pointer in sys_futex.
-    let cur = unsafe {
-        AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire)
-    };
+    let cur = unsafe { AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire) };
     if cur != expected {
         drop(g);
         return EAGAIN;
@@ -143,9 +140,7 @@ pub fn wait_bitset(uaddr: *const u32, expected: u32, bitset: u32) -> i64 {
     let bucket = bucket_for(uaddr as usize);
     let g = bucket.lock.lock();
 
-    let cur = unsafe {
-        AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire)
-    };
+    let cur = unsafe { AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire) };
     if cur != expected {
         drop(g);
         return EAGAIN;
@@ -176,16 +171,24 @@ pub fn wake_bitset(uaddr: *const u32, max: u32, bitset: u32) -> i64 {
     let mut woken: u32 = 0;
     let mut cur_link: *const AtomicPtr<Thread> = &bucket.head;
     loop {
-        if woken >= max { break; }
+        if woken >= max {
+            break;
+        }
         let cur_ptr = unsafe { (*cur_link).load(Ordering::Relaxed) };
-        if cur_ptr.is_null() { break; }
+        if cur_ptr.is_null() {
+            break;
+        }
         let cur = unsafe { &*cur_ptr };
         if cur.wait_link.uaddr.load(Ordering::Relaxed) == uaddr as u64
             && cur.wait_link.bitset.load(Ordering::Relaxed) & bitset != 0
         {
             let next_ptr = cur.wait_link.next.load(Ordering::Relaxed);
-            unsafe { (*cur_link).store(next_ptr, Ordering::Release); }
-            cur.wait_link.next.store(core::ptr::null_mut(), Ordering::Relaxed);
+            unsafe {
+                (*cur_link).store(next_ptr, Ordering::Release);
+            }
+            cur.wait_link
+                .next
+                .store(core::ptr::null_mut(), Ordering::Relaxed);
             debug_assert_eq!(
                 cur.state.load(Ordering::Relaxed),
                 ThreadState::Blocked as u32,
@@ -297,7 +300,7 @@ mod tests {
     #[test]
     fn bucket_for_masks_to_array_bounds() {
         let base = &BUCKETS[0] as *const _ as usize;
-        let end  = base + FUTEX_BUCKETS * core::mem::size_of::<FutexBucket>();
+        let end = base + FUTEX_BUCKETS * core::mem::size_of::<FutexBucket>();
         for i in 0..4096usize {
             let p = bucket_for(i * 4) as *const _ as usize;
             assert!(p >= base && p < end);

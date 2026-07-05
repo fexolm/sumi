@@ -12,8 +12,8 @@ use sumi_abi::address::PhysicalAddr;
 use sumi_abi::arch::layout::LAPIC_BASE_PHYS;
 
 // LAPIC register offsets (byte offsets from LAPIC_BASE).
-const LAPIC_SVR:       u32 = 0x0F0; // Spurious Vector Register
-const LAPIC_EOI:       u32 = 0x0B0; // End of Interrupt (write-only)
+const LAPIC_SVR: u32 = 0x0F0; // Spurious Vector Register
+const LAPIC_EOI: u32 = 0x0B0; // End of Interrupt (write-only)
 const LAPIC_LVT_TIMER: u32 = 0x320; // LVT Timer register
 const LAPIC_TIMER_ICR: u32 = 0x380; // Timer Initial Count Register
 const LAPIC_TIMER_DCR: u32 = 0x3E0; // Timer Divide Configuration Register
