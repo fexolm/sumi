@@ -25,6 +25,7 @@ pub const EADDRNOTAVAIL: SyscallResult = -99;
 pub const ECONNRESET: SyscallResult = -104;
 pub const EISCONN: SyscallResult = -106;
 pub const ENOTCONN: SyscallResult = -107;
+pub const ETIMEDOUT: SyscallResult = -110;
 pub const ECONNREFUSED: SyscallResult = -111;
 pub const EALREADY: SyscallResult = -114;
 pub const EINPROGRESS: SyscallResult = -115;

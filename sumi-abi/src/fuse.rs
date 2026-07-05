@@ -6,6 +6,11 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 pub const FUSE_LOOKUP: u32 = 1;
 pub const FUSE_FORGET: u32 = 2;
 pub const FUSE_GETATTR: u32 = 3;
+pub const FUSE_SETATTR: u32 = 4;
+pub const FUSE_MKDIR: u32 = 9;
+pub const FUSE_UNLINK: u32 = 10;
+pub const FUSE_RMDIR: u32 = 11;
+pub const FUSE_RENAME: u32 = 12;
 pub const FUSE_OPEN: u32 = 14;
 pub const FUSE_READ: u32 = 15;
 pub const FUSE_WRITE: u32 = 16;
@@ -24,6 +29,8 @@ pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1;
 pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 2;
 
 pub const FUSE_ROOT_ID: u64 = 1;
+pub const FATTR_SIZE: u32 = 1 << 3;
+pub const FATTR_FH: u32 = 1 << 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -176,11 +183,45 @@ pub struct FuseAttrOut {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct FuseSetattrIn {
+    pub valid: u32,
+    pub padding: u32,
+    pub fh: u64,
+    pub size: u64,
+    pub lock_owner: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atimensec: u32,
+    pub mtimensec: u32,
+    pub ctimensec: u32,
+    pub mode: u32,
+    pub unused4: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub unused5: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct FuseCreateIn {
     pub flags: u32,
     pub mode: u32,
     pub umask: u32,
     pub open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseMkdirIn {
+    pub mode: u32,
+    pub umask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FuseRenameIn {
+    pub newdir: u64,
 }
 
 #[repr(C)]

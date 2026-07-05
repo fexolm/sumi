@@ -111,6 +111,14 @@ pub fn sys_getppid(_args: &SyscallArgs) -> SyscallResult {
     0
 }
 
+pub fn sys_getpriority(_args: &SyscallArgs) -> SyscallResult {
+    0
+}
+
+pub fn sys_setpriority(_args: &SyscallArgs) -> SyscallResult {
+    0
+}
+
 /// Load IA32_FS_BASE with `addr` so %fs-relative addressing (TLS) sees the
 /// new base immediately. Host stand-in: no MSR on the test host — every
 /// test-reachable read of the FS base goes through `current_thread().fs_base`
@@ -279,6 +287,58 @@ pub fn sys_sysinfo(args: &SyscallArgs) -> SyscallResult {
         (*buf).procs = 1;
         (*buf).mem_unit = 1;
     }
+    0
+}
+
+/// `get_mempolicy(2)` compatibility for libnuma/MySQL startup probes.
+/// sumi exposes one effective NUMA node and the default memory policy.
+pub fn sys_get_mempolicy(args: &SyscallArgs) -> SyscallResult {
+    let mode = args.arg0 as *mut i32;
+    let nodemask = args.arg1 as *mut u64;
+    let maxnode = args.arg2;
+    let addr = args.arg3;
+    let flags = args.arg4;
+
+    const MPOL_F_NODE: u64 = 1 << 0;
+    const MPOL_F_ADDR: u64 = 1 << 1;
+    const MPOL_F_MEMS_ALLOWED: u64 = 1 << 2;
+    const SUPPORTED_FLAGS: u64 = MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED;
+
+    if flags & !SUPPORTED_FLAGS != 0 {
+        return EINVAL;
+    }
+    if flags & MPOL_F_ADDR != 0 && addr == 0 {
+        return EFAULT;
+    }
+
+    if !mode.is_null() {
+        // SAFETY: caller-provided writable int pointer.
+        unsafe {
+            core::ptr::write_unaligned(mode, 0);
+        }
+    }
+    if !nodemask.is_null() && maxnode > 0 {
+        let words = maxnode.div_ceil(64) as usize;
+        // SAFETY: caller-provided writable nodemask with enough words for
+        // `maxnode` bits. Report node 0 and clear any extra words.
+        unsafe {
+            for i in 0..words {
+                core::ptr::write_unaligned(
+                    nodemask.add(i),
+                    if i == 0 { 1 } else { 0 },
+                );
+            }
+        }
+    }
+
+    0
+}
+
+pub fn sys_set_mempolicy(_args: &SyscallArgs) -> SyscallResult {
+    0
+}
+
+pub fn sys_mbind(_args: &SyscallArgs) -> SyscallResult {
     0
 }
 

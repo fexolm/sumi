@@ -874,8 +874,12 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     const F_SETFD: i32 = 2;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    const F_GETLK: i32 = 5;
+    const F_SETLK: i32 = 6;
+    const F_SETLKW: i32 = 7;
     const F_DUPFD: i32 = 0;
     const F_DUPFD_CLOEXEC: i32 = 1030;
+    const F_UNLCK: i16 = 2;
 
     match cmd {
         F_SETFL => {
@@ -909,6 +913,23 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
                     F_GETFD => 0, // no close-on-exec in unikernel
                     F_SETFD => 0, // ignore
                     F_GETFL => desc.flags as SyscallResult,
+                    F_GETLK => {
+                        if args.arg2 == 0 {
+                            return EFAULT;
+                        }
+                        // `struct flock` starts with `short l_type`.
+                        // Report "no conflicting lock" in sumi's single process.
+                        unsafe {
+                            core::ptr::write_unaligned(args.arg2 as *mut i16, F_UNLCK);
+                        }
+                        0
+                    }
+                    F_SETLK | F_SETLKW => {
+                        if args.arg2 == 0 {
+                            return EFAULT;
+                        }
+                        0
+                    }
                     F_DUPFD | F_DUPFD_CLOEXEC => {
                         let new_desc = *desc;
                         drop(table);
@@ -919,6 +940,107 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
                 },
             }
         }
+    }
+}
+
+pub fn sys_io_setup(_args: &SyscallArgs) -> SyscallResult {
+    ENOSYS
+}
+
+pub fn sys_fallocate(args: &SyscallArgs) -> SyscallResult {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    static ZERO_PAGE: [u8; 4096] = [0; 4096];
+
+    let fd_num = args.arg0 as usize;
+    let mode = args.arg1 as u32;
+    let offset = args.arg2 as i64;
+    let len = args.arg3 as i64;
+
+    if offset < 0 || len <= 0 {
+        return EINVAL;
+    }
+    if mode == (FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) {
+        return 0;
+    }
+    if mode != 0 {
+        return EOPNOTSUPP;
+    }
+
+    let offset = offset as u64;
+    let len = len as u64;
+    let end = match offset.checked_add(len) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    let fuse_fh = {
+        let table = crate::FD_TABLE.lock();
+        match table.get(fd_num) {
+            Some(desc) => match desc.kind {
+                FdKind::File { fuse_fh, .. } => fuse_fh,
+                _ => return EBADF,
+            },
+            None => return EBADF,
+        }
+    };
+
+    let fs = crate::fs();
+    let zero_phys = crate::fs::virtio_fs::VirtioFsClient::v2p(ZERO_PAGE.as_ptr());
+    let mut pos = offset;
+    while pos < end {
+        let count = (end - pos).min(ZERO_PAGE.len() as u64) as u32;
+        match fs.write(fuse_fh, pos, zero_phys, count) {
+            Ok(0) => return EIO,
+            Ok(n) => pos += n as u64,
+            Err(e) => return e as SyscallResult,
+        }
+    }
+
+    let mut table = crate::FD_TABLE.lock();
+    if let Some(desc) = table.get_mut(fd_num)
+        && let FdKind::File { ref mut size, .. } = desc.kind
+        && end > *size
+    {
+        *size = end;
+    }
+    0
+}
+
+pub fn sys_ftruncate(args: &SyscallArgs) -> SyscallResult {
+    let fd_num = args.arg0 as usize;
+    let len = args.arg1 as i64;
+
+    if len < 0 {
+        return EINVAL;
+    }
+
+    let (fuse_fh, fuse_nodeid) = {
+        let table = crate::FD_TABLE.lock();
+        match table.get(fd_num) {
+            Some(desc) => match desc.kind {
+                FdKind::File {
+                    fuse_fh,
+                    fuse_nodeid,
+                    ..
+                } => (fuse_fh, fuse_nodeid),
+                _ => return EBADF,
+            },
+            None => return EBADF,
+        }
+    };
+
+    match crate::fs().setattr_size(fuse_nodeid, Some(fuse_fh), len as u64) {
+        Ok(_) => {
+            let mut table = crate::FD_TABLE.lock();
+            if let Some(desc) = table.get_mut(fd_num)
+                && let FdKind::File { ref mut size, .. } = desc.kind
+            {
+                *size = len as u64;
+            }
+            0
+        }
+        Err(e) => e as SyscallResult,
     }
 }
 

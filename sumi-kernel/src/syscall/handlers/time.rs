@@ -21,6 +21,13 @@ struct Timeval {
     tv_usec: i64,
 }
 
+#[repr(C)]
+struct Rusage {
+    ru_utime: Timeval,
+    ru_stime: Timeval,
+    ru_rest: [i64; 14],
+}
+
 pub fn sys_nanosleep(args: &SyscallArgs) -> SyscallResult {
     let req = args.arg0 as *const Timespec;
     let rem = args.arg1 as *mut Timespec;
@@ -85,6 +92,66 @@ pub fn sys_time(args: &SyscallArgs) -> SyscallResult {
         }
     }
     sec as SyscallResult
+}
+
+/// Linux's `times(2)` reports elapsed scheduler ticks and optionally fills
+/// `struct tms`. MySQL polls this during startup; wall-clock monotonic ticks
+/// are enough for its progress accounting in sumi's single-address-space
+/// process model.
+#[repr(C)]
+struct Tms {
+    tms_utime: i64,
+    tms_stime: i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+pub fn sys_times(args: &SyscallArgs) -> SyscallResult {
+    const USER_HZ: u64 = 100;
+    let ticks = crate::time::monotonic_ns() / (1_000_000_000 / USER_HZ);
+    let buf = args.arg0 as *mut Tms;
+
+    if !buf.is_null() {
+        // SAFETY: single-process unikernel — user pointers are in the same
+        // address space; invalid pointers fault like other syscall buffers.
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 1);
+        }
+    }
+
+    ticks as SyscallResult
+}
+
+pub fn sys_getrusage(args: &SyscallArgs) -> SyscallResult {
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_THREAD: i64 = 1;
+
+    let who = args.arg0 as i64;
+    let usage = args.arg1 as *mut Rusage;
+
+    match who {
+        RUSAGE_CHILDREN | RUSAGE_SELF | RUSAGE_THREAD => {}
+        _ => return EINVAL,
+    }
+    if usage.is_null() {
+        return EFAULT;
+    }
+
+    let now_ns = if who == RUSAGE_CHILDREN {
+        0
+    } else {
+        crate::time::monotonic_ns()
+    };
+
+    // SAFETY: single-process unikernel — user pointers share the kernel address
+    // space; invalid pointers fault consistently with the other syscall buffers.
+    unsafe {
+        core::ptr::write_bytes(usage, 0, 1);
+        (*usage).ru_utime.tv_sec = (now_ns / 1_000_000_000) as i64;
+        (*usage).ru_utime.tv_usec = ((now_ns % 1_000_000_000) / 1_000) as i64;
+    }
+    0
 }
 
 // Linux x86_64 RLIMIT_* numbers (kernel ABI, stable).

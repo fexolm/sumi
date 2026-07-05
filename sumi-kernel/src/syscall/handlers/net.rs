@@ -66,7 +66,7 @@ pub fn sys_socket(args: &SyscallArgs) -> SyscallResult {
     let typ_raw = args.arg1 as u32;
     let typ = (typ_raw & 0xFF) as u16;
 
-    if domain != socket::AF_INET && domain != socket::AF_INET6 {
+    if domain != socket::AF_UNIX && domain != socket::AF_INET && domain != socket::AF_INET6 {
         return EAFNOSUPPORT;
     }
     if typ != socket::SOCK_STREAM {
@@ -101,6 +101,15 @@ pub fn sys_bind(args: &SyscallArgs) -> SyscallResult {
         Ok(id) => id,
         Err(e) => return e,
     };
+    {
+        let g = net::lock();
+        let Some(obj) = g.socket_get(id) else {
+            return EBADF;
+        };
+        if obj.domain == socket::AF_UNIX {
+            return 0;
+        }
+    }
     let ep = match net::parse_sockaddr(args.arg1, args.arg2 as u32) {
         Ok(ep) => ep,
         Err(e) => return e,
@@ -127,6 +136,12 @@ pub fn sys_listen(args: &SyscallArgs) -> SyscallResult {
     let Some(obj) = g.socket_get(id) else {
         return EBADF;
     };
+    if obj.domain == socket::AF_UNIX {
+        let obj = g.socket_get_mut(id).expect("id validated above");
+        obj.role = socket::SockRole::Listener;
+        g.poll_and_wake();
+        return 0;
+    }
     let Some(local) = obj.local else {
         return EINVAL; // must bind() before listen()
     };
@@ -551,6 +566,20 @@ pub fn sys_getsockname(args: &SyscallArgs) -> SyscallResult {
     let Some(obj) = g.socket_get(id) else {
         return EBADF;
     };
+    if obj.domain == socket::AF_UNIX {
+        let addr_ptr = args.arg1;
+        let addrlen_ptr = args.arg2;
+        if addr_ptr != 0 && addrlen_ptr != 0 {
+            let cap = unsafe { core::ptr::read_unaligned(addrlen_ptr as *const u32) };
+            if cap >= 2 {
+                unsafe {
+                    core::ptr::write_unaligned(addr_ptr as *mut u16, socket::AF_UNIX);
+                    core::ptr::write_unaligned(addrlen_ptr as *mut u32, 2);
+                }
+            }
+        }
+        return 0;
+    }
     let ep = match obj.handle {
         Some(h) => g.sockets.get::<tcp::Socket>(h).local_endpoint(),
         None => obj.local,

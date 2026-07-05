@@ -43,6 +43,8 @@ const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 /// a second thread to wake it, so most host tests exercise the bookkeeping
 /// via `sched::futex` directly rather than through this dispatch.
 pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
     let uaddr = args.arg0 as *const u32;
     let op    = args.arg1 as i32;
     let val   = args.arg2 as u32;
@@ -52,15 +54,33 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
         return EFAULT;
     }
 
+    let timed_probe = |bitset: Option<u32>| -> SyscallResult {
+        if matches!(bitset, Some(0)) {
+            return EINVAL;
+        }
+        let cur = unsafe { AtomicU32::from_ptr(uaddr as *mut u32).load(Ordering::Acquire) };
+        if cur != val {
+            EAGAIN
+        } else {
+            ETIMEDOUT
+        }
+    };
+
     match cmd {
+        FUTEX_WAIT if args.arg3 != 0 => timed_probe(None),
         FUTEX_WAIT => crate::sched::futex::wait(uaddr, val),
         FUTEX_WAKE => crate::sched::futex::wake(uaddr, val),
         FUTEX_WAIT_BITSET => {
-            // arg3 (r10) = timeout pointer (ignored in sumi — no timed waits)
+            // arg3 (r10) = timeout pointer. Timed waits do not enqueue a
+            // waiter yet; report timeout after the required value check.
             // arg4 (r8)  = unused
             // arg5 (r9)  = bitset
             let bitset = args.arg5 as u32;
-            crate::sched::futex::wait_bitset(uaddr, val, bitset)
+            if args.arg3 != 0 {
+                timed_probe(Some(bitset))
+            } else {
+                crate::sched::futex::wait_bitset(uaddr, val, bitset)
+            }
         }
         FUTEX_WAKE_BITSET => {
             // arg5 (r9) = bitset
@@ -107,6 +127,37 @@ pub fn sys_sched_getaffinity(args: &SyscallArgs) -> SyscallResult {
         }
     }
     8
+}
+
+pub fn sys_sched_setaffinity(args: &SyscallArgs) -> SyscallResult {
+    let pid = args.arg0 as i64;
+    let cpusetsize = args.arg1 as usize;
+    let mask_ptr = args.arg2 as *const u8;
+
+    if pid != 0 && pid != 1 {
+        return ESRCH;
+    }
+    if cpusetsize > 0 && mask_ptr.is_null() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn sys_getcpu(args: &SyscallArgs) -> SyscallResult {
+    let cpu_ptr = args.arg0 as *mut u32;
+    let node_ptr = args.arg1 as *mut u32;
+
+    // sumi currently exposes one NUMA node. Returning CPU 0 is enough for
+    // libraries that use getcpu() only for cache sharding or diagnostics.
+    unsafe {
+        if !cpu_ptr.is_null() {
+            *cpu_ptr = 0;
+        }
+        if !node_ptr.is_null() {
+            *node_ptr = 0;
+        }
+    }
+    0
 }
 
 pub fn sys_set_robust_list(args: &SyscallArgs) -> SyscallResult {

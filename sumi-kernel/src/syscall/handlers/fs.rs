@@ -22,6 +22,29 @@ fn cwd_bytes() -> alloc::vec::Vec<u8> {
     }
 }
 
+fn normalize_abs_path(path: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut parts: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    for part in path.split(|&b| b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    let mut out = alloc::vec::Vec::new();
+    out.push(b'/');
+    for (idx, part) in parts.iter().enumerate() {
+        if idx != 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 fn read_user_path_inner(ptr: u64, allow_empty: bool) -> Result<alloc::vec::Vec<u8>, SyscallResult> {
     let path_ptr = ptr as *const u8;
     // SAFETY: Unikernel — single address space, user and kernel share memory.
@@ -44,20 +67,24 @@ fn read_user_path_inner(ptr: u64, allow_empty: bool) -> Result<alloc::vec::Vec<u
             Err(-2) // ENOENT — Linux rejects the empty path
         };
     }
-    if raw[0] == b'/' {
-        return Ok(raw.to_vec());
+    let mut abs = if raw[0] == b'/' {
+        raw.to_vec()
+    } else {
+        let mut abs = cwd_bytes();
+        if abs.last() != Some(&b'/') {
+            abs.push(b'/');
+        }
+        abs.extend_from_slice(raw);
+        abs
+    };
+    if abs.first() != Some(&b'/') {
+        abs.insert(0, b'/');
     }
-    let mut abs = cwd_bytes();
-    if abs.last() != Some(&b'/') {
-        abs.push(b'/');
-    }
-    abs.extend_from_slice(raw);
-    Ok(abs)
+    Ok(normalize_abs_path(&abs))
 }
 
 /// Read a user path and make it absolute against the current working
-/// directory. `.`/`..` components are left intact — path resolution joins
-/// them on the host, where they behave normally.
+/// directory, normalizing `.`/`..` before FUSE component lookup.
 fn read_user_path(ptr: u64) -> Result<alloc::vec::Vec<u8>, SyscallResult> {
     read_user_path_inner(ptr, false)
 }
@@ -482,16 +509,134 @@ pub fn sys_fchdir(_args: &SyscallArgs) -> SyscallResult {
     0
 }
 
-pub fn sys_rename(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_rename(args: &SyscallArgs) -> SyscallResult {
+    let old_path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_path = match read_user_path(args.arg1) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let fs = crate::fs();
+    let (old_parent_path, old_name) = match split_path(&old_path) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+    let (new_parent_path, new_name) = match split_path(&new_path) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+
+    let old_parent_nodeid = match fs.resolve_path(old_parent_path) {
+        Ok(id) => id,
+        Err(e) => return e as SyscallResult,
+    };
+    let new_parent_nodeid = match fs.resolve_path(new_parent_path) {
+        Ok(id) => id,
+        Err(e) => {
+            forget_if_not_root(fs, old_parent_nodeid);
+            return e as SyscallResult;
+        }
+    };
+    let result = fs.rename(old_parent_nodeid, old_name, new_parent_nodeid, new_name);
+    forget_if_not_root(fs, old_parent_nodeid);
+    forget_if_not_root(fs, new_parent_nodeid);
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => e as SyscallResult,
+    }
 }
 
-pub fn sys_mkdir(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_truncate(args: &SyscallArgs) -> SyscallResult {
+    let path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let len = args.arg1 as i64;
+    if len < 0 {
+        return EINVAL;
+    }
+
+    let fs = crate::fs();
+    let nodeid = match fs.resolve_path(&path) {
+        Ok(id) => id,
+        Err(e) => return e as SyscallResult,
+    };
+    let result = fs.setattr_size(nodeid, None, len as u64);
+    forget_if_not_root(fs, nodeid);
+
+    match result {
+        Ok(_) => 0,
+        Err(e) => e as SyscallResult,
+    }
 }
 
-pub fn sys_rmdir(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+fn do_mkdirat(dirfd: i32, path: &[u8], mode: u32) -> SyscallResult {
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
+        return ENOSYS;
+    }
+
+    let fs = crate::fs();
+    let (parent_path, filename) = match split_path(path) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+    let parent_nodeid = match fs.resolve_path(parent_path) {
+        Ok(id) => id,
+        Err(e) => return e as SyscallResult,
+    };
+    let result = fs.mkdir(parent_nodeid, filename, mode);
+    forget_if_not_root(fs, parent_nodeid);
+
+    match result {
+        Ok(entry) => {
+            forget_if_not_root(fs, entry.nodeid);
+            0
+        }
+        Err(e) => e as SyscallResult,
+    }
+}
+
+pub fn sys_mkdir(args: &SyscallArgs) -> SyscallResult {
+    let path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_mkdirat(AT_FDCWD, &path, args.arg1 as u32)
+}
+
+fn do_rmdir(dirfd: i32, path: &[u8]) -> SyscallResult {
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
+        return ENOSYS;
+    }
+
+    let fs = crate::fs();
+    let (parent_path, filename) = match split_path(path) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+    let parent_nodeid = match fs.resolve_path(parent_path) {
+        Ok(id) => id,
+        Err(e) => return e as SyscallResult,
+    };
+    let result = fs.rmdir(parent_nodeid, filename);
+    forget_if_not_root(fs, parent_nodeid);
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+pub fn sys_rmdir(args: &SyscallArgs) -> SyscallResult {
+    let path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_rmdir(AT_FDCWD, &path)
 }
 
 pub fn sys_creat(args: &SyscallArgs) -> SyscallResult {
@@ -543,8 +688,40 @@ pub fn sys_link(_args: &SyscallArgs) -> SyscallResult {
     ENOSYS
 }
 
-pub fn sys_unlink(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+fn do_unlinkat(dirfd: i32, path: &[u8], flags: u32) -> SyscallResult {
+    const AT_REMOVEDIR: u32 = 0x200;
+
+    if flags & AT_REMOVEDIR != 0 {
+        return do_rmdir(dirfd, path);
+    }
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
+        return ENOSYS;
+    }
+
+    let fs = crate::fs();
+    let (parent_path, filename) = match split_path(path) {
+        Some(v) => v,
+        None => return EINVAL,
+    };
+    let parent_nodeid = match fs.resolve_path(parent_path) {
+        Ok(id) => id,
+        Err(e) => return e as SyscallResult,
+    };
+    let result = fs.unlink(parent_nodeid, filename);
+    forget_if_not_root(fs, parent_nodeid);
+
+    match result {
+        Ok(()) => 0,
+        Err(e) => e as SyscallResult,
+    }
+}
+
+pub fn sys_unlink(args: &SyscallArgs) -> SyscallResult {
+    let path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_unlinkat(AT_FDCWD, &path, 0)
 }
 
 pub fn sys_symlink(_args: &SyscallArgs) -> SyscallResult {
@@ -694,8 +871,22 @@ pub fn sys_newfstatat(args: &SyscallArgs) -> SyscallResult {
     do_stat_path(&path, buf_addr)
 }
 
-pub fn sys_unlinkat(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+pub fn sys_unlinkat(args: &SyscallArgs) -> SyscallResult {
+    let dirfd = args.arg0 as i32;
+    let path = match read_user_path(args.arg1) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_unlinkat(dirfd, &path, args.arg2 as u32)
+}
+
+pub fn sys_mkdirat(args: &SyscallArgs) -> SyscallResult {
+    let dirfd = args.arg0 as i32;
+    let path = match read_user_path(args.arg1) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_mkdirat(dirfd, &path, args.arg2 as u32)
 }
 
 /// Split a path into (parent, filename). E.g. "/foo/bar" -> ("/foo", "bar").

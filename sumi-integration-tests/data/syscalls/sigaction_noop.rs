@@ -5,7 +5,9 @@ include!("../common.rs");
 
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_RT_SIGTIMEDWAIT: u64 = 128;
 const SIGUSR1: u64 = 10;
+const EAGAIN: i64 = -11;
 const EINVAL: i64 = -22;
 
 #[repr(C)]
@@ -87,5 +89,23 @@ pub extern "C" fn sumi_main() -> i32 {
         )
     };
     check_eq!(r, EINVAL);
+
+    // Timed sigwait-style calls must report that no signal is pending. The
+    // untimed path intentionally parks the caller for signal-handler threads.
+    let wait_mask = 1u64 << SIGUSR1;
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let r = unsafe {
+        syscall4(
+            SYS_RT_SIGTIMEDWAIT,
+            &wait_mask as *const _ as u64,
+            0,
+            &timeout as *const _ as u64,
+            8,
+        )
+    };
+    check_eq!(r, EAGAIN);
     pass!();
 }

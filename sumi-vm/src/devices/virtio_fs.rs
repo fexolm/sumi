@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -146,6 +146,11 @@ impl VirtioFs {
             FUSE_INIT => self.handle_init(header, writable_bufs, mem),
             FUSE_LOOKUP => self.handle_lookup(header, req_data, writable_bufs, mem),
             FUSE_GETATTR => self.handle_getattr(header, writable_bufs, mem),
+            FUSE_SETATTR => self.handle_setattr(header, req_data, writable_bufs, mem),
+            FUSE_MKDIR => self.handle_mkdir(header, req_data, writable_bufs, mem),
+            FUSE_UNLINK => self.handle_unlink(header, req_data, writable_bufs, mem),
+            FUSE_RMDIR => self.handle_rmdir(header, req_data, writable_bufs, mem),
+            FUSE_RENAME => self.handle_rename(header, req_data, writable_bufs, mem),
             FUSE_CREATE => self.handle_create(header, req_data, writable_bufs, mem),
             FUSE_FSYNC => self.handle_fsync(header, req_data, writable_bufs, mem),
             FUSE_OPEN | FUSE_OPENDIR => self.handle_open(header, req_data, writable_bufs, mem),
@@ -366,6 +371,270 @@ impl VirtioFs {
             )
         };
         self.write_response(header.unique, body, writable_bufs, mem)
+    }
+
+    fn handle_setattr(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let setattr_in_size = core::mem::size_of::<FuseSetattrIn>();
+        if req_data.len() < hdr_size + setattr_in_size {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let setattr = unsafe {
+            core::ptr::read_unaligned(req_data[hdr_size..].as_ptr() as *const FuseSetattrIn)
+        };
+        if setattr.valid & FATTR_SIZE == 0 {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+        if setattr.valid & !(FATTR_SIZE | FATTR_FH) != 0 {
+            return self.write_error(header.unique, -95, writable_bufs, mem);
+        }
+
+        let path = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+
+        let set_len_result = if setattr.valid & FATTR_FH != 0 {
+            match self.file_handles.get_mut(setattr.fh as usize) {
+                Some(Some(file)) => file.set_len(setattr.size),
+                _ => return self.write_error(header.unique, -9, writable_bufs, mem),
+            }
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(setattr.size))
+        };
+        if let Err(e) = set_len_result {
+            let errno = e.raw_os_error().unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(5);
+                return self.write_error(header.unique, -errno, writable_bufs, mem);
+            }
+        };
+        let attr_out = FuseAttrOut {
+            attr_valid: 0,
+            attr_valid_nsec: 0,
+            dummy: 0,
+            attr: metadata_to_fuse_attr(&metadata, header.nodeid),
+        };
+        let body: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                &attr_out as *const _ as *const u8,
+                core::mem::size_of::<FuseAttrOut>(),
+            )
+        };
+        self.write_response(header.unique, body, writable_bufs, mem)
+    }
+
+    fn handle_unlink(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let name_bytes = &req_data[hdr_size..];
+        let name_end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name = match std::str::from_utf8(&name_bytes[..name_end]) {
+            Ok(s) => s,
+            Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
+        };
+
+        if name == ".." || name == "." || name.contains('/') || name.contains('\0') {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let parent_path = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+        let child_path = parent_path.join(name);
+
+        if let Err(e) = std::fs::remove_file(&child_path) {
+            let errno = e.raw_os_error().unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        self.write_response(header.unique, &[], writable_bufs, mem)
+    }
+
+    fn handle_mkdir(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let mkdir_in_size = core::mem::size_of::<FuseMkdirIn>();
+        if req_data.len() < hdr_size + mkdir_in_size {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let name_bytes = &req_data[hdr_size + mkdir_in_size..];
+        let name_end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name = match std::str::from_utf8(&name_bytes[..name_end]) {
+            Ok(s) => s,
+            Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
+        };
+
+        if name == ".." || name == "." || name.contains('/') || name.contains('\0') {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let parent_path = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+        let child_path = parent_path.join(name);
+
+        if let Err(e) = std::fs::create_dir(&child_path) {
+            let errno = e.raw_os_error().unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        let metadata = match std::fs::metadata(&child_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(5);
+                return self.write_error(header.unique, -errno, writable_bufs, mem);
+            }
+        };
+        let nodeid = self.alloc_nodeid(child_path);
+        let entry_out = FuseEntryOut {
+            nodeid,
+            generation: 0,
+            entry_valid: 0,
+            attr_valid: 0,
+            entry_valid_nsec: 0,
+            attr_valid_nsec: 0,
+            attr: metadata_to_fuse_attr(&metadata, nodeid),
+        };
+        let body: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                &entry_out as *const _ as *const u8,
+                core::mem::size_of::<FuseEntryOut>(),
+            )
+        };
+        self.write_response(header.unique, body, writable_bufs, mem)
+    }
+
+    fn handle_rmdir(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let name_bytes = &req_data[hdr_size..];
+        let name_end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name = match std::str::from_utf8(&name_bytes[..name_end]) {
+            Ok(s) => s,
+            Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
+        };
+
+        if name == ".." || name == "." || name.contains('/') || name.contains('\0') {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let parent_path = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+        let child_path = parent_path.join(name);
+
+        if let Err(e) = std::fs::remove_dir(&child_path) {
+            let errno = e.raw_os_error().unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        self.write_response(header.unique, &[], writable_bufs, mem)
+    }
+
+    fn handle_rename(
+        &mut self,
+        header: &FuseInHeader,
+        req_data: &[u8],
+        writable_bufs: &[(u64, u32)],
+        mem: &GuestMemoryMmap<()>,
+    ) -> u32 {
+        let hdr_size = core::mem::size_of::<FuseInHeader>();
+        let rename_in_size = core::mem::size_of::<FuseRenameIn>();
+        if req_data.len() < hdr_size + rename_in_size {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let rename_in = unsafe {
+            core::ptr::read_unaligned(req_data[hdr_size..].as_ptr() as *const FuseRenameIn)
+        };
+        let names = &req_data[hdr_size + rename_in_size..];
+        let Some(old_end) = names.iter().position(|&b| b == 0) else {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        };
+        let old_name = match std::str::from_utf8(&names[..old_end]) {
+            Ok(s) => s,
+            Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
+        };
+        let new_bytes = &names[old_end + 1..];
+        let Some(new_end) = new_bytes.iter().position(|&b| b == 0) else {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        };
+        let new_name = match std::str::from_utf8(&new_bytes[..new_end]) {
+            Ok(s) => s,
+            Err(_) => return self.write_error(header.unique, -22, writable_bufs, mem),
+        };
+
+        if old_name == ".."
+            || old_name == "."
+            || old_name.contains('/')
+            || old_name.contains('\0')
+            || new_name == ".."
+            || new_name == "."
+            || new_name.contains('/')
+            || new_name.contains('\0')
+        {
+            return self.write_error(header.unique, -22, writable_bufs, mem);
+        }
+
+        let old_parent = match self.nodes.get(header.nodeid as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+        let new_parent = match self.nodes.get(rename_in.newdir as usize) {
+            Some(Some(node)) => node.host_path.clone(),
+            _ => return self.write_error(header.unique, -2, writable_bufs, mem),
+        };
+
+        if let Err(e) = std::fs::rename(old_parent.join(old_name), new_parent.join(new_name)) {
+            let errno = e.raw_os_error().unwrap_or(5);
+            return self.write_error(header.unique, -errno, writable_bufs, mem);
+        }
+
+        self.write_response(header.unique, &[], writable_bufs, mem)
     }
 
     fn handle_create(

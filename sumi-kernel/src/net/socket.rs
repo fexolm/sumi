@@ -17,6 +17,7 @@ use super::stack::{TCP_RX, TCP_TX};
 
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+pub const AF_UNIX: u16 = 1;
 pub const SOCK_STREAM: u16 = 1;
 pub const SOCK_NONBLOCK: u32 = 0o4000; // 0x800 == O_NONBLOCK
 pub const SOCK_CLOEXEC: u32 = 0o2000000;

@@ -408,6 +408,145 @@ impl VirtioFsClient {
         }
     }
 
+    /// FUSE_UNLINK: remove one non-directory entry from a parent directory.
+    pub fn unlink(&self, parent_nodeid: u64, name: &[u8]) -> Result<(), i32> {
+        self.name_only_op(parent_nodeid, FUSE_UNLINK, name)
+    }
+
+    /// FUSE_RMDIR: remove an empty directory from a parent directory.
+    pub fn rmdir(&self, parent_nodeid: u64, name: &[u8]) -> Result<(), i32> {
+        self.name_only_op(parent_nodeid, FUSE_RMDIR, name)
+    }
+
+    /// FUSE_RENAME: rename one directory entry into another parent directory.
+    pub fn rename(
+        &self,
+        old_parent_nodeid: u64,
+        old_name: &[u8],
+        new_parent_nodeid: u64,
+        new_name: &[u8],
+    ) -> Result<(), i32> {
+        let rename_in_size = size_of::<FuseRenameIn>();
+        let req_len =
+            size_of::<FuseInHeader>() + rename_in_size + old_name.len() + 1 + new_name.len() + 1;
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseRenameIn>() + 512];
+        debug_assert!(req_len <= req.len());
+
+        self.write_fuse_header_with_len(
+            &mut req,
+            req_len as u32,
+            FUSE_RENAME,
+            old_parent_nodeid,
+        );
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseRenameIn,
+                FuseRenameIn {
+                    newdir: new_parent_nodeid,
+                },
+            );
+            let names_ptr = req
+                .as_mut_ptr()
+                .add(size_of::<FuseInHeader>() + rename_in_size);
+            core::ptr::copy_nonoverlapping(old_name.as_ptr(), names_ptr, old_name.len());
+            core::ptr::copy_nonoverlapping(
+                new_name.as_ptr(),
+                names_ptr.add(old_name.len() + 1),
+                new_name.len(),
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+        self.submit_request_response(&req, req_len as u32, &resp)
+    }
+
+    fn name_only_op(&self, parent_nodeid: u64, opcode: u32, name: &[u8]) -> Result<(), i32> {
+        let req_len = size_of::<FuseInHeader>() + name.len() + 1;
+        let mut req = [0u8; size_of::<FuseInHeader>() + 256];
+        debug_assert!(req_len <= req.len());
+
+        self.write_fuse_header_with_len(&mut req, req_len as u32, opcode, parent_nodeid);
+        // SAFETY: Copying name bytes after header; buffer is zeroed so null
+        // terminator is implicit.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()),
+                name.len(),
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>()];
+        self.submit_request_response(&req, req_len as u32, &resp)
+    }
+
+    /// FUSE_MKDIR: create one directory entry below a parent directory.
+    pub fn mkdir(
+        &self,
+        parent_nodeid: u64,
+        name: &[u8],
+        mode: u32,
+    ) -> Result<FuseEntryOut, i32> {
+        let mkdir_in_size = size_of::<FuseMkdirIn>();
+        let req_len = size_of::<FuseInHeader>() + mkdir_in_size + name.len() + 1;
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseMkdirIn>() + 256];
+        debug_assert!(req_len <= req.len());
+
+        self.write_fuse_header_with_len(&mut req, req_len as u32, FUSE_MKDIR, parent_nodeid);
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseMkdirIn,
+                FuseMkdirIn { mode, umask: 0o022 },
+            );
+            core::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                req.as_mut_ptr()
+                    .add(size_of::<FuseInHeader>() + mkdir_in_size),
+                name.len(),
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseEntryOut>()];
+        self.submit_and_read(&req, req_len as u32, &resp)
+    }
+
+    /// FUSE_SETATTR: update file size, optionally by open file handle.
+    pub fn setattr_size(
+        &self,
+        nodeid: u64,
+        fh: Option<u64>,
+        size: u64,
+    ) -> Result<FuseAttrOut, i32> {
+        let mut req = [0u8; size_of::<FuseInHeader>() + size_of::<FuseSetattrIn>()];
+        self.write_fuse_header(&mut req, FUSE_SETATTR, nodeid);
+        unsafe {
+            core::ptr::write_volatile(
+                req.as_mut_ptr().add(size_of::<FuseInHeader>()) as *mut FuseSetattrIn,
+                FuseSetattrIn {
+                    valid: FATTR_SIZE | if fh.is_some() { FATTR_FH } else { 0 },
+                    padding: 0,
+                    fh: fh.unwrap_or(0),
+                    size,
+                    lock_owner: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    atimensec: 0,
+                    mtimensec: 0,
+                    ctimensec: 0,
+                    mode: 0,
+                    unused4: 0,
+                    uid: 0,
+                    gid: 0,
+                    unused5: 0,
+                },
+            );
+        }
+
+        let resp = [0u8; size_of::<FuseOutHeader>() + size_of::<FuseAttrOut>()];
+        self.submit_and_read(&req, req.len() as u32, &resp)
+    }
+
     /// FUSE_READ: read data into buf_phys. Returns bytes read.
     pub fn read(
         &self,

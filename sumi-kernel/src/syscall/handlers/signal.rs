@@ -1,5 +1,6 @@
 use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
+use core::sync::atomic::Ordering;
 
 /// Kernel's sigaction struct layout (matches Linux kernel, NOT libc).
 /// musl's rt_sigaction syscall wrapper passes this directly.
@@ -69,6 +70,41 @@ pub fn sys_rt_sigreturn(_args: &SyscallArgs) -> SyscallResult {
     ENOSYS
 }
 
+/// Wait for one of the requested signals. sumi does not deliver POSIX
+/// signals, but runtimes may still create a signal-handling thread and call
+/// sigwait()/sigwaitinfo() forever. A timed wait reports "nothing pending";
+/// an untimed wait parks the caller so it does not spin or treat ENOSYS as a
+/// fatal signal subsystem failure.
+pub fn sys_rt_sigtimedwait(args: &SyscallArgs) -> SyscallResult {
+    let set = args.arg0 as *const u64;
+    let timeout = args.arg2 as *const Timespec;
+    let sigsetsize = args.arg3;
+
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+    if set.is_null() {
+        return EFAULT;
+    }
+
+    // Force the same basic pointer contract as Linux: a bad set pointer
+    // faults here instead of silently accepting an unreadable mask.
+    let _mask = unsafe { core::ptr::read_volatile(set) };
+
+    if !timeout.is_null() {
+        return EAGAIN;
+    }
+
+    let me = crate::sched::current_thread();
+    me.state
+        .store(crate::sched::ThreadState::Blocked as u32, Ordering::Release);
+    crate::sched::schedule();
+
+    // No signal delivery exists today. If this thread is ever woken by a
+    // future implementation, preserve the "nothing pending" result.
+    EAGAIN
+}
+
 pub fn sys_pause(_args: &SyscallArgs) -> SyscallResult {
     ENOSYS
 }
@@ -119,6 +155,12 @@ struct StackT {
 
 const SS_DISABLE: i32 = 2;
 
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +171,20 @@ mod tests {
             arg0: how,
             arg1: new_set,
             arg2: old_set,
+            arg3: sigsetsize,
+            arg4: 0,
+            arg5: 0,
+            caller_rip: 0,
+            caller_rflags: 0,
+        }
+    }
+
+    fn make_sigtimedwait_args(set: u64, timeout: u64, sigsetsize: u64) -> SyscallArgs {
+        SyscallArgs {
+            nr: 128,
+            arg0: set,
+            arg1: 0,
+            arg2: timeout,
             arg3: sigsetsize,
             arg4: 0,
             arg5: 0,
@@ -156,5 +212,45 @@ mod tests {
     fn sigprocmask_rejects_wrong_sigsetsize() {
         let args = make_sigprocmask_args(SIG_BLOCK, 0, 0, 16);
         assert_eq!(sys_rt_sigprocmask(&args), EINVAL);
+    }
+
+    #[test]
+    fn sigtimedwait_timed_wait_reports_no_pending_signal() {
+        let set = 1u64 << 10;
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let args = make_sigtimedwait_args(
+            &set as *const u64 as u64,
+            &timeout as *const Timespec as u64,
+            8,
+        );
+        assert_eq!(sys_rt_sigtimedwait(&args), EAGAIN);
+    }
+
+    #[test]
+    fn sigtimedwait_rejects_wrong_sigsetsize() {
+        let set = 1u64;
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let args = make_sigtimedwait_args(
+            &set as *const u64 as u64,
+            &timeout as *const Timespec as u64,
+            16,
+        );
+        assert_eq!(sys_rt_sigtimedwait(&args), EINVAL);
+    }
+
+    #[test]
+    fn sigtimedwait_rejects_null_set() {
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let args = make_sigtimedwait_args(0, &timeout as *const Timespec as u64, 8);
+        assert_eq!(sys_rt_sigtimedwait(&args), EFAULT);
     }
 }

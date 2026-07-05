@@ -111,8 +111,16 @@ const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
 const SYS_UNAME: u64 = 63;
 const SYS_FCNTL: u64 = 72;
+const SYS_TRUNCATE: u64 = 76;
+const SYS_FTRUNCATE: u64 = 77;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
+const SYS_RENAME: u64 = 82;
+const SYS_MKDIR: u64 = 83;
+const SYS_RMDIR: u64 = 84;
+const SYS_UNLINK: u64 = 87;
+const SYS_GETRUSAGE: u64 = 98;
+const SYS_TIMES: u64 = 100;
 const SYS_GETUID: u64 = 102;
 const SYS_GETGID: u64 = 104;
 const SYS_GETEUID: u64 = 107;
@@ -127,10 +135,15 @@ const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_CLOCK_GETTIME: u64 = 228;
 const SYS_CLOCK_GETRES: u64 = 229;
 const SYS_EXIT_GROUP: u64 = 231;
+const SYS_GET_MEMPOLICY: u64 = 239;
 const SYS_OPENAT: u64 = 257;
+const SYS_MKDIRAT: u64 = 258;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_UNLINKAT: u64 = 263;
+const SYS_FALLOCATE: u64 = 285;
 const SYS_PIPE2: u64 = 293;
 const SYS_PRLIMIT64: u64 = 302;
+const SYS_GETCPU: u64 = 309;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_CLONE: u64 = 56;
 const SYS_SCHED_YIELD: u64 = 24;
@@ -170,6 +183,7 @@ const CLONE_REQUIRED: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | 
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
+const FUTEX_WAIT_BITSET: u64 = 9;
 
 // ── thin wrappers around the syscalls used by tests ────────────────────────
 
@@ -273,6 +287,21 @@ fn sys_pwrite64(fd: i64, buf: &[u8], offset: i64) -> i64 {
 }
 
 #[inline]
+fn sys_truncate(path: &[u8], len: i64) -> i64 {
+    unsafe { syscall2(SYS_TRUNCATE, path.as_ptr() as u64, len as u64) }
+}
+
+#[inline]
+fn sys_ftruncate(fd: i64, len: i64) -> i64 {
+    unsafe { syscall2(SYS_FTRUNCATE, fd as u64, len as u64) }
+}
+
+#[inline]
+fn sys_fallocate(fd: i64, mode: u64, offset: i64, len: i64) -> i64 {
+    unsafe { syscall4(SYS_FALLOCATE, fd as u64, mode, offset as u64, len as u64) }
+}
+
+#[inline]
 fn sys_writev(fd: i64, iov: *const Iovec, iovcnt: usize) -> i64 {
     unsafe { syscall3(SYS_WRITEV, fd as u64, iov as u64, iovcnt as u64) }
 }
@@ -310,6 +339,36 @@ fn sys_clock_gettime(clk: u64, ts: *mut Timespec) -> i64 {
 #[inline]
 fn sys_clock_getres(clk: u64, ts: *mut Timespec) -> i64 {
     unsafe { syscall2(SYS_CLOCK_GETRES, clk, ts as u64) }
+}
+
+#[inline]
+fn sys_times(tms: *mut Tms) -> i64 {
+    unsafe { syscall1(SYS_TIMES, tms as u64) }
+}
+
+#[inline]
+fn sys_getrusage(who: i64, usage: *mut Rusage) -> i64 {
+    unsafe { syscall2(SYS_GETRUSAGE, who as u64, usage as u64) }
+}
+
+#[inline]
+fn sys_get_mempolicy(
+    mode: *mut i32,
+    nodemask: *mut u64,
+    maxnode: u64,
+    addr: u64,
+    flags: u64,
+) -> i64 {
+    unsafe {
+        syscall5(
+            SYS_GET_MEMPOLICY,
+            mode as u64,
+            nodemask as u64,
+            maxnode,
+            addr,
+            flags,
+        )
+    }
 }
 
 #[inline]
@@ -375,6 +434,26 @@ fn sys_chdir(path: &[u8]) -> i64 {
 }
 
 #[inline]
+fn sys_rename(old_path: &[u8], new_path: &[u8]) -> i64 {
+    unsafe { syscall2(SYS_RENAME, old_path.as_ptr() as u64, new_path.as_ptr() as u64) }
+}
+
+#[inline]
+fn sys_mkdir(path: &[u8], mode: u64) -> i64 {
+    unsafe { syscall2(SYS_MKDIR, path.as_ptr() as u64, mode) }
+}
+
+#[inline]
+fn sys_mkdirat(dirfd: i64, path: &[u8], mode: u64) -> i64 {
+    unsafe { syscall3(SYS_MKDIRAT, dirfd as u64, path.as_ptr() as u64, mode) }
+}
+
+#[inline]
+fn sys_rmdir(path: &[u8]) -> i64 {
+    unsafe { syscall1(SYS_RMDIR, path.as_ptr() as u64) }
+}
+
+#[inline]
 fn sys_uname(buf: *mut u8) -> i64 {
     unsafe { syscall1(SYS_UNAME, buf as u64) }
 }
@@ -400,8 +479,35 @@ fn sys_futex(uaddr: *const u32, op: u64, val: u64) -> i64 {
 }
 
 #[inline]
+fn sys_futex6(
+    uaddr: *const u32,
+    op: u64,
+    val: u64,
+    timeout: *const Timespec,
+    uaddr2: u64,
+    val3: u64,
+) -> i64 {
+    unsafe {
+        syscall6(
+            SYS_FUTEX,
+            uaddr as u64,
+            op,
+            val,
+            timeout as u64,
+            uaddr2,
+            val3,
+        )
+    }
+}
+
+#[inline]
 fn sys_prlimit64(pid: u64, resource: u64, new_lim: *const u8, old_lim: *mut u8) -> i64 {
     unsafe { syscall4(SYS_PRLIMIT64, pid, resource, new_lim as u64, old_lim as u64) }
+}
+
+#[inline]
+fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> i64 {
+    unsafe { syscall3(SYS_GETCPU, cpu as u64, node as u64, 0) }
 }
 
 #[inline]
@@ -437,6 +543,16 @@ fn sys_newfstatat(dirfd: i64, path: &[u8], buf: *mut u8, flags: u64) -> i64 {
 #[inline]
 fn sys_access(path: &[u8], mode: u64) -> i64 {
     unsafe { syscall2(SYS_ACCESS, path.as_ptr() as u64, mode) }
+}
+
+#[inline]
+fn sys_unlink(path: &[u8]) -> i64 {
+    unsafe { syscall1(SYS_UNLINK, path.as_ptr() as u64) }
+}
+
+#[inline]
+fn sys_unlinkat(dirfd: i64, path: &[u8], flags: u64) -> i64 {
+    unsafe { syscall3(SYS_UNLINKAT, dirfd as u64, path.as_ptr() as u64, flags) }
 }
 
 #[inline]
@@ -480,6 +596,27 @@ fn exit_thread(code: i32) -> ! {
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
+}
+
+#[repr(C)]
+struct Tms {
+    tms_utime: i64,
+    tms_stime: i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+#[repr(C)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+#[repr(C)]
+struct Rusage {
+    ru_utime: Timeval,
+    ru_stime: Timeval,
+    ru_rest: [i64; 14],
 }
 
 #[repr(C)]

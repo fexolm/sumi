@@ -29,6 +29,9 @@ Implemented operations include:
 - `INIT`;
 - `LOOKUP` / `FORGET`;
 - `GETATTR`;
+- `SETATTR` for file size updates;
+- `MKDIR` / `UNLINK` / `RMDIR`;
+- `RENAME`;
 - `OPEN` / `OPENDIR`;
 - `READ` / `READDIR`;
 - `WRITE`;
@@ -45,6 +48,8 @@ The guest syscall layer uses virtio-fs for:
 - path lookup and metadata;
 - regular file read/write;
 - directory iteration;
+- directory create/remove;
+- file truncate and rename;
 - file creation through supported open/create paths;
 - loading ELF binaries and interpreters;
 - file-backed `mmap` private-copy and DAX paths.
@@ -56,8 +61,8 @@ guest physical addresses before descriptors are submitted.
 
 - No asynchronous virtqueue processing.
 - No permission model beyond host filesystem results.
-- Many mutation operations beyond the currently tested create/write paths are
-  absent or stubs.
+- Many mutation operations beyond the currently tested create/write/unlink,
+  truncate, rename, and directory paths are absent or stubs.
 - File handles and node IDs are VM-local bookkeeping, not a complete FUSE cache.
 - Host path behavior depends on the selected `--share` root.
 
