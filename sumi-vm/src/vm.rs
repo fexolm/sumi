@@ -227,6 +227,9 @@ pub struct VmCreateInfo {
     pub share_dir: Option<PathBuf>,
     pub run_path: Option<String>,
     pub gdb_port: Option<u16>,
+    /// `--hostfwd` rules: forward a host TCP port to a guest TCP port
+    /// through the network gateway (see `net::gateway`). Empty by default.
+    pub hostfwd: Vec<gateway::HostForward>,
 }
 
 pub trait VirtBackend: Sized {
@@ -329,7 +332,7 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
             dax_host_ptr,
             Arc::clone(&net_chan),
         )));
-        let gateway = Some(gateway::spawn(net_chan));
+        let gateway = Some(gateway::spawn(net_chan, info.hostfwd.clone()));
 
         let mut vcpus = Vec::new();
         for _ in 0..info.vcpu_count {

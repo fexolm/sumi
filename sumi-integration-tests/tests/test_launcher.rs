@@ -68,3 +68,21 @@ fn tcp_epoll_loopback() {
 fn tcp_virtio_echo() {
     sumi_integration_tests::run_test_smp("syscalls/tcp_virtio_echo", 1);
 }
+
+// Host -> guest TCP port forwarding (Phase 2b networking, see
+// docs/networking-design.md): the harness launches sumi-vm with
+// `--hostfwd tcp:127.0.0.1:19100-10.0.2.15:9100`, the guest runs an
+// epoll-driven echo server on its virtio-net address, and this test acts
+// as the real host client through the forwarded port. Ports match the
+// GUEST_PORT constant in data/syscalls/tcp_hostfwd_echo.rs. Pinned to a
+// single vCPU like the other net tests; suppressed from auto-generation
+// via `MANUAL_SYSCALL_TESTS`.
+#[test]
+fn tcp_hostfwd_echo() {
+    sumi_integration_tests::run_test_hostfwd_echo(
+        "syscalls/tcp_hostfwd_echo",
+        19100,
+        9100,
+        b"hello through the forwarded port",
+    );
+}

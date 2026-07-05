@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use sumi_vm::net::gateway::HostForward;
 use sumi_vm::{Hypervisor, VmCreateInfo, run_sumi_vm};
 
 fn default_vcpus() -> usize {
@@ -31,6 +32,12 @@ pub struct RunCommand {
     /// idle loop.
     #[arg(long = "vcpus", value_name = "N", default_value_t = default_vcpus())]
     vcpus: usize,
+
+    /// Forward a host TCP port to a guest TCP port through the network
+    /// gateway: `tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT` (e.g.
+    /// `tcp:127.0.0.1:3307-10.0.2.15:3306`). May be repeated.
+    #[arg(long = "hostfwd", value_name = "tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT")]
+    hostfwd: Vec<HostForward>,
 }
 
 impl RunCommand {
@@ -55,6 +62,7 @@ impl RunCommand {
             share_dir: Some(self.share_dir),
             run_path: self.run_path,
             gdb_port: self.gdb_port,
+            hostfwd: self.hostfwd,
         };
 
         let exit_code = run_sumi_vm(&info)?;

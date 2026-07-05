@@ -42,6 +42,7 @@ const MANUAL_SYSCALL_TESTS: &[&str] = &[
     "exit_group_kills_all",
     "tcp_epoll_loopback",
     "tcp_virtio_echo",
+    "tcp_hostfwd_echo",
 ];
 
 /// Source files in `data/glibc/` whose `#[test]` is written manually

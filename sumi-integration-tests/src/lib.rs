@@ -5,13 +5,14 @@
 //! `tests/test_launcher.rs` test binary calls [`run_test`] for each
 //! generated binary, asserting that the program exits with code 0.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum wall-clock time a single integration test may run inside sumi-vm.
 /// A bug that hangs the kernel (e.g. futex wait on a never-written word,
@@ -164,6 +165,101 @@ pub fn run_test_smp_expect_exit(name: &str, vcpus: u32, expected: i32) {
 /// to aid debugging.
 pub fn run_test(name: &str) {
     run_guest(name, None, 0);
+}
+
+/// Attempt one full echo exchange against the forwarded host port:
+/// connect, send `payload`, read it back, verify. The whole exchange (not
+/// just the connect) must be retried by the caller: the gateway binds the
+/// host listener before the guest boots, so an early client connection is
+/// accepted by the gateway and then reset when its inward smoltcp connect
+/// finds no guest listener yet.
+fn try_echo_once(host_port: u16, payload: &[u8]) -> Result<(), String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", host_port))
+        .map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream
+        .write_all(payload)
+        .map_err(|e| format!("send: {e}"))?;
+    let mut echoed = vec![0u8; payload.len()];
+    stream
+        .read_exact(&mut echoed)
+        .map_err(|e| format!("recv echo: {e}"))?;
+    if echoed != payload {
+        return Err("echoed bytes differ from payload".to_string());
+    }
+    Ok(())
+    // `stream` drops here: the guest server sees EOF and exits 0.
+}
+
+/// Run a guest TCP server binary inside sumi-vm with a `--hostfwd
+/// tcp:127.0.0.1:<host_port>-10.0.2.15:<guest_port>` rule while acting as
+/// the host client: retry the echo exchange until the guest is up, assert
+/// the payload round-trips through the forwarded port, then assert the
+/// guest exits 0 (it does so when the client closes the connection).
+/// Single-vCPU for the same reason as `tcp_epoll_loopback`.
+pub fn run_test_hostfwd_echo(name: &str, host_port: u16, guest_port: u16, payload: &[u8]) {
+    if !kvm_available() {
+        eprintln!("skipping {name}: /dev/kvm not available");
+        return;
+    }
+    ensure_built();
+
+    let host_bin = bin_dir().join(name);
+    assert!(host_bin.exists(), "test binary {name} not found");
+    let guest_path = host_bin.to_str().expect("non-UTF8 binary path");
+    let mut cmd = Command::new(vm_bin());
+    cmd.arg("run")
+        .arg(kernel_bin())
+        .arg("--share")
+        .arg("/")
+        .arg("--vcpus")
+        .arg("1")
+        .arg("--run")
+        .arg(guest_path)
+        .arg("--hostfwd")
+        .arg(format!("tcp:127.0.0.1:{host_port}-10.0.2.15:{guest_port}"));
+
+    // Host client, concurrent with the VM: retry the full exchange until
+    // it round-trips or the deadline passes (the guest's own epoll loop
+    // budget is ~20s; stay under it so failures are attributed clearly).
+    let payload_owned = payload.to_vec();
+    let client = thread::spawn(move || -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match try_echo_once(host_port, &payload_owned) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("echo through forwarded port never succeeded: {e}"));
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+
+    let (stdout, stderr, timed_out) = run_with_timeout(cmd, TEST_TIMEOUT);
+    let client_result = client
+        .join()
+        .unwrap_or_else(|_| Err("host client thread panicked".to_string()));
+    let exit_code = find_last_exit_code(&stdout);
+
+    if timed_out || exit_code != Some(0) || client_result.is_err() {
+        eprintln!("--- {name} stdout ---\n{stdout}");
+        eprintln!("--- {name} stderr ---\n{stderr}");
+        if let Err(e) = client_result {
+            panic!("hostfwd test {name}: host client failed: {e}");
+        }
+        if timed_out {
+            panic!("hostfwd test {name} timed out after {TEST_TIMEOUT:?}");
+        }
+        match exit_code {
+            None => panic!("hostfwd test {name} did not emit an [exit] code= line"),
+            Some(code) => panic!("hostfwd test {name} exited with code={code} (expected 0)"),
+        }
+    }
 }
 
 fn run_guest(name: &str, vcpus: Option<u32>, expected_exit: i32) {
