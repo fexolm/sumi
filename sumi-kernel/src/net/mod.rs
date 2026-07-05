@@ -67,6 +67,14 @@ pub struct NetStateInner<D> {
     pub epolltab: Vec<Option<EpollInstance>>,
     pub waiters: wait::WaitQueue,
     pub next_ephemeral: u16,
+    /// Handles whose fd was closed while the TCP conversation was still
+    /// draining: `close(2)` initiates a graceful FIN (`socket.close()`)
+    /// and parks the handle here; `poll_and_wake` reaps it once the socket
+    /// reaches `Closed`. Removing a live handle from the `SocketSet`
+    /// outright would vanish the endpoint mid-conversation — the peer's
+    /// next segment would be answered with RST instead of a FIN handshake,
+    /// turning a clean EOF into ECONNRESET/ENOTCONN on the other side.
+    pub closing: Vec<smoltcp::iface::SocketHandle>,
 }
 
 /// Production net state: virtio-net backed.
@@ -108,10 +116,16 @@ pub(crate) fn lock() -> spin::MutexGuard<'static, NetState> {
     NET.get().expect("net not initialized").lock()
 }
 
-/// Close a socket fd: drop its `SocketObject` and remove its smoltcp
-/// handle(s) from the socket set.
+/// Close a socket fd: drop its `SocketObject`, initiating a graceful FIN
+/// for a live stream handle (see `NetStateInner::closing`) and aborting
+/// (RST) any un-accepted backlog connections, exactly like Linux does when
+/// a listener closes.
 pub fn close_socket(id: usize) {
-    lock().socket_free(id);
+    let mut g = lock();
+    g.socket_close(id);
+    // Push the FIN/RST segments out immediately rather than waiting for
+    // the next timer tick.
+    g.poll_and_wake();
 }
 
 /// Close an epoll fd: drop its `EpollInstance`.
@@ -134,6 +148,7 @@ impl NetState {
             epolltab: Vec::new(),
             waiters: wait::WaitQueue::new(),
             next_ephemeral: stack::EPHEMERAL_LO,
+            closing: Vec::new(),
         })
     }
 }
@@ -152,6 +167,7 @@ impl TestNetState {
             epolltab: Vec::new(),
             waiters: wait::WaitQueue::new(),
             next_ephemeral: stack::EPHEMERAL_LO,
+            closing: Vec::new(),
         }
     }
 }
@@ -175,6 +191,37 @@ impl<D> NetStateInner<D> {
 
     pub fn socket_get_mut(&mut self, id: usize) -> Option<&mut SocketObject> {
         self.socktab.get_mut(id)?.as_mut()
+    }
+
+    /// Close a socket id gracefully: a live stream handle gets a FIN
+    /// (`close()`) and is parked on `self.closing` until the conversation
+    /// drains (reaped by `poll_and_wake`); un-accepted backlog connections
+    /// are aborted (RST), matching Linux listener-close semantics. Handles
+    /// already fully closed are removed immediately.
+    pub fn socket_close(&mut self, id: usize) -> Option<SocketObject> {
+        let obj = self.socktab.get_mut(id)?.take()?;
+        if let Some(h) = obj.handle {
+            let s = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(h);
+            if s.is_active() {
+                s.close();
+                self.closing.push(h);
+            } else {
+                self.sockets.remove(h);
+            }
+        }
+        for &h in &obj.backlog {
+            let s = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(h);
+            if s.is_active() {
+                // Un-accepted connection: reset it (Linux does the same);
+                // the RST goes out on the caller's follow-up poll, after
+                // which the socket is Closed and the reaper removes it.
+                s.abort();
+                self.closing.push(h);
+            } else {
+                self.sockets.remove(h);
+            }
+        }
+        Some(obj)
     }
 
     /// Free a socket id, removing its smoltcp handle(s) (stream handle
@@ -266,6 +313,21 @@ impl<D: Device + PollDevice> NetStateInner<D> {
         self.device.pre_poll();
         for _ in 0..NET_POLL_ITERS {
             let _: PollResult = self.iface.poll(now, &mut self.device, &mut self.sockets);
+        }
+        // Reap gracefully-closing handles (see `closing`) whose TCP
+        // conversation has fully drained. TIME-WAIT is left to smoltcp:
+        // the state only becomes `Closed` once 2MSL (or the FIN handshake)
+        // completes, so removal here is always safe.
+        if !self.closing.is_empty() {
+            let sockets = &mut self.sockets;
+            self.closing.retain(|&h| {
+                let done = sockets.get::<smoltcp::socket::tcp::Socket>(h).state()
+                    == smoltcp::socket::tcp::State::Closed;
+                if done {
+                    sockets.remove(h);
+                }
+                !done
+            });
         }
         self.waiters.wake_all();
     }

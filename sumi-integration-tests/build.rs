@@ -50,6 +50,10 @@ const MANUAL_SYSCALL_TESTS: &[&str] = &[
 /// via `run_test_smp` instead of the single-vCPU `run_test`).
 const MANUAL_GLIBC_TESTS: &[&str] = &["preempt_timer"];
 
+/// Source files in `data/rust_std/` whose `#[test]` is written manually in
+/// `tests/test_launcher.rs` (e.g. net tests pinned to a single vCPU).
+const MANUAL_RUST_STD_TESTS: &[&str] = &["tcp_echo_pair"];
+
 const RUST_NO_STD_TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUST_STD_TARGET: &str = "x86_64-unknown-linux-musl";
 
@@ -124,6 +128,9 @@ fn emit_category(out: &mut String, category: &str, sources: &[PathBuf]) {
             continue;
         }
         if category == "glibc" && MANUAL_GLIBC_TESTS.contains(&name.as_str()) {
+            continue;
+        }
+        if category == "rust_std" && MANUAL_RUST_STD_TESTS.contains(&name.as_str()) {
             continue;
         }
         let fn_name = sanitize_ident(&name);

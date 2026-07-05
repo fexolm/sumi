@@ -86,3 +86,13 @@ fn tcp_hostfwd_echo() {
         b"hello through the forwarded port",
     );
 }
+
+// Rust std TCP echo client/server pair, entirely inside the guest
+// (data/rust_std/tcp_echo_pair.rs): std::net + std::thread over the
+// blocking socket read()/write() paths. Pinned to a single vCPU like the
+// other net tests; suppressed from auto-generation via
+// `MANUAL_RUST_STD_TESTS`.
+#[test]
+fn tcp_echo_pair() {
+    sumi_integration_tests::run_test_smp("rust_std/tcp_echo_pair", 1);
+}

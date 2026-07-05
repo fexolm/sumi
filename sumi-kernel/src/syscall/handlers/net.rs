@@ -622,3 +622,42 @@ pub fn sys_getsockopt(args: &SyscallArgs) -> SyscallResult {
     }
     0
 }
+
+/// `read(fd)` on a socket: byte-stream receive, used by `sys_read`/`sys_readv`
+/// (Rust std and glibc use plain read/write on connected sockets). Semantics
+/// match `sys_recvfrom` with no address out-params.
+pub(crate) fn sock_read(id: usize, buf_ptr: u64, count: usize) -> i64 {
+    if count > 0 && buf_ptr == 0 {
+        return EFAULT;
+    }
+    let nonblocking = match net::lock().socket_get(id) {
+        Some(obj) => obj.nonblocking,
+        None => return EBADF,
+    };
+    if count == 0 {
+        return 0;
+    }
+    // SAFETY: single-address-space model; the syscall ABI guarantees
+    // buf_ptr..+count is a valid, writable user buffer.
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
+    recv_bytes(id, buf, nonblocking)
+}
+
+/// `write(fd)` on a socket: byte-stream send, used by `sys_write`/`sys_writev`.
+/// Semantics match `sys_sendto` with a NULL destination.
+pub(crate) fn sock_write(id: usize, buf_ptr: u64, count: usize) -> i64 {
+    if count > 0 && buf_ptr == 0 {
+        return EFAULT;
+    }
+    let nonblocking = match net::lock().socket_get(id) {
+        Some(obj) => obj.nonblocking,
+        None => return EBADF,
+    };
+    if count == 0 {
+        return 0;
+    }
+    // SAFETY: single-address-space model; the syscall ABI guarantees
+    // buf_ptr..+count is a valid, readable user buffer.
+    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+    send_bytes(id, data, nonblocking)
+}

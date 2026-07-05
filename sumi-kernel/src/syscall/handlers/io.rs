@@ -137,6 +137,8 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
+        // Rust std and glibc use plain read() on connected sockets.
+        FdKind::Socket { id } => super::net::sock_read(id, buf_vaddr, count as usize),
         FdKind::Console => {
             // SAFETY: In sumi unikernel, all user virtual addresses are valid
             // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
@@ -184,6 +186,8 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
+        // Rust std and glibc use plain write() on connected sockets.
+        FdKind::Socket { id } => super::net::sock_write(id, buf_vaddr, count),
         FdKind::Console => {
             // SAFETY: In sumi unikernel, all user virtual addresses are valid
             // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
@@ -476,6 +480,19 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
+        // Stream sockets: fill the first non-empty iovec and return. A short
+        // readv is always legal, and a second blocking recv between iovecs
+        // could stall with data already delivered.
+        FdKind::Socket { id } => {
+            for i in 0..iovcnt {
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                if iov_len == 0 {
+                    continue;
+                }
+                return super::net::sock_read(id, iov_base, iov_len as usize);
+            }
+            0
+        }
         FdKind::Console => {
             let mut total = 0usize;
             for i in 0..iovcnt {
@@ -551,6 +568,34 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
     };
 
     match kind {
+        // Stream sockets: gather. Send each iovec in order; a partial send
+        // or an error after progress returns the bytes already written
+        // (standard writev short-write semantics).
+        FdKind::Socket { id } => {
+            let mut total: i64 = 0;
+            for i in 0..iovcnt {
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                let iov_len = iov_len as usize;
+                if iov_len == 0 {
+                    continue;
+                }
+                match super::net::sock_write(id, iov_base, iov_len) {
+                    n if n < 0 => {
+                        if total > 0 {
+                            break;
+                        }
+                        return n;
+                    }
+                    n => {
+                        total += n;
+                        if (n as usize) < iov_len {
+                            break;
+                        }
+                    }
+                }
+            }
+            total as SyscallResult
+        }
         FdKind::Console => {
             let mut total = 0usize;
             for i in 0..iovcnt {

@@ -38,6 +38,11 @@ pub struct RunCommand {
     /// `tcp:127.0.0.1:3307-10.0.2.15:3306`). May be repeated.
     #[arg(long = "hostfwd", value_name = "tcp:HOST_IP:HOST_PORT-GUEST_IP:GUEST_PORT")]
     hostfwd: Vec<HostForward>,
+
+    /// Arguments passed to the guest program (its argv[1..]), given after
+    /// `--`: `sumi-vm run KERNEL --run /bin/prog -- --flag value`.
+    #[arg(last = true, value_name = "GUEST_ARGS")]
+    guest_args: Vec<String>,
 }
 
 impl RunCommand {
@@ -61,6 +66,7 @@ impl RunCommand {
             kernel_path: self.program,
             share_dir: Some(self.share_dir),
             run_path: self.run_path,
+            run_args: self.guest_args,
             gdb_port: self.gdb_port,
             hostfwd: self.hostfwd,
         };

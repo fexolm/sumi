@@ -81,11 +81,21 @@ pub fn read_boot_info() -> Option<&'static str> {
     core::str::from_utf8(path_bytes).ok()
 }
 
-/// Load and execute a user program from the given path. Never returns.
-pub fn exec_user_program(path: &str) -> ! {
+/// Load and execute a user program. `cmdline` is the NUL-joined guest
+/// command line written by the host (see `write_boot_info` in sumi-vm):
+/// the first element is the program path, the rest are its arguments.
+/// Never returns.
+pub fn exec_user_program(cmdline: &str) -> ! {
+    let mut argv: alloc::vec::Vec<&str> = cmdline.split('\0').collect();
+    // A trailing/duplicated NUL would create empty argv entries; the path
+    // itself can never be empty (the host writes it from a non-empty
+    // Option<String>), so drop empties defensively rather than passing a
+    // confusing empty argv[k] to the program.
+    argv.retain(|a| !a.is_empty());
+    let path = argv.first().copied().unwrap_or("");
     kprintln!("[exec] loading {}", path);
 
-    match exec_user_program_inner(path) {
+    match exec_user_program_inner(path, &argv) {
         Ok(()) => {
             // exec_user_program_inner only returns Ok if jump_to_user somehow returned,
             // which should never happen.
@@ -102,7 +112,7 @@ pub fn exec_user_program(path: &str) -> ! {
     }
 }
 
-fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
+fn exec_user_program_inner(path: &str, argv: &[&str]) -> Result<(), ExecError> {
     // 1. Read file from virtio-fs
     let file_data = read_file(path)?;
 
@@ -213,7 +223,7 @@ fn exec_user_program_inner(path: &str) -> Result<(), ExecError> {
     };
 
     // 6. Set up stack (needs elf_info + interp_info for auxv)
-    let sp = setup_stack(path, &elf_info, interp_info.as_ref())?;
+    let sp = setup_stack(argv, &elf_info, interp_info.as_ref())?;
 
     // 7. Set brk state
     {
@@ -357,7 +367,7 @@ fn load_segments_at_base(file_data: &[u8], elf: &Elf, base: u64) -> Result<Virtu
 }
 
 fn setup_stack(
-    path: &str,
+    argv: &[&str],
     elf_info: &ElfInfo,
     interp_info: Option<&InterpInfo>,
 ) -> Result<u64, ExecError> {
@@ -378,7 +388,7 @@ fn setup_stack(
 
     Ok(prepare_initial_stack(
         USER_STACK_TOP,
-        path,
+        argv,
         elf_info,
         interp_info,
     ))
@@ -386,19 +396,23 @@ fn setup_stack(
 
 fn prepare_initial_stack(
     stack_top: VirtualAddr,
-    path: &str,
+    argv: &[&str],
     info: &ElfInfo,
     interp_info: Option<&InterpInfo>,
 ) -> u64 {
     let mut sp = stack_top.as_u64();
 
-    // Write argv[0] string (path + null terminator)
-    sp -= (path.len() + 1) as u64;
-    let argv0_addr = sp;
-    // SAFETY: Stack pages are mapped, writing path string and null terminator.
-    unsafe {
-        core::ptr::copy_nonoverlapping(path.as_ptr(), sp as *mut u8, path.len());
-        *(sp as *mut u8).add(path.len()) = 0;
+    // Write each argv string (NUL-terminated) at the stack top, recording
+    // its address for the pointer array below.
+    let mut argv_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(argv.len());
+    for arg in argv {
+        sp -= (arg.len() + 1) as u64;
+        argv_addrs.push(sp);
+        // SAFETY: Stack pages are mapped; writing the string + terminator.
+        unsafe {
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
+            *(sp as *mut u8).add(arg.len()) = 0;
+        }
     }
 
     // Write 16 "random" bytes for AT_RANDOM (musl reads this for stack canary)
@@ -450,12 +464,24 @@ fn prepare_initial_stack(
     // envp NULL terminator
     sp = push_u64(sp, 0);
 
-    // argv NULL terminator + argv[0]
+    // The SysV ABI requires (sp % 16 == 0) at process entry with argc at
+    // sp. Everything below this comment is argv.len() + 3 qwords (argv
+    // NULL + pointers + argc); together with the 28 auxv qwords and the
+    // envp terminator above, the total after the 16-byte alignment point
+    // is 32 + argv.len() qwords — even argv counts need one pad qword.
+    if argv.len().is_multiple_of(2) {
+        sp = push_u64(sp, 0);
+    }
+
+    // argv NULL terminator + pointers (argv[n-1] .. argv[0], so argv[0]
+    // ends up at the lowest address, right above argc).
     sp = push_u64(sp, 0);
-    sp = push_u64(sp, argv0_addr);
+    for &addr in argv_addrs.iter().rev() {
+        sp = push_u64(sp, addr);
+    }
 
     // argc
-    sp = push_u64(sp, 1);
+    sp = push_u64(sp, argv.len() as u64);
 
     sp
 }

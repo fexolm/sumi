@@ -226,6 +226,11 @@ pub struct VmCreateInfo {
     pub kernel_path: PathBuf,
     pub share_dir: Option<PathBuf>,
     pub run_path: Option<String>,
+    /// Arguments for the guest program (argv[1..]; argv[0] is `run_path`).
+    /// Passed to the kernel as a NUL-joined tail after the run path in the
+    /// boot-info buffer — NUL cannot appear inside a path or argument, so
+    /// no escaping is needed and the BootInfo layout is unchanged.
+    pub run_args: Vec<String>,
     pub gdb_port: Option<u16>,
     /// `--hostfwd` rules: forward a host TCP port to a guest TCP port
     /// through the network gateway (see `net::gateway`). Empty by default.
@@ -741,12 +746,19 @@ impl<Backend: VirtBackend + 'static> SumiVm<Backend> {
         use sumi_abi::boot_info::*;
 
         let mut flags = 0u32;
-        let mut path_bytes: &[u8] = &[];
+        // Guest command line: run path, then each argument, NUL-joined. The
+        // kernel splits on NUL to build argv (see exec::exec_user_program).
+        let mut cmdline = String::new();
 
         if let Some(ref path) = info.run_path {
             flags |= BOOT_INFO_FLAG_HAS_RUN_PATH;
-            path_bytes = path.as_bytes();
+            cmdline.push_str(path);
+            for arg in &info.run_args {
+                cmdline.push('\0');
+                cmdline.push_str(arg);
+            }
         }
+        let path_bytes: &[u8] = cmdline.as_bytes();
 
         let header_size = core::mem::size_of::<BootInfo>();
         let total_size = header_size + path_bytes.len();
