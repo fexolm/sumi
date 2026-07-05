@@ -117,14 +117,24 @@ pub fn sys_epoll_ctl(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
-/// Snapshot `(socket_id, interest_events, data)` for every fd registered on
-/// `epoll_id`, resolving each fd to its socket id. Locks `NET` (to read the
-/// interest set) and then `FD_TABLE` (to resolve fds) — sequentially, never
-/// nested — once, before any possible block, so the `net_wait` loop itself
-/// never touches `FD_TABLE` (Invariant N1). fds that aren't sockets, or
-/// that were closed after being registered, are silently skipped: they can
-/// never contribute smoltcp-backed readiness.
-fn snapshot_interest(epoll_id: usize) -> Result<Vec<(usize, u32, u64)>, SyscallResult> {
+/// A registered interest resolved to the net-module id it targets — a
+/// socket or one end of a pipe. Both are backed by `net::NetState` and
+/// share its lock/waiters, so `compute_ready` can recompute either kind's
+/// readiness without leaving the `NET` lock.
+#[derive(Clone, Copy)]
+enum EpollTarget {
+    Socket(usize),
+    Pipe { id: usize, write_end: bool },
+}
+
+/// Snapshot `(target, interest_events, data)` for every fd registered on
+/// `epoll_id`, resolving each fd to its socket/pipe id. Locks `NET` (to read
+/// the interest set) and then `FD_TABLE` (to resolve fds) — sequentially,
+/// never nested — once, before any possible block, so the `net_wait` loop
+/// itself never touches `FD_TABLE` (Invariant N1). fds that aren't
+/// sockets/pipes, or that were closed after being registered, are silently
+/// skipped: they can never contribute smoltcp-backed readiness.
+fn snapshot_interest(epoll_id: usize) -> Result<Vec<(EpollTarget, u32, u64)>, SyscallResult> {
     let raw: Vec<(i32, u32, u64)> = {
         let g = net::lock();
         let Some(epi) = g.epoll_get(epoll_id) else {
@@ -141,7 +151,10 @@ fn snapshot_interest(epoll_id: usize) -> Result<Vec<(usize, u32, u64)>, SyscallR
         .into_iter()
         .filter_map(|(fd, events, data)| match table.get(fd as usize) {
             Some(d) => match d.kind {
-                FdKind::Socket { id } => Some((id, events, data)),
+                FdKind::Socket { id } => Some((EpollTarget::Socket(id), events, data)),
+                FdKind::Pipe { id, write_end } => {
+                    Some((EpollTarget::Pipe { id, write_end }, events, data))
+                }
                 _ => None,
             },
             None => None,
@@ -151,14 +164,24 @@ fn snapshot_interest(epoll_id: usize) -> Result<Vec<(usize, u32, u64)>, SyscallR
 
 /// Recompute readiness for every entry in `snapshot` against the current
 /// `NetState`, capped at `max` events.
-fn compute_ready(g: &net::NetState, snapshot: &[(usize, u32, u64)], max: usize) -> Vec<(u32, u64)> {
+fn compute_ready(
+    g: &net::NetState,
+    snapshot: &[(EpollTarget, u32, u64)],
+    max: usize,
+) -> Vec<(u32, u64)> {
     let mut out = Vec::new();
-    for &(id, events, data) in snapshot {
+    for &(target, events, data) in snapshot {
         if out.len() >= max {
             break;
         }
-        if let Some(obj) = g.socket_get(id) {
-            let r = socket::readiness(obj, &g.sockets) & events;
+        let readiness = match target {
+            EpollTarget::Socket(id) => g.socket_get(id).map(|obj| socket::readiness(obj, &g.sockets)),
+            EpollTarget::Pipe { id, write_end } => {
+                g.pipe_get(id).map(|p| net::pipe_readiness(p, write_end))
+            }
+        };
+        if let Some(r) = readiness {
+            let r = r & events;
             if r != 0 {
                 out.push((r, data));
             }

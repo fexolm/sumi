@@ -71,6 +71,44 @@ pub fn sys_futex(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
+/// `sched_getaffinity(pid, cpusetsize, mask)`. sumi has no CPU affinity
+/// concept — every thread can run on every vCPU — so this reports a mask
+/// with bits `0..cpu_count()` set, matching a system with no affinity mask
+/// ever applied. `pid` must name this process (0 = caller, or our fixed
+/// pid 1); anything else is ESRCH, same as `sys_prlimit64`'s pid handling.
+pub fn sys_sched_getaffinity(args: &SyscallArgs) -> SyscallResult {
+    let pid = args.arg0 as i64;
+    let cpusetsize = args.arg1 as usize;
+    let mask_ptr = args.arg2 as *mut u8;
+
+    if pid != 0 && pid != 1 {
+        return ESRCH;
+    }
+    if cpusetsize < 8 {
+        return EINVAL;
+    }
+    if mask_ptr.is_null() {
+        return EFAULT;
+    }
+
+    let n = crate::sched::cpu_count() as usize;
+    let write_len = cpusetsize.min(128);
+
+    // SAFETY: mask_ptr..+write_len is a valid, writable user buffer per the
+    // syscall ABI (glibc's CPU_ALLOC/CPU_SET always sizes it >= cpusetsize).
+    unsafe {
+        core::ptr::write_bytes(mask_ptr, 0, write_len);
+        for cpu in 0..n {
+            let byte = cpu / 8;
+            if byte >= write_len {
+                break;
+            }
+            *mask_ptr.add(byte) |= 1u8 << (cpu % 8);
+        }
+    }
+    8
+}
+
 pub fn sys_set_robust_list(args: &SyscallArgs) -> SyscallResult {
     // glibc always passes sizeof(struct robust_list_head) = 24.
     const ROBUST_LIST_HEAD_SIZE: u64 = 24;

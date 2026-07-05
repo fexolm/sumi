@@ -33,10 +33,28 @@ pub fn sys_rt_sigaction(args: &SyscallArgs) -> SyscallResult {
     0
 }
 
-/// No-op: single-threaded unikernel, signal mask is meaningless.
-/// When old_set is provided, write an empty mask.
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+
+/// No-op: single-threaded unikernel, signal mask is meaningless — but `how`
+/// and `sigsetsize` are validated exactly like Linux does. mysqld's startup
+/// sanity probe deliberately calls this with an invalid `how` (`~0`) and
+/// aborts if it doesn't get EINVAL back, so silently succeeding on garbage
+/// input is not an option here. When old_set is provided, write an empty
+/// mask.
 pub fn sys_rt_sigprocmask(args: &SyscallArgs) -> SyscallResult {
+    let how = args.arg0;
     let old_set = args.arg2 as *mut u64;
+    let sigsetsize = args.arg3;
+
+    if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK {
+        return EINVAL;
+    }
+    if sigsetsize != 8 {
+        return EINVAL;
+    }
+
     if !old_set.is_null() {
         // SAFETY: User passed a valid pointer for the old signal mask.
         unsafe {

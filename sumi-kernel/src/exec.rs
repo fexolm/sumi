@@ -68,6 +68,10 @@ pub fn read_boot_info() -> Option<&'static str> {
         crate::RNG_SEED.call_once(|| info.rng_seed);
     }
 
+    if info.version >= 3 {
+        crate::sched::set_cpu_count(info.num_cpus);
+    }
+
     if info.flags & BOOT_INFO_FLAG_HAS_RUN_PATH == 0 {
         return None;
     }

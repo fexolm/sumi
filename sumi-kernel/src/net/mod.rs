@@ -29,6 +29,7 @@
 mod abi;
 pub mod device;
 pub mod epoll;
+pub mod pipe;
 pub mod socket;
 pub mod stack;
 pub mod wait;
@@ -40,6 +41,8 @@ use smoltcp::phy::Device;
 
 pub use abi::{EpollEvent, parse_sockaddr, read_epoll_event, write_epoll_event, write_sockaddr};
 pub use epoll::EpollInstance;
+pub use pipe::{close_pipe, pipe_create, pipe_readiness};
+pub(crate) use pipe::{pipe_read, pipe_write};
 pub use socket::SocketObject;
 pub use stack::now;
 pub use wait::{Wait, net_wait};
@@ -65,6 +68,11 @@ pub struct NetStateInner<D> {
     pub device: D,
     pub socktab: Vec<Option<SocketObject>>,
     pub epolltab: Vec<Option<EpollInstance>>,
+    /// In-kernel pipes (`pipe`/`pipe2`), indexed the same way as `socktab`.
+    /// Sharing this struct's lock and `waiters` queue with sockets is what
+    /// lets pipes reuse `net_wait`/`poll_and_wake` for blocking I/O and
+    /// epoll readiness — see `net::pipe`'s module doc comment.
+    pub pipetab: Vec<Option<pipe::PipeState>>,
     pub waiters: wait::WaitQueue,
     pub next_ephemeral: u16,
     /// Handles whose fd was closed while the TCP conversation was still
@@ -146,6 +154,7 @@ impl NetState {
             device,
             socktab: Vec::new(),
             epolltab: Vec::new(),
+            pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
             next_ephemeral: stack::EPHEMERAL_LO,
             closing: Vec::new(),
@@ -165,6 +174,7 @@ impl TestNetState {
             device,
             socktab: Vec::new(),
             epolltab: Vec::new(),
+            pipetab: Vec::new(),
             waiters: wait::WaitQueue::new(),
             next_ephemeral: stack::EPHEMERAL_LO,
             closing: Vec::new(),
@@ -259,6 +269,30 @@ impl<D> NetStateInner<D> {
 
     pub fn epoll_free(&mut self, id: usize) -> Option<EpollInstance> {
         self.epolltab.get_mut(id)?.take()
+    }
+
+    /// Allocate the lowest free pipe id, matching `socket_alloc`/`epoll_alloc`.
+    pub fn pipe_alloc(&mut self, p: pipe::PipeState) -> usize {
+        for (i, slot) in self.pipetab.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(p);
+                return i;
+            }
+        }
+        self.pipetab.push(Some(p));
+        self.pipetab.len() - 1
+    }
+
+    pub fn pipe_get(&self, id: usize) -> Option<&pipe::PipeState> {
+        self.pipetab.get(id)?.as_ref()
+    }
+
+    pub fn pipe_get_mut(&mut self, id: usize) -> Option<&mut pipe::PipeState> {
+        self.pipetab.get_mut(id)?.as_mut()
+    }
+
+    pub fn pipe_free(&mut self, id: usize) -> Option<pipe::PipeState> {
+        self.pipetab.get_mut(id)?.take()
     }
 
     /// Allocate the next ephemeral port in `[EPHEMERAL_LO, EPHEMERAL_HI]`,

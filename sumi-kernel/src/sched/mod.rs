@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub mod clone;
 pub mod futex;
@@ -31,6 +31,26 @@ pub use percpu::{get as get_cpu, init_for_cpu, this_cpu};
 /// with Acquire on the AP load, giving a happens-before edge that covers every
 /// global the BSP wrote before publishing.
 pub static KERNEL_READY: AtomicBool = AtomicBool::new(false);
+
+/// Number of vCPUs the host created (`BootInfo::num_cpus`, version >= 3).
+/// Defaults to 1 until `set_cpu_count` runs from `exec::read_boot_info` —
+/// a safe under-estimate matching a single-vCPU boot for anything that
+/// queries `cpu_count()` before boot info is parsed (never happens in
+/// practice: syscalls only run after `exec_user_program`, well after
+/// `read_boot_info`).
+static NUM_CPUS: AtomicU32 = AtomicU32::new(1);
+
+/// Record the number of vCPUs the host created. Called once from
+/// `exec::read_boot_info`.
+pub fn set_cpu_count(n: u32) {
+    NUM_CPUS.store(n, Ordering::Relaxed);
+}
+
+/// Number of vCPUs this kernel instance is running on. Used by
+/// `sched_getaffinity`/`sysinfo`.
+pub fn cpu_count() -> u32 {
+    NUM_CPUS.load(Ordering::Relaxed)
+}
 
 /// Return the currently executing `Thread` on this CPU.
 ///

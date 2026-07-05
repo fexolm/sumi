@@ -4,6 +4,10 @@ use crate::syscall::errno::*;
 use crate::syscall::{SyscallArgs, SyscallResult};
 use sumi_abi::address::VirtualAddr;
 
+/// O_NONBLOCK, shared by `sys_fcntl`'s F_SETFL handling and every read/write
+/// path (sockets and pipes) that needs to know a fd's nonblocking flag.
+const O_NONBLOCK: u32 = crate::net::socket::SOCK_NONBLOCK;
+
 fn console_write(data: &[u8]) -> usize {
     crate::console().write(data)
 }
@@ -48,10 +52,11 @@ fn release_fuse_resources(desc: &FileDescriptor) {
             fs.forget(fuse_nodeid, 1);
         }
         FdKind::Console => {}
-        // Sockets/epoll instances have no FUSE handle; their teardown is
-        // routed directly through `net::close_socket`/`close_epoll` by the
-        // callers below instead of through this FUSE-specific helper.
-        FdKind::Socket { .. } | FdKind::Epoll { .. } => {}
+        // Sockets/epoll instances/pipes have no FUSE handle; their teardown
+        // is routed directly through `net::close_socket`/`close_epoll`/
+        // `close_pipe` by the callers below instead of through this
+        // FUSE-specific helper.
+        FdKind::Socket { .. } | FdKind::Epoll { .. } | FdKind::Pipe { .. } => {}
     }
 }
 
@@ -62,6 +67,7 @@ fn count_remaining_refs(table: &crate::fs::FdTable, desc: &FileDescriptor) -> us
         }
         FdKind::Socket { id } => table.count_socket_refs(id),
         FdKind::Epoll { id } => table.count_epoll_refs(id),
+        FdKind::Pipe { id, write_end } => table.count_pipe_refs(id, write_end),
         FdKind::Console => 0,
     }
 }
@@ -128,7 +134,7 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     let buf_vaddr = args.arg1;
     let count = args.arg2.min(u32::MAX as u64) as u32;
 
-    let (kind, _flags) = {
+    let (kind, flags) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(d) => (d.kind, d.flags),
@@ -139,6 +145,16 @@ pub fn sys_read(args: &SyscallArgs) -> SyscallResult {
     match kind {
         // Rust std and glibc use plain read() on connected sockets.
         FdKind::Socket { id } => super::net::sock_read(id, buf_vaddr, count as usize),
+        FdKind::Pipe { id, write_end } => {
+            if write_end {
+                return EBADF;
+            }
+            // SAFETY: In sumi unikernel, all user virtual addresses are valid
+            // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(buf_vaddr as *mut u8, count as usize) };
+            crate::net::pipe_read(id, buf, flags & O_NONBLOCK != 0)
+        }
         FdKind::Console => {
             // SAFETY: In sumi unikernel, all user virtual addresses are valid
             // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
@@ -177,7 +193,7 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
     let buf_vaddr = args.arg1;
     let count = args.arg2.min(u32::MAX as u64) as usize;
 
-    let (kind, _flags) = {
+    let (kind, flags) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(d) => (d.kind, d.flags),
@@ -188,6 +204,15 @@ pub fn sys_write(args: &SyscallArgs) -> SyscallResult {
     match kind {
         // Rust std and glibc use plain write() on connected sockets.
         FdKind::Socket { id } => super::net::sock_write(id, buf_vaddr, count),
+        FdKind::Pipe { id, write_end } => {
+            if !write_end {
+                return EBADF;
+            }
+            // SAFETY: In sumi unikernel, all user virtual addresses are valid
+            // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
+            let data = unsafe { core::slice::from_raw_parts(buf_vaddr as *const u8, count) };
+            crate::net::pipe_write(id, data, flags & O_NONBLOCK != 0)
+        }
         FdKind::Console => {
             // SAFETY: In sumi unikernel, all user virtual addresses are valid
             // kernel-mapped memory. The caller guarantees buf_vaddr points to count bytes.
@@ -262,6 +287,9 @@ pub fn sys_close(args: &SyscallArgs) -> SyscallResult {
             match desc.kind {
                 FdKind::Socket { id } if remaining_refs == 0 => crate::net::close_socket(id),
                 FdKind::Epoll { id } if remaining_refs == 0 => crate::net::close_epoll(id),
+                FdKind::Pipe { id, write_end } if remaining_refs == 0 => {
+                    crate::net::close_pipe(id, write_end)
+                }
                 // Only release resources if no other fd shares this handle.
                 _ if remaining_refs == 0 => release_fuse_resources(&desc),
                 _ => {}
@@ -471,7 +499,7 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
     let iov_ptr = args.arg1 as usize;
     let iovcnt = args.arg2 as usize;
 
-    let (kind, _flags) = {
+    let (kind, flags) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
             Some(d) => (d.kind, d.flags),
@@ -490,6 +518,26 @@ pub fn sys_readv(args: &SyscallArgs) -> SyscallResult {
                     continue;
                 }
                 return super::net::sock_read(id, iov_base, iov_len as usize);
+            }
+            0
+        }
+        // Pipe: same short-readv rule as sockets above.
+        FdKind::Pipe { id, write_end } => {
+            if write_end {
+                return EBADF;
+            }
+            let nonblocking = flags & O_NONBLOCK != 0;
+            for i in 0..iovcnt {
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                if iov_len == 0 {
+                    continue;
+                }
+                // SAFETY: single-address-space model; iovec entries are
+                // valid per the syscall ABI.
+                let buf = unsafe {
+                    core::slice::from_raw_parts_mut(iov_base as *mut u8, iov_len as usize)
+                };
+                return crate::net::pipe_read(id, buf, nonblocking);
             }
             0
         }
@@ -559,10 +607,10 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
     let iov_ptr = args.arg1 as usize;
     let iovcnt = args.arg2 as usize;
 
-    let kind = {
+    let (kind, flags) = {
         let table = crate::FD_TABLE.lock();
         match table.get(fd_num) {
-            Some(d) => d.kind,
+            Some(d) => (d.kind, d.flags),
             None => return EBADF,
         }
     };
@@ -580,6 +628,43 @@ pub fn sys_writev(args: &SyscallArgs) -> SyscallResult {
                     continue;
                 }
                 match super::net::sock_write(id, iov_base, iov_len) {
+                    n if n < 0 => {
+                        if total > 0 {
+                            break;
+                        }
+                        return n;
+                    }
+                    n => {
+                        total += n;
+                        if (n as usize) < iov_len {
+                            break;
+                        }
+                    }
+                }
+            }
+            total as SyscallResult
+        }
+        // Pipe: same gather/short-write rule as sockets above.
+        FdKind::Pipe { id, write_end } => {
+            if !write_end {
+                return EBADF;
+            }
+            let nonblocking = flags & O_NONBLOCK != 0;
+            let mut total: i64 = 0;
+            for i in 0..iovcnt {
+                let (iov_base, iov_len) = read_iovec(iov_ptr, i);
+                let iov_len = iov_len as usize;
+                if iov_len == 0 {
+                    continue;
+                }
+                // SAFETY: single-address-space model; iovec entries are
+                // valid per the syscall ABI.
+                let data =
+                    unsafe { core::slice::from_raw_parts(iov_base as *const u8, iov_len) };
+                // Only the first chunk may legitimately block; once
+                // something has been written, treat further backpressure as
+                // the end of this gather (same rule sys_sendmsg applies).
+                match crate::net::pipe_write(id, data, nonblocking || total > 0) {
                     n if n < 0 => {
                         if total > 0 {
                             break;
@@ -670,7 +755,6 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     const F_SETFL: i32 = 4;
     const F_DUPFD: i32 = 0;
     const F_DUPFD_CLOEXEC: i32 = 1030;
-    const O_NONBLOCK: u32 = crate::net::socket::SOCK_NONBLOCK;
 
     match cmd {
         F_SETFL => {
@@ -717,8 +801,66 @@ pub fn sys_fcntl(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
-pub fn sys_pipe(_args: &SyscallArgs) -> SyscallResult {
-    ENOSYS
+/// `pipe2(fds[2], flags)`: allocate a fresh `PipeState` in the net module
+/// (see `net::pipe`'s module doc comment for why pipes live there) and hand
+/// out its read/write ends as two new fds.
+pub fn sys_pipe2(args: &SyscallArgs) -> SyscallResult {
+    let fds_ptr = args.arg0;
+    let flags = args.arg1 as u32;
+
+    if fds_ptr == 0 {
+        return EFAULT;
+    }
+    // O_CLOEXEC is accepted and ignored — sumi has no exec() that would
+    // observe close-on-exec, matching F_SETFD's existing no-op behavior.
+    let fd_flags = if flags & O_NONBLOCK != 0 {
+        O_NONBLOCK
+    } else {
+        0
+    };
+
+    let id = crate::net::pipe_create();
+
+    let mut table = crate::FD_TABLE.lock();
+    let read_fd = table.alloc(FileDescriptor {
+        kind: FdKind::Pipe {
+            id,
+            write_end: false,
+        },
+        flags: fd_flags,
+    });
+    let write_fd = table.alloc(FileDescriptor {
+        kind: FdKind::Pipe {
+            id,
+            write_end: true,
+        },
+        flags: fd_flags,
+    });
+    drop(table);
+
+    // SAFETY: fds_ptr is a valid, writable 2-element `int[2]` per the
+    // syscall ABI; write_unaligned since callers may pass any alignment.
+    unsafe {
+        core::ptr::write_unaligned(fds_ptr as *mut i32, read_fd as i32);
+        core::ptr::write_unaligned((fds_ptr + 4) as *mut i32, write_fd as i32);
+    }
+    0
+}
+
+/// `pipe(fds[2])` == `pipe2(fds, 0)`.
+pub fn sys_pipe(args: &SyscallArgs) -> SyscallResult {
+    let pipe2_args = SyscallArgs {
+        nr: 293,
+        arg0: args.arg0,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+        caller_rip: args.caller_rip,
+        caller_rflags: args.caller_rflags,
+    };
+    sys_pipe2(&pipe2_args)
 }
 
 pub fn sys_select(_args: &SyscallArgs) -> SyscallResult {
@@ -774,6 +916,9 @@ pub fn sys_dup2(args: &SyscallArgs) -> SyscallResult {
         match evicted.kind {
             FdKind::Socket { id } if remaining_refs == 0 => crate::net::close_socket(id),
             FdKind::Epoll { id } if remaining_refs == 0 => crate::net::close_epoll(id),
+            FdKind::Pipe { id, write_end } if remaining_refs == 0 => {
+                crate::net::close_pipe(id, write_end)
+            }
             _ if remaining_refs == 0 => release_fuse_resources(evicted),
             _ => {}
         }

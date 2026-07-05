@@ -29,6 +29,11 @@ pub enum FdKind {
     Socket { id: usize },
     /// An epoll instance, indexing into `net::NetState::epolltab`.
     Epoll { id: usize },
+    /// One end of an in-kernel pipe, indexing into `net::NetState::pipetab`.
+    /// `write_end` distinguishes the read fd from the write fd — both index
+    /// the same `PipeState`, but close()/refcounting/readiness treat them
+    /// as independent sides (see `net::pipe`).
+    Pipe { id: usize, write_end: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +135,20 @@ impl FdTable {
         self.fds
             .iter()
             .filter(|slot| matches!(slot, Some(d) if matches!(d.kind, FdKind::Epoll { id: eid } if eid == id)))
+            .count()
+    }
+
+    /// Count how many open fds reference this exact (pipe id, end) pair.
+    /// The read end and write end of the same pipe are refcounted
+    /// independently — dup()ing a read fd must not affect the write end's
+    /// count and vice versa.
+    pub fn count_pipe_refs(&self, id: usize, write_end: bool) -> usize {
+        self.fds
+            .iter()
+            .filter(|slot| matches!(slot, Some(d) if matches!(
+                d.kind,
+                FdKind::Pipe { id: pid, write_end: pwe } if pid == id && pwe == write_end
+            )))
             .count()
     }
 }

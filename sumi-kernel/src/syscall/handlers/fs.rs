@@ -162,6 +162,32 @@ pub fn sys_fstat(args: &SyscallArgs) -> SyscallResult {
                     write_stat_to_user(&stat, buf_addr);
                     return 0;
                 }
+                FdKind::Pipe { .. } => {
+                    // Minimal stat with FIFO mode; enough for glibc's
+                    // fstat-based isatty()/buffering checks.
+                    let stat = Stat {
+                        st_dev: 0,
+                        st_ino: 0,
+                        st_nlink: 1,
+                        st_mode: 0o10666, // S_IFIFO | 0666
+                        st_uid: 0,
+                        st_gid: 0,
+                        __pad0: 0,
+                        st_rdev: 0,
+                        st_size: 0,
+                        st_blksize: 4096,
+                        st_blocks: 0,
+                        st_atime: 0,
+                        st_atime_nsec: 0,
+                        st_mtime: 0,
+                        st_mtime_nsec: 0,
+                        st_ctime: 0,
+                        st_ctime_nsec: 0,
+                        __unused: [0; 3],
+                    };
+                    write_stat_to_user(&stat, buf_addr);
+                    return 0;
+                }
             },
             None => return EBADF,
         }
@@ -184,15 +210,18 @@ pub fn sys_lstat(args: &SyscallArgs) -> SyscallResult {
     sys_stat(args)
 }
 
-pub fn sys_access(args: &SyscallArgs) -> SyscallResult {
-    let path = match read_user_path(args.arg0) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
+/// Shared by `sys_access`/`sys_faccessat`/`sys_faccessat2`: existence check
+/// only (our FUSE layer doesn't model per-bit read/write/execute
+/// permissions, so `mode` is accepted but unchecked, same as `sys_access`
+/// always did). `dirfd` must be `AT_FDCWD` or `path` absolute — no
+/// relative-to-fd support, the same restriction `sys_openat` enforces.
+fn do_faccessat(dirfd: i32, path: &[u8]) -> SyscallResult {
+    if dirfd != AT_FDCWD && path.first() != Some(&b'/') {
+        return ENOSYS;
+    }
 
     let fs = crate::fs();
 
-    // Just check existence by resolving the path.
     let nodeid = match fs.resolve_path(path) {
         Ok(id) => id,
         Err(e) => return e as SyscallResult,
@@ -200,6 +229,46 @@ pub fn sys_access(args: &SyscallArgs) -> SyscallResult {
 
     forget_if_not_root(fs, nodeid);
     0
+}
+
+pub fn sys_access(args: &SyscallArgs) -> SyscallResult {
+    let path = match read_user_path(args.arg0) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_faccessat(AT_FDCWD, path)
+}
+
+/// `faccessat(dirfd, path, mode, flags)`. `flags` (AT_EACCESS,
+/// AT_SYMLINK_NOFOLLOW) don't change our existence-only semantics, so they
+/// are accepted without validation — unlike `faccessat2`, the plain
+/// `faccessat` libc wrapper never validates them against the kernel either.
+pub fn sys_faccessat(args: &SyscallArgs) -> SyscallResult {
+    let dirfd = args.arg0 as i32;
+    let path = match read_user_path(args.arg1) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    do_faccessat(dirfd, path)
+}
+
+/// `faccessat2(dirfd, path, mode, flags)` — like `faccessat`, but flags are
+/// a real syscall argument (not emulated by glibc), so unknown bits are
+/// rejected exactly like Linux's `do_faccessat2` does.
+pub fn sys_faccessat2(args: &SyscallArgs) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EACCESS: u32 = 0x200;
+
+    let dirfd = args.arg0 as i32;
+    let path = match read_user_path(args.arg1) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let flags = args.arg3 as u32;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
+        return EINVAL;
+    }
+    do_faccessat(dirfd, path)
 }
 
 pub fn sys_getdents(_args: &SyscallArgs) -> SyscallResult {

@@ -222,6 +222,58 @@ pub fn sys_prctl(args: &SyscallArgs) -> SyscallResult {
     }
 }
 
+/// `struct sysinfo` for x86_64 Linux (112 bytes) — see `man 2 sysinfo`.
+/// Field order/types follow the kernel uapi definition exactly so repr(C)
+/// reproduces its padding (4 bytes before `totalhigh`, 4 bytes of tail
+/// padding after `mem_unit`) without listing it explicitly.
+#[repr(C)]
+struct Sysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _f: [u8; 0],
+}
+
+const _: () = assert!(core::mem::size_of::<Sysinfo>() == 112);
+
+/// mysqld's startup sanity checks call `sysinfo()` for `totalram`/`freeram`.
+/// `loads`/swap are always reported as zero — sumi has no load average or
+/// swap. `mem_unit = 1` so `totalram`/`freeram` are plain byte counts.
+pub fn sys_sysinfo(args: &SyscallArgs) -> SyscallResult {
+    let buf = args.arg0 as *mut Sysinfo;
+    if buf.is_null() {
+        return EFAULT;
+    }
+
+    let uptime = (crate::time::monotonic_ns() / 1_000_000_000) as i64;
+    let stats = crate::PAGE_ALLOCATOR.get_stats();
+    let total_pages = stats.allocatable_limit_pages;
+    let free_pages = total_pages.saturating_sub(stats.used_pages);
+    let page_size = sumi_abi::arch::layout::PAGE_SIZE as u64;
+
+    // SAFETY: single-process unikernel — the caller-provided pointer is a
+    // valid, writable `struct sysinfo` per the syscall ABI.
+    unsafe {
+        core::ptr::write_bytes(buf, 0, 1);
+        (*buf).uptime = uptime;
+        (*buf).totalram = total_pages as u64 * page_size;
+        (*buf).freeram = free_pages as u64 * page_size;
+        (*buf).procs = 1;
+        (*buf).mem_unit = 1;
+    }
+    0
+}
+
 
 #[cfg(test)]
 mod tests {
